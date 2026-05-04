@@ -18,7 +18,7 @@ THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABI
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-Contract based upon the Church of Rao Treasury Contract (https://github.com/bittensor-church/treasury-contract).
+Parts of this contract are based upon the Church of Rao Treasury Contract (https://github.com/bittensor-church/treasury-contract).
 */
 
 pragma solidity ^0.8.24;
@@ -26,9 +26,20 @@ pragma solidity ^0.8.24;
 import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 
 address constant NEURON_PRECOMPILE = 0x0000000000000000000000000000000000000804;
+address constant STAKING_V2_ADDRESS = 0x0000000000000000000000000000000000000805;
 
 interface INeuron {
     function registerLimit(uint16 netuid, bytes32 hotkey, uint64 limitPrice) external payable;
+}
+
+interface IStakingV2 {
+    function moveStake(
+        bytes32 originHotkey, 
+        bytes32 destinationHotkey, 
+        uint256 originNetuid, 
+        uint256 destinationNetuid, 
+        uint256 amountAlpha
+    ) external;
 }
 
 contract TreasuryVault is TimelockController {
@@ -37,11 +48,20 @@ contract TreasuryVault is TimelockController {
     error LimitPriceOverflow();
     error InsufficientValueForBurn(uint256 burned, uint256 provided);
 
+    bytes32 public constant STAKE_ADMIN_ROLE = keccak256("STAKE_ADMIN_ROLE");
+
     event NeuronRegistration(uint16 indexed netuid, bytes32 hotkey, address indexed caller);
 
     constructor(uint256 minDelay, address[] memory proposers, address[] memory executors, address admin)
         TimelockController(minDelay, proposers, executors, admin)
-    { }
+    {
+        _grantRole(STAKE_ADMIN_ROLE, admin);
+    }
+
+    modifier onlyStakeAdmin() {
+        require(hasRole(STAKE_ADMIN_ROLE, msg.sender), "Only stake admin can move stake");
+        _;
+    }
 
     function registerNeuron(uint16 netuid, bytes32 hotkey) external payable returns (bool) {
         uint256 limitRao = msg.value / 1e9;
@@ -76,5 +96,25 @@ contract TreasuryVault is TimelockController {
         if (!success) {
             revert RefundError();
         }
+    }
+
+    /**
+     * @notice Allows the Treasury Admin to consolidate Alpha across different hotkeys owned by the Vault.
+     * @dev This does not require a DAO vote because funds do not leave the Vault's Coldkey.
+     */
+    function moveStake(
+        bytes32 originHotkey,
+        bytes32 destinationHotkey,
+        uint16 originNetuid,
+        uint16 destinationNetuid,
+        uint256 amountAlpha
+    ) external onlyStakeAdmin {
+        IStakingV2(STAKING_V2_ADDRESS).moveStake(
+            originHotkey,
+            destinationHotkey,
+            uint256(originNetuid),
+            uint256(destinationNetuid),
+            amountAlpha
+        );
     }
 }

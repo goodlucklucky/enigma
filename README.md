@@ -36,6 +36,23 @@ By leveraging Bittensor's incentive layer, Enigma turns critical security resear
 
 ## Treasury Wallet
 
+- **Governor**
+
+  *__Note:__ Governor limits are in pre-release mode so that we can test with validators the functionality before official challenge launch.*
+
+  - Contract Address: `0x35A900e75D7bf3a2dcdF8B542ADDeDeCa08fadC8`
+  - Details (verify with `treasury/scripts/list_proposals.py`):
+      - Name:                  Enigma-Treasury-v0
+      - Target NetUID:         63
+      - Treasury Admin:        0xa5ACB66F2e1e5307cd536F7fd346b0301b7bC0Ca
+      - TAO Limit:             1,000.0000 TAO
+      - Alpha Limit:           25,000.0000 Alpha
+      - ERC20 Limit:           10,000.0000 Tokens
+      - Limit Reset Period:    86400 seconds (~1 days 0 hrs)
+      - Success Threshold:     6000 BPS (60.0%)
+      - Voting Delay:          75 blocks (~15 mins)
+      - Voting Period:         900 blocks (~3 hrs 0 mins)
+
 The Treasury Wallet is a core component of Subnet 63, implemented as a smart contract on the EVM layer of Bittensor. It serves as the primary funding mechanism for challenges and ecosystem development.
 
 - **Funding**: All miner emissions are directed to the Treasury Wallet, accumulating SN63 Alpha tokens.
@@ -47,13 +64,21 @@ Challenges and prizes will be paid to the winner based upon a proposal and vote 
 
 ---
 
+## Voting
+
+*__Note:__ Please make sure to follow [the setup guide](#installation--setup-validator-only) first.*
+
+- [Validator Voting Guide](VOTING.md)
+
+---
+
 ## Current Live Challenge: Breaking Treasury Wallets
 
 - **Prize**: Entire contents of the treasury wallet (~$5,000 USD in SN63 Alpha at launch).
 - **Target**: Drain the treasury wallet by any means (exploit code, consensus attacks, social engineering, etc.).
 - **Wallet Details**:
-  - Contract Address: `0x08151141ea1B3EC01Fb3816234Ba1F96FA9D1Cda`
-  - SS58 Cold Key: `5GvJQCF5nmnp9y8E6pGKaXqner8LPq7NjDJAgZbPrGaETnun`
+  - Contract Address: `0x4DE748C04811d06c80D9c8234932Cb25A552B080`
+  - SS58 Cold Key: `5FsKhxJZuVpPU9JCpZcZvUW8cxqSZHDGAJrdmqTbXfRfTJWD`
 - **Rules**: First to drain wins. No partial prizes. No time limit. Disclose method to `support@qbittensorlabs.com` (identity optional).
 - **Participation**: Participation: Open to anyone. More details on the [Enigma website](https://www.qbittensorlabs.com/enigma).
 - **Deployment & Setup**: For detailed instructions on deploying and managing the Treasury Wallet, see [treasury/README.md](treasury/).
@@ -72,7 +97,11 @@ More challenges (Q-Day cryptography, AI security, etc.) are coming soon.
 - Git
 - [Validator Compute Requirements](min_compute.yml)
 
-### Quick Setup
+### Voting Setup
+
+To participate in Treasury Governance and cast votes on proposals, validators must follow the [Validator Onboarding Guide](VALIDATORS.md) which provides setup instructions for an EVM wallet.
+
+### Runtime Setup (PM2)
 
 ```bash
 # 1. Create and activate virtual environment
@@ -90,7 +119,7 @@ pm2 start --interpreter .venv/bin/python --name enigma-validator neurons/validat
 
 **Note**: Replace `<your_wallet_name>` and `<your_hotkey>` with your Bittensor wallet details (defaults to 'default' if not specified). For localnet testing, add `--subtensor.network local`.
 
-### Running Without PM2
+#### Running Without PM2
 
 To run the validator directly in the terminal (foreground):
 
@@ -98,7 +127,7 @@ To run the validator directly in the terminal (foreground):
 python neurons/validator.py --netuid 63 --logging.info --wallet.name <your_wallet_name> --wallet.hotkey <your_hotkey>
 ```
 
-### Choosing GPU Device
+### Setting GPU Device
 
 To bind the validator to a specific GPU, use the `--neuron.device` flag:
 

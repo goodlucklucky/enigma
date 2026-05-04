@@ -18,7 +18,7 @@ THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABI
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-Parts of this contract are based upon the Church of Rao Treasury Contract (https://github.com/bittensor-church/treasury-contract).
+Parts of this script are based upon the Church of Rao Treasury Contract (https://github.com/bittensor-church/treasury-contract).
 */
 
 pragma solidity ^0.8.24;
@@ -45,7 +45,7 @@ contract DeployGovernance is Script {
         uint256 successThresholdEnv = vm.envOr("SUCCESS_THRESHOLD_BPS", uint256(6000));
 
         uint256 taoLimit = vm.envOr("TAO_LIMIT", uint256(1000 ether));
-        uint256 alphaLimit = vm.envOr("ALPHA_LIMIT", uint256(5000 ether));
+        uint256 alphaLimit = vm.envOr("ALPHA_LIMIT", uint256(5000 * 1e9)); // 9 decimals instead of ether
         uint256 erc20Limit = vm.envOr("ERC20_LIMIT", uint256(10000 ether));
         uint256 resetPeriod = vm.envOr("LIMIT_RESET_PERIOD_MIN", uint256(10080)); // Default: 1 week
 

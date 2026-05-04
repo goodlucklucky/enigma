@@ -52,7 +52,7 @@ def main():
     parser.add_argument("--voting-delay", type=int, default=7200, help="Voting delay in blocks (default: 1 day = 7200)")
     parser.add_argument("--voting-period", type=int, default=21600, help="Voting period in blocks (default: 3 days = 21600)")
     parser.add_argument("--proposal-threshold", type=int, default=0, help="Proposal threshold (default: 0)")
-    parser.add_argument("--quorum-bps", type=int, default=5000, help="Quorum in basis points (default: 50%% = 5000)")
+    parser.add_argument("--quorum-bps", type=int, default=5000, help="Quorum in basis points (default: 50% = 5000)")
     parser.add_argument("--proposal-expiration", type=int, default=50400, help="Proposal expiration in blocks (default: 7 days = 50400)")
 
     args = parser.parse_args()
@@ -131,7 +131,7 @@ def main():
     
     # Run the bash script from the expected directory
     process = subprocess.run(
-        ["bash", "scripts/deploy.sh"],
+        ["bash", "scripts/deploy.sh"], 
         cwd=treasury_dir,
         env=env,
         text=True
@@ -142,7 +142,6 @@ def main():
         sys.exit(process.returncode)
 
     print("\n✅ Deployment script completed.")
-
 
 if __name__ == "__main__":
     main()

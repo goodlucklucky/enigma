@@ -32,23 +32,23 @@ fi
 # ── Network ──
 export RPC_URL="${RPC_URL:-https://lite.chain.opentensor.ai}"
 
-# ── Governance Parameters ──
+# ── Governance Parameters (12s/block) ──
 export NETUID="${NETUID:-63}"
 export GOV_NAME="${GOV_NAME:-SN63Treasury}"
-export MIN_DELAY="${MIN_DELAY:-3600}"                         # 1 hour timelock (seconds)
+export MIN_DELAY="${MIN_DELAY:-86400}"                        # 24 hour timelock (seconds)
 
-export VOTING_DELAY="${VOTING_DELAY:-1}"                      # 1 block (~12 sec) before voting starts
-export VOTING_PERIOD="${VOTING_PERIOD:-7200}"                 # ~24 hours at 12s/block
+export VOTING_DELAY="${VOTING_DELAY:-300}"                    # ~1 hour before voting starts
+export VOTING_PERIOD="${VOTING_PERIOD:-10800}"                # ~36 hours for voting
 export PROPOSAL_THRESHOLD="${PROPOSAL_THRESHOLD:-0}"          # Any validator can propose
 export QUORUM_BPS="${QUORUM_BPS:-5000}"                       # 50% of total stake must vote FOR
 export SUCCESS_THRESHOLD_BPS="${SUCCESS_THRESHOLD_BPS:-6000}" # 60% of vote must be FOR
 export PROPOSAL_EXPIRATION="${PROPOSAL_EXPIRATION:-14400}"    # ~48 hours to queue after vote success
 
 # ── Rate Limits (IMMUTABLE after deployment) ──
-export TAO_LIMIT="${TAO_LIMIT:-1000000000000000000000}"          # 1000 TAO per period (in wei)
-export ALPHA_LIMIT="${ALPHA_LIMIT:-25000000000000000000000}"     # 25000 Alpha per period (in wei)
-export ERC20_LIMIT="${ERC20_LIMIT:-10000000000000000000000}"     # 10000 ERC20 per period (in wei)
-export LIMIT_RESET_PERIOD_MIN="${LIMIT_RESET_PERIOD_MIN:-10080}" # 1 week in minutes
+export TAO_LIMIT="${TAO_LIMIT:-1000000000000000000000}"           # 1000 TAO per period (in wei)
+export ALPHA_LIMIT="${ALPHA_LIMIT:-25000000000000}"               # 25000 Alpha per period (in RAO / 9 decimals)
+export ERC20_LIMIT="${ERC20_LIMIT:-10000000000000000000000}"      # 10000 ERC20 per period (in wei)
+export LIMIT_RESET_PERIOD_MIN="${LIMIT_RESET_PERIOD_MIN:-10080}"  # 1 week in minutes
 
 # ── Validation ──
 if [ -z "${PRIVATE_KEY:-}" ]; then
@@ -75,7 +75,7 @@ echo "  Quorum:           $QUORUM_BPS BPS ($(( QUORUM_BPS / 100 ))%)"
 echo "  Voting Period:    $VOTING_PERIOD blocks (~$(( VOTING_PERIOD * 12 / 3600 ))h)"
 echo "  Timelock Delay:   $MIN_DELAY seconds ($(( MIN_DELAY / 3600 ))h)"
 echo "  TAO Limit/week:   $(echo "scale=0; $TAO_LIMIT / 1000000000000000000" | bc) TAO"
-echo "  Alpha Limit/week: $(echo "scale=0; $ALPHA_LIMIT / 1000000000000000000" | bc) Alpha"
+echo "  Alpha Limit/week: $(echo "scale=0; $ALPHA_LIMIT / 1000000000" | bc) Alpha"
 echo "========================================================="
 echo ""
 

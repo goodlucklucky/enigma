@@ -53,7 +53,6 @@ interface IMetagraph {
 
 interface IBittensorVotes {
     function getVotingPower(uint16 netuid, bytes32 hotkey) external view returns (uint256);
-    function getTotalVotingPower(uint16 netuid) external view returns (uint256);
 }
 
 interface IStakingV2 {
@@ -106,7 +105,11 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     }
 
     modifier onlyAdminOrWhitelisted() {
-        require(msg.sender == treasuryAdmin || _trustedValidators.contains(msg.sender), "Not admin or whitelisted");
+        require(
+            msg.sender == treasuryAdmin || 
+            (_trustedValidators.contains(msg.sender) && _hasActiveValidatorStatus(msg.sender)), 
+            "Not admin or whitelisted/active"
+        );
         _;
     }
 
@@ -339,9 +342,7 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     // VOTING & TALLYING
     // ==========================================
 
-    function _castVote(uint256 proposalId, address account, uint8 support, string memory reason) 
-        internal virtual override returns (uint256) 
-    {
+    function _requireValidVoter(uint256 proposalId, address account) internal view {
         if (proposalTypes[proposalId] == ProposalType.Whitelist) {
             if (_trustedValidators.length() == 0) {
                 require(account == treasuryAdmin, "Only admin can vote on empty whitelist");
@@ -351,8 +352,20 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
         } else {
             require(_trustedValidators.contains(account) && _hasActiveValidatorStatus(account), "Not an active, trusted validator");
         }
+    }
         
+    function _castVote(uint256 proposalId, address account, uint8 support, string memory reason) 
+        internal virtual override returns (uint256) 
+    {
+        _requireValidVoter(proposalId, account);
         return super._castVote(proposalId, account, support, reason);
+    }
+
+    function _castVote(uint256 proposalId, address account, uint8 support, string memory reason, bytes memory params) 
+        internal virtual override returns (uint256) 
+    {
+        _requireValidVoter(proposalId, account);
+        return super._castVote(proposalId, account, support, reason, params);
     }
 
     function _countVote(

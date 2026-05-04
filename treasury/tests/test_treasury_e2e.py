@@ -31,6 +31,9 @@ class TreasuryTest:
         self.vault_ss58 = None
         self.vault_hotkey_ss58 = None
         self.vault_hotkey_hex = None
+        self.validator_hotkey_ss58 = None
+        self.validator_hotkey_hex = None
+        self.vault_coldkey_hex = None
         self.miner_ss58 = None
         self.miner_evm = None
         self.miner_coldkey_hex = None
@@ -77,6 +80,14 @@ class TreasuryTest:
                 import substrateinterface
                 kp = substrateinterface.Keypair(ss58_address=self.vault_hotkey_ss58)
                 self.vault_hotkey_hex = "0x" + kp.public_key.hex()
+                
+        val_hk_path = base / "wallets" / "sn-creator" / "hotkeys" / "default"
+        if val_hk_path.exists():
+            with open(val_hk_path) as f:
+                self.validator_hotkey_ss58 = json.load(f)["ss58Address"]
+                import substrateinterface
+                kp = substrateinterface.Keypair(ss58_address=self.validator_hotkey_ss58)
+                self.validator_hotkey_hex = "0x" + kp.public_key.hex()
 
         miner_ck_path = base / "wallets" / "test-miner" / "coldkeypub.txt"
         if miner_ck_path.exists():
@@ -95,6 +106,11 @@ class TreasuryTest:
         # Address conversions
         gov_ss58 = self.evm_to_ss58(self.contract)
         self.vault_ss58 = self.evm_to_ss58(self.vault_addr)
+        if self.vault_ss58 and self.vault_ss58 not in ("unknown", "error"):
+            import substrateinterface
+            kp = substrateinterface.Keypair(ss58_address=self.vault_ss58)
+            self.vault_coldkey_hex = "0x" + kp.public_key.hex()
+            
         admin_ss58 = self.evm_to_ss58(self.admin_addr)
         val_ss58 = self.evm_to_ss58(self.validator_addr)
         
@@ -399,8 +415,8 @@ class TreasuryTest:
 
     def test_6_native_rate_limit_failure(self):
         print("\n" + "="*80 + "\nTEST 6: Native TAO Rate Limiting Enforcement\n" + "="*80)
-        # 1500 TAO (1500 + 18 zeros) to breach the 1000 TAO limit
-        args = [self.admin_addr, "1500000000000000000000", "RateLimitTest"]
+        # 8 TAO (exceeds the 5 TAO limit, but is within the 10 TAO initial vault balance)
+        args = [self.admin_addr, "8000000000000000000", "RateLimitTest"]
 
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Propose Large Transfer")
         prop_id = self.current_proposal_id
@@ -433,7 +449,7 @@ class TreasuryTest:
         step3 = self.cast("queueNativeTransfer(address,uint256,string)", args, self.admin_pk, "Queue Impossible Transfer")
         self.wait_for_timelock(min_seconds=12)
         
-        step4 = self.cast("executeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Execute Impossible Transfer", expected_revert="0x1425ea42")
+        step4 = self.cast("executeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Execute Impossible Transfer", expected_revert="Limit exceeded")
         
         return all([step1, step2, step3, step4])
 
@@ -485,27 +501,27 @@ class TreasuryTest:
 
     def test_9_alpha_rate_limit_failure(self):
         print("\n" + "="*80 + "\nTEST 9: Alpha Rate Limit Enforcement\n" + "="*80)
-        massive_alpha_amount = "500000000000000000000000000"
+        limit_exceeding_alpha_amount = "150000000000" # 150 Alpha (exceeds 100 limit but within 200 wallet balance)
         args = [
             self.miner_coldkey_hex,
             self.vault_hotkey_hex,
             str(self.netuid),
             str(self.netuid),
-            massive_alpha_amount,
+            limit_exceeding_alpha_amount,
             "AlphaLimitTest"
         ]
         
-        step1 = self.cast("proposeAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)", args, self.admin_pk, "Propose Massive Alpha")
+        step1 = self.cast("proposeAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)", args, self.admin_pk, "Propose Limit-Exceeding Alpha")
         prop_id = self.current_proposal_id
         self.wait_for_blocks(4)
         
         step2 = self.cast("castVote(uint256,uint8)", [str(prop_id), "1"], self.validator_pk, "Vote")
         self.wait_for_blocks(12)
         
-        step3 = self.cast("queueAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)", args, self.admin_pk, "Queue Massive Alpha")
+        step3 = self.cast("queueAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)", args, self.admin_pk, "Queue Limit-Exceeding Alpha")
         self.wait_for_timelock(min_seconds=12)
         
-        step4 = self.cast("executeAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)", args, self.admin_pk, "Execute Massive Alpha", expected_revert="Limit exceeded")
+        step4 = self.cast("executeAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)", args, self.admin_pk, "Execute Limit-Exceeding Alpha", expected_revert="Limit exceeded")
         
         return all([step1, step2, step3, step4])
 
@@ -620,11 +636,119 @@ class TreasuryTest:
         return step1 and (state == 3)
 
     # =========================================================================
-    # GROUP 6: The Grand Finale (Revocation)
+    # GROUP 6: Vault Stake Consolidation
+    # =========================================================================
+    
+    def test_16_admin_move_stake(self):
+        print("\n" + "="*80 + "\nTEST 16: Fragment Stake & Admin Move Stake\n" + "="*80)
+        
+        if not hasattr(self, 'validator_hotkey_hex') or not self.validator_hotkey_hex:
+            print("  ⚠️ Skipping: Validator hotkey not found.")
+            return True
+            
+        if not hasattr(self, 'vault_coldkey_hex') or not self.vault_coldkey_hex:
+            print("  ⚠️ Skipping: Vault coldkey not found.")
+            return True
+
+        amount_to_fragment = "10000000000" # 10 Alpha
+        
+        vault_main_stake_before = self.get_alpha_balance(self.vault_ss58, self.vault_hotkey_ss58)
+        print(f"  Vault Stake on Vault Hotkey (Initial): {vault_main_stake_before} Alpha")
+        
+        if vault_main_stake_before < 10.0:
+            print("  ❌ Vault does not have enough Alpha to fragment!")
+            return False
+
+        print("\n→ [Admin Fragmenting Stake: Vault Hotkey -> Validator Hotkey]")
+        frag_cmd = [
+            "cast", "send", self.vault_addr,
+            "moveStake(bytes32,bytes32,uint16,uint16,uint256)",
+            self.vault_hotkey_hex,
+            self.validator_hotkey_hex,
+            str(self.netuid),
+            str(self.netuid),
+            amount_to_fragment,
+            "--private-key", self.admin_pk,
+            "--rpc-url", self.rpc_url,
+            "--json"
+        ]
+        
+        frag_res = subprocess.run(frag_cmd, capture_output=True, text=True)
+        if frag_res.returncode != 0:
+            print(f"  ❌ Failed to fragment stake: {frag_res.stderr.strip() or frag_res.stdout.strip()}")
+            return False
+            
+        self.wait_for_blocks(2)
+        
+        vault_frag_stake = self.get_alpha_balance(self.vault_ss58, self.validator_hotkey_ss58)
+        print(f"  Vault Stake on Validator Hotkey: {vault_frag_stake} Alpha")
+        
+        if vault_frag_stake < 9.9:
+            print("  ❌ Stake fragmentation did not reflect on chain!")
+            return False
+
+        print("\n→ [Malicious Move Stake Attempt (Should Fail)]")
+        mal_cmd = [
+            "cast", "send", self.vault_addr,
+            "moveStake(bytes32,bytes32,uint16,uint16,uint256)",
+            self.validator_hotkey_hex,
+            self.vault_hotkey_hex,
+            str(self.netuid),
+            str(self.netuid),
+            amount_to_fragment,
+            "--private-key", self.malicious_pk,
+            "--rpc-url", self.rpc_url
+        ]
+        mal_res = subprocess.run(mal_cmd, capture_output=True, text=True)
+        if "Only stake admin can move stake" in mal_res.stderr or "AccessControl" in mal_res.stderr or "revert" in mal_res.stderr:
+            print("  ✅ Malicious user blocked from moving stake.")
+        else:
+            print("  ❌ Malicious user bypass succeeded! SECURITY FAILURE!")
+            return False
+
+        print("\n→ [Admin Consolidating Stake: Validator Hotkey -> Vault Hotkey]")
+        
+        move_cmd = [
+            "cast", "send", self.vault_addr,
+            "moveStake(bytes32,bytes32,uint16,uint16,uint256)",
+            self.validator_hotkey_hex,
+            self.vault_hotkey_hex,
+            str(self.netuid),
+            str(self.netuid),
+            amount_to_fragment,
+            "--private-key", self.admin_pk,
+            "--rpc-url", self.rpc_url,
+            "--json"
+        ]
+        
+        move_res = subprocess.run(move_cmd, capture_output=True, text=True)
+        if move_res.returncode != 0:
+            print(f"  ❌ Failed to move stake: {move_res.stderr.strip() or move_res.stdout.strip()}")
+            return False
+            
+        self.wait_for_blocks(2)
+        
+        vault_frag_stake_after = self.get_alpha_balance(self.vault_ss58, self.validator_hotkey_ss58)
+        vault_main_stake_after = self.get_alpha_balance(self.vault_ss58, self.vault_hotkey_ss58)
+        
+        print(f"  Vault Stake on Validator Hotkey (After): {vault_frag_stake_after} Alpha")
+        print(f"  Vault Stake on Vault Hotkey (After): {vault_main_stake_after} Alpha")
+        
+        stake_cleared = vault_frag_stake_after < 0.1
+        
+        if stake_cleared:
+            print("  ✅ Admin successfully consolidated stake!")
+            return True
+        else:
+            print("  ❌ Stake consolidation failed verification.")
+            return False
+
+    # =========================================================================
+    # GROUP 7: The Grand Finale (Revocation)
     # =========================================================================
 
-    def test_16_remove_from_whitelist(self):
-        print("\n" + "="*80 + "\nTEST 16: Remove Validator from Whitelist\n" + "="*80)
+    def test_17_remove_from_whitelist(self):
+        print("\n" + "="*80 + "\nTEST 17: Remove Validator from Whitelist\n" + "="*80)
         args = [f"[{self.validator_addr}]", "[false]", "RemoveValidator"]
         
         step1 = self.cast("proposeUpdateTrustedValidators(address[],bool[],string)", args, self.admin_pk, "Propose Removal")
@@ -642,8 +766,8 @@ class TreasuryTest:
         
         return all([step1, step2, step3, step4])
 
-    def test_17_post_removal_voting_fails(self):
-        print("\n" + "="*80 + "\nTEST 17: Verify Removed Validator Cannot Vote\n" + "="*80)
+    def test_18_post_removal_voting_fails(self):
+        print("\n" + "="*80 + "\nTEST 18: Verify Removed Validator Cannot Vote\n" + "="*80)
         
         args = [self.admin_addr, "100000", "PostRemovalTest"]
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Propose Transfer")
@@ -654,8 +778,8 @@ class TreasuryTest:
         
         return all([step1, step2])
 
-    def test_18_proposal_listing(self):
-        print("\n" + "="*80 + "\nTEST 18: Proposal Listing (GovernorStorage)\n" + "="*80)
+    def test_19_proposal_listing(self):
+        print("\n" + "="*80 + "\nTEST 19: Proposal Listing (GovernorStorage)\n" + "="*80)
         
         # 1. Get total proposal count from standard OpenZeppelin storage
         cmd_count = ["cast", "call", self.contract, "proposalCount()(uint256)", "--rpc-url", self.rpc_url]
@@ -830,9 +954,10 @@ class TreasuryTest:
             self.test_13_queued_cancellation(),
             self.test_14_against_vote_defeats_proposal(),
             self.test_15_passive_quorum_failure(),
-            self.test_16_remove_from_whitelist(),
-            self.test_17_post_removal_voting_fails(),
-            self.test_18_proposal_listing(),
+            self.test_16_admin_move_stake(),
+            self.test_17_remove_from_whitelist(),
+            self.test_18_post_removal_voting_fails(),
+            self.test_19_proposal_listing(),
         ]
 
         print("\n" + "="*90 + "\nFINAL SUMMARY\n" + "="*90)

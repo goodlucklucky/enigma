@@ -5,7 +5,7 @@
 The Treasury Wallet utilizes a dual-contract pattern: the `TreasuryController` acts as the governance brain handling proposals, voting, and limits, while the `TreasuryVault` acts as the timelocked executor and asset holder. Parts of these contracts are based upon the Church of Rao Treasury Contract (https://github.com/bittensor-church/treasury-contract).
 
 ### 1. Roles and Access Control
-* **Treasury Admin:** A centrally appointed address that possesses the exclusive right to *create* proposals (whitelist updates, native transfers, ERC20 transfers, and Alpha stake transfers).
+* **Treasury Admin:** A centrally appointed address that possesses the exclusive right to *create* proposals (whitelist updates, native transfers, ERC20 transfers, and Alpha stake transfers) and move stake between hotkeys to allow wallet consolidation.
 * **Trusted Validators:** A whitelisted set of addresses. To participate in governance (voting or canceling proposals), an address must be on this whitelist **and** possess an active validator status on the target subnet (`TARGET_NETUID`). This prevents voting by validators that are not running subnet code (weight copiers).
 * **Proposers/Executors (Vault):** Defined during the `TreasuryVault` initialization. The `TreasuryController` will be granted proposer and executor rights on the vault to move proposals through the timelock lifecycle.
 
