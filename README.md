@@ -36,22 +36,31 @@ By leveraging Bittensor's incentive layer, Enigma turns critical security resear
 
 ## Treasury Wallet
 
-- **Governor**
+- **Details**
 
-  *__Note:__ Governor limits are in pre-release mode so that we can test with validators the functionality before official challenge launch.*
-
-  - Contract Address: `0x35A900e75D7bf3a2dcdF8B542ADDeDeCa08fadC8`
+  - Vault Contract Address: `0xB291C87759E2BAf678734C45A44121091d999220`
+  - Vault SS58 Cold Key: `5EgP27pkachXDvWpYGfFjatQkWkGXfaoGkP35jdXC4xwPmtZ`
+  - Vault SS58 Hot Key: `5DCLafsAKaLeZwm9hjMHvrQNjtucSwBhKyTLYnYmMvhxF2Uc`
+  - Governor Contract Address: `0x41a1BE0a7408717877DE25e2c62c2Fb71a04D8A9`
   - Details (verify with `treasury/scripts/list_proposals.py`):
-      - Name:                  Enigma-Treasury-v0
-      - Target NetUID:         63
-      - Treasury Admin:        0xa5ACB66F2e1e5307cd536F7fd346b0301b7bC0Ca
-      - TAO Limit:             1,000.0000 TAO
-      - Alpha Limit:           25,000.0000 Alpha
-      - ERC20 Limit:           10,000.0000 Tokens
-      - Limit Reset Period:    86400 seconds (~1 days 0 hrs)
-      - Success Threshold:     6000 BPS (60.0%)
-      - Voting Delay:          75 blocks (~15 mins)
-      - Voting Period:         900 blocks (~3 hrs 0 mins)
+    ```
+    ====================================================================================================
+    🔍 Contract Configuration:
+      Name:                  Enigma-Treasury-v1.1-20260505
+      Target NetUID:         63
+      Treasury Admin:        0xa5ACB66F2e1e5307cd536F7fd346b0301b7bC0Ca
+      TAO Limit:             1,000.0000 TAO
+      Alpha Limit:           25,000.0000 Alpha
+      ERC20 Limit:           10,000.0000 Tokens
+      Limit Reset Period:    172800 seconds (~2 days 0 hrs)
+      Success Threshold:     6000 BPS (60.0%)
+      Quorum:                5000 BPS (50.0%)
+      Proposal Expiration:   14400 blocks (~2 days 0 hrs)
+      Voting Delay:          900 blocks (~3 hrs 0 mins)
+      Voting Period:         21600 blocks (~3 days 0 hrs)
+      Timelock Delay:        86400 seconds (~1 days 0 hrs)
+    ====================================================================================================
+    ```
 
 The Treasury Wallet is a core component of Subnet 63, implemented as a smart contract on the EVM layer of Bittensor. It serves as the primary funding mechanism for challenges and ecosystem development.
 
@@ -75,7 +84,7 @@ Challenges and prizes will be paid to the winner based upon a proposal and vote 
 ## Current Live Challenge: Breaking Treasury Wallets
 
 - **Prize**: Entire contents of the treasury wallet (~$5,000 USD in SN63 Alpha at launch).
-- **Target**: Drain the treasury wallet by any means (exploit code, consensus attacks, social engineering, etc.).
+- **Target**: Drain the **test** treasury wallet by any means (exploit code, consensus attacks, social engineering, etc.).
 - **Wallet Details**:
   - Contract Address: `0x4DE748C04811d06c80D9c8234932Cb25A552B080`
   - SS58 Cold Key: `5FsKhxJZuVpPU9JCpZcZvUW8cxqSZHDGAJrdmqTbXfRfTJWD`

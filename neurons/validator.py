@@ -28,7 +28,7 @@ from qbittensor.base.validator import BaseValidatorNeuron
 
 from qbittensor.validator.services.metrics import MetricsService
 
-TREASURY_HOTKEY = "5FbishpQXFZjrVStcjA5x6WJp32NQRvTeKyMDdLkv181VbS5"  # type: Optional[str]
+TREASURY_HOTKEY = "5DCLafsAKaLeZwm9hjMHvrQNjtucSwBhKyTLYnYmMvhxF2Uc"  # type: Optional[str]
 
 
 class Validator(BaseValidatorNeuron):

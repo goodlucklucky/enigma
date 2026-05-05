@@ -284,9 +284,17 @@ class ProposalViewer:
         erc20_limit = extract_int(self.cast_call("ERC20_LIMIT()(uint256)"))
         limit_reset_period = extract_int(self.cast_call("LIMIT_RESET_PERIOD()(uint256)"))
         success_threshold = extract_int(self.cast_call("SUCCESS_THRESHOLD_BPS()(uint256)"))
+        quorum_bps = extract_int(self.cast_call("SUPPORT_THRESHOLD_NUMERATOR()(uint256)"))
+        proposal_exp = extract_int(self.cast_call("proposalExpirationBlocks()(uint256)"))
         voting_delay = extract_int(self.cast_call("votingDelay()(uint256)"))
         voting_period = extract_int(self.cast_call("votingPeriod()(uint256)"))
         proposal_threshold = extract_int(self.cast_call("proposalThreshold()(uint256)"))
+
+        # Get Min Delay from Timelock
+        timelock_addr = self.cast_call("timelock()(address)")
+        min_delay = 0
+        if timelock_addr:
+            min_delay = extract_int(subprocess.run(["cast", "call", timelock_addr, "getMinDelay()(uint256)", "--rpc-url", self.rpc], capture_output=True, text=True).stdout)
 
         print(f"  Name:                  {name}")
         print(f"  Target NetUID:         {target_netuid}")
@@ -296,8 +304,11 @@ class ProposalViewer:
         print(f"  ERC20 Limit:           {erc20_limit / 1e18:,.4f} Tokens")
         print(f"  Limit Reset Period:    {limit_reset_period} seconds (~{self.format_time_estimate(limit_reset_period)})")
         print(f"  Success Threshold:     {success_threshold} BPS ({success_threshold / 100:.1f}%)")
+        print(f"  Quorum:                {quorum_bps} BPS ({quorum_bps / 100:.1f}%)")
+        print(f"  Proposal Expiration:   {proposal_exp} blocks (~{self.format_time_estimate(proposal_exp * 12)})")
         print(f"  Voting Delay:          {voting_delay} blocks (~{self.format_time_estimate(voting_delay * 12)})")
         print(f"  Voting Period:         {voting_period} blocks (~{self.format_time_estimate(voting_period * 12)})")
+        print(f"  Timelock Delay:        {min_delay} seconds (~{self.format_time_estimate(min_delay)})")
         print("=" * 100)
 
     def run(self):

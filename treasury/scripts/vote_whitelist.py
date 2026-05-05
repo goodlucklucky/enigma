@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--proposal-id", required=True, help="The Proposal ID")
     parser.add_argument("--support", required=True, type=str, choices=['true', 'false'], help="'false' = Against, 'true' = For")
     parser.add_argument("--pk", required=True, help="Validator Private Key")
-    parser.add_argument("--rpc", default="http://127.0.0.1:9944", help="RPC URL")
+    parser.add_argument("--rpc", required=True, help="RPC URL")
     args = parser.parse_args()
 
     contract = args.contract
@@ -83,7 +83,16 @@ def main():
         print("✅ Vote cast successfully!")
     else:
         err_out = res.stderr.strip() or res.stdout.strip()
-        print(f"❌ Failed to cast vote: \n   ↳ {parse_oz_custom_error(err_out)}")
+        parsed_err = parse_oz_custom_error(err_out)
+        print(f"❌ Failed to cast vote: \n   ↳ {parsed_err}")
+
+        if "GovernorAlreadyCastVote" in parsed_err:
+            print("   ↳ You have already voted on this proposal.")
+            sys.exit(0)
+        elif "gas required exceeds allowance" in err_out:
+            print("   ↳ ERROR: Gas estimation failed. This usually means:")
+            print("            1. Your EVM account (derived from --pk) has 0 TAO balance.")
+            print("            2. The transaction reverted (e.g., you are not an active, trusted validator).")
         sys.exit(1)
 
 if __name__ == "__main__":

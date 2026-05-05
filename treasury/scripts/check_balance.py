@@ -120,7 +120,6 @@ class VaultChecker:
         parser = argparse.ArgumentParser(description="Check Vault / Governor balances and stake")
         parser.add_argument("--address", required=True, help="EVM address of Vault or Governor")
         parser.add_argument("--rpc", required=True, help="RPC URL")
-        parser.add_argument("--name", type=str, default="Contract", help="Label (e.g. Vault, Governor)")
 
         args = parser.parse_args()
 
@@ -128,8 +127,6 @@ class VaultChecker:
         self.subtensor = bt.Subtensor(network=ws_url)
 
         print(f"\n{'='*90}")
-        print(f"CHECKING {args.name.upper()}")
-        print(f"{'='*90}")
         print(f"EVM Address : {args.address}")
         
         ss58 = self.get_ss58(args.address)
