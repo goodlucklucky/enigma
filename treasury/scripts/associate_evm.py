@@ -37,7 +37,12 @@ except ImportError:
 def main():
     parser = argparse.ArgumentParser(description="Associate EVM address with Bittensor hotkey")
     parser.add_argument("--hotkey", required=True, help="Hotkey SS58 address or 0x hex (32 bytes)")
-    parser.add_argument("--hotkey-seed", required=True, help="Hotkey seed phrase")
+    
+    # Mutually exclusive group so the user provides exactly one authentication method
+    auth_group = parser.add_mutually_exclusive_group(required=True)
+    auth_group.add_argument("--hotkey-seed", help="Hotkey seed phrase")
+    auth_group.add_argument("--hotkey-private-key", help="Hotkey private key / raw seed (0x hex)")
+    
     parser.add_argument("--netuid", type=int, required=True, help="The subnet netuid")
     parser.add_argument("--fast-mode", action="store_true", help="Apply fixes for fast localnet block production")
 
@@ -52,13 +57,35 @@ def main():
         hotkey_kp = Keypair(ss58_address=args.hotkey)
         hotkey_bytes = hotkey_kp.public_key
 
-    # Create keypair from the provided seed
-    hotkey_keypair = Keypair.create_from_uri(args.hotkey_seed)
+    # Create keypair from the provided seed or private key
+    if args.hotkey_private_key:
+        clean_hex = args.hotkey_private_key.replace("0x", "").replace("0X", "")
+        key_bytes = bytes.fromhex(clean_hex)
+        
+        if len(key_bytes) == 32:
+            # 32-byte seed (Maps to "secretSeed" in Polkadot/Substrate JSON)
+            hotkey_keypair = Keypair.create_from_seed(seed_hex=key_bytes)
+        elif len(key_bytes) == 64:
+            # 64-byte expanded private key (Maps to "privateKey" in Polkadot/Substrate JSON)
+            # We initialize it directly and pass the hotkey_bytes as the public key
+            hotkey_keypair = Keypair(
+                private_key=key_bytes,
+                public_key=hotkey_bytes,
+                ss58_format=42
+            )
+        else:
+            print(f"\n❌ ERROR: Invalid key length!")
+            print(f"   Expected 32 bytes (secret seed) or 64 bytes (private key).")
+            print(f"   You provided {len(key_bytes)} bytes.")
+            sys.exit(1)
+    else:
+        # Parse the mnemonic phrase
+        hotkey_keypair = Keypair.create_from_uri(args.hotkey_seed)
 
-    # SAFETY CHECK: Ensure the seed matches the target hotkey
+    # SAFETY CHECK: Ensure the seed/key matches the target hotkey
     if hotkey_keypair.public_key != hotkey_bytes:
         print(f"\n❌ ERROR: Security validation failed!")
-        print(f"   The seed provided in --hotkey-seed derives a different public key")
+        print(f"   The provided secret/seed derives a different public key")
         print(f"   than the target --hotkey: {args.hotkey}")
         sys.exit(1)
 

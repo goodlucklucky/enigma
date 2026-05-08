@@ -62,7 +62,7 @@ python3 treasury/scripts/associate_evm.py \
   --rpc-url <RPC_URL> \
   --private-key <YOUR_EVM_PRIVATE_KEY> \
   --hotkey <YOUR_HOTKEY_SS58_ADDRESS> \
-  --hotkey-seed "<YOUR_HOTKEY_SEED_PHRASE>" \
+  --hotkey-private-key "<YOUR_HOTKEY_PRIVATE_KEY>" \
   --netuid <SUBNET_ID>
 ```
 
