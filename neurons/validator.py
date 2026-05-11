@@ -39,7 +39,9 @@ class Validator(BaseValidatorNeuron):
         self.metrics_service = MetricsService(keypair=self.wallet.hotkey, network=self.subtensor.network, netuid=self.config.netuid, device=self.device)
         self.treasury_hotkey = TREASURY_HOTKEY
         self.last_heartbeat_time = 0
+        self.next_heartbeat_time = time.time() + 300  # Schedule first heartbeat in 5 minutes
         self.last_system_metrics_time = 0
+        self.next_system_metrics_time = time.time() + 300  # Schedule first system metrics in 5 minutes
 
         if self.treasury_hotkey:
             bt.logging.info("Constant-weight validator initialized")
@@ -59,19 +61,21 @@ class Validator(BaseValidatorNeuron):
         bt.logging.debug("forward() called (minimal validator)")
 
         # Send heartbeat every 5 minutes
-        if time.time() - self.last_heartbeat_time >= 300:
+        if time.time() >= self.next_heartbeat_time:
             try:
                 self.metrics_service.record_heartbeat(qbittensor.__version__)
                 bt.logging.info("Heartbeat sent - version {}".format(qbittensor.__version__))
                 self.last_heartbeat_time = time.time()
+                self.next_heartbeat_time += 300  # Schedule next in 5 minutes
             except Exception as e:
                 bt.logging.warning("Failed to send heartbeat: {}".format(e))
 
         # Send system metrics every 5 minutes
-        if time.time() - self.last_system_metrics_time >= 300:
+        if time.time() >= self.next_system_metrics_time:
             try:
                 self.metrics_service.record_system_metrics()
                 self.last_system_metrics_time = time.time()
+                self.next_system_metrics_time += 300  # Schedule next in 5 minutes
             except Exception as e:
                 bt.logging.warning(f"Failed to send system metrics: {e}")
 

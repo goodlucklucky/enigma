@@ -180,8 +180,7 @@ class MetricsService:
             }
             self.queue.put_nowait(item)
 
-            if bt.logging.isEnabledFor(bt.logging.DEBUG):
-                bt.logging.debug(f"Recorded datapoint: {item}")
+            bt.logging.debug(f"Recorded datapoint: {item}")
 
             return True
         except queue.Full:
@@ -198,56 +197,59 @@ class MetricsService:
 
     def record_startup_metrics(self):
         """Record startup system metrics (CPU family, count, GPU count/models)."""
-        timestamp = datetime.now(timezone.utc).isoformat()
-        cpu_family = platform.processor()
-        cpu_count = psutil.cpu_count()
-        self._enqueue_datapoint("system_cpu_family", timestamp, cpu_family)
-        self._enqueue_datapoint("system_cpu_count", timestamp, cpu_count)
+        try:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            cpu_family = platform.processor()
+            cpu_count = psutil.cpu_count()
+            self._enqueue_datapoint("system_cpu_family", timestamp, cpu_family)
+            self._enqueue_datapoint("system_cpu_count", timestamp, cpu_count)
 
-        # GPU info
-        if NVML_AVAILABLE:
-            try:
-                nvmlInit()
-                device_count = nvmlDeviceGetCount()
-                if self.device == "cpu":
-                    gpu_count = 0
-                    gpu_models = "none"
-                elif self.device.startswith("cuda:"):
-                    gpu_index = int(self.device.split(":")[1])
-                    if gpu_index < device_count:
-                        handle = nvmlDeviceGetHandleByIndex(gpu_index)
-                        gpu_count = 1
-                        gpu_models = nvmlDeviceGetName(handle).decode()
-                    else:
+            # GPU info
+            if NVML_AVAILABLE:
+                try:
+                    nvmlInit()
+                    device_count = nvmlDeviceGetCount()
+                    if self.device == "cpu":
                         gpu_count = 0
-                        gpu_models = "invalid device"
-                else:
-                    gpu_count = device_count
-                    gpu_models_list = []
-                    for i in range(device_count):
-                        handle = nvmlDeviceGetHandleByIndex(i)
-                        gpu_models_list.append(nvmlDeviceGetName(handle).decode())
-                    gpu_models = ", ".join(gpu_models_list)
-            except Exception as e:
-                bt.logging.warning(f"Failed to get GPU info: {e}")
-                gpu_count = 0
-                gpu_models = "error"
-        else:
-            gpu_count = 0
-            gpu_models = "pynvml not available"
-
-        self._enqueue_datapoint("system_gpu_count", timestamp, gpu_count)
-        self._enqueue_datapoint("system_gpu_models", timestamp, gpu_models)
-
-        # Store GPU indices for periodic metrics
-        self.gpu_indices = []
-        if gpu_count > 0:
-            if self.device == "cpu":
-                pass
-            elif self.device.startswith("cuda:"):
-                self.gpu_indices = [gpu_index]
+                        gpu_models = "none"
+                    elif self.device.startswith("cuda:"):
+                        gpu_index = int(self.device.split(":")[1])
+                        if gpu_index < device_count:
+                            handle = nvmlDeviceGetHandleByIndex(gpu_index)
+                            gpu_count = 1
+                            gpu_models = nvmlDeviceGetName(handle).decode()
+                        else:
+                            gpu_count = 0
+                            gpu_models = "invalid device"
+                    else:
+                        gpu_count = device_count
+                        gpu_models_list = []
+                        for i in range(device_count):
+                            handle = nvmlDeviceGetHandleByIndex(i)
+                            gpu_models_list.append(nvmlDeviceGetName(handle).decode())
+                        gpu_models = ", ".join(gpu_models_list)
+                except Exception as e:
+                    bt.logging.warning(f"Failed to get GPU info: {e}")
+                    gpu_count = 0
+                    gpu_models = "error"
             else:
-                self.gpu_indices = list(range(device_count))
+                gpu_count = 0
+                gpu_models = "pynvml not available"
+
+            self._enqueue_datapoint("system_gpu_count", timestamp, gpu_count)
+            self._enqueue_datapoint("system_gpu_models", timestamp, gpu_models)
+
+            # Store GPU indices for periodic metrics
+            self.gpu_indices = []
+            if gpu_count > 0:
+                if self.device == "cpu":
+                    pass
+                elif self.device.startswith("cuda:"):
+                    self.gpu_indices = [gpu_index]
+                else:
+                    self.gpu_indices = list(range(device_count))
+        except Exception as e:
+            bt.logging.warning(f"Startup metrics recording failed: {e}")
 
     def record_system_metrics(self):
         """Record periodic system metrics (CPU/RAM usage, GPU util/memory)."""
@@ -270,7 +272,7 @@ class MetricsService:
 
             bt.logging.info("System metrics sent")
         except Exception as e:
-            bt.logging.warning(f"Failed to send system metrics: {e}")
+            bt.logging.warning(f"System metrics recording failed: {e}")
 
     def shutdown(self):
         """

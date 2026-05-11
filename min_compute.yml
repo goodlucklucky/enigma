@@ -55,8 +55,8 @@ compute_spec:
       recommended_gpu: "RTX PRO 6000"
 
     memory:
-      min_ram: 180
-      recommended_ram: 180
+      min_ram: 96
+      recommended_ram: 96
 
     storage:
       min_space: 50

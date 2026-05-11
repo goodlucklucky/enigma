@@ -135,8 +135,8 @@ class TestValidator:
 
     def test_forward_heartbeat_sent_when_due(self, mock_validator):
         """Test that heartbeat is sent when 5 minutes have passed."""
-        # Set last heartbeat time to more than 5 minutes ago
-        mock_validator.last_heartbeat_time = time.time() - 301
+        # Set next heartbeat time to past
+        mock_validator.next_heartbeat_time = time.time() - 1
 
         # Mock the metrics service
         mock_validator.metrics_service.record_heartbeat = Mock()
@@ -152,12 +152,14 @@ class TestValidator:
 
         # Assert timestamp was updated (should be >= before_time)
         assert mock_validator.last_heartbeat_time >= before_time
+        # Assert next heartbeat time was scheduled approximately 300 seconds later
+        assert abs(mock_validator.next_heartbeat_time - (before_time + 300)) < 10
 
     def test_forward_heartbeat_not_sent_too_soon(self, mock_validator):
         """Test that heartbeat is not sent if less than 5 minutes have passed."""
-        # Set last heartbeat time to recently
-        initial_time = time.time() - 100  # less than 300 seconds
-        mock_validator.last_heartbeat_time = initial_time
+        # Set next heartbeat time to future
+        future_time = time.time() + 100
+        mock_validator.next_heartbeat_time = future_time
 
         # Mock the metrics service
         mock_validator.metrics_service.record_heartbeat = Mock()
@@ -168,5 +170,5 @@ class TestValidator:
         # Assert heartbeat was not called
         mock_validator.metrics_service.record_heartbeat.assert_not_called()
 
-        # Assert timestamp was not updated
-        assert mock_validator.last_heartbeat_time == initial_time
+        # Assert next heartbeat time was not changed
+        assert mock_validator.next_heartbeat_time == future_time
