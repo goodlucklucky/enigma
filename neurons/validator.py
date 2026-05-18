@@ -109,6 +109,7 @@ class Validator(BaseValidatorNeuron):
 # The main function parses the configuration and runs the validator.
 if __name__ == "__main__":
     with Validator() as validator:
-        while True:
+        while validator.is_running and validator.thread and validator.thread.is_alive():
             bt.logging.info("Validator running... {}".format(time.time()))
             time.sleep(5)
+        bt.logging.warning("Validator background thread has stopped. Exiting.")

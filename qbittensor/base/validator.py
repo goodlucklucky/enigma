@@ -134,35 +134,36 @@ class BaseValidatorNeuron(BaseNeuron):
         # This loop maintains the validator's operations until intentionally stopped.
         try:
             while True:
-                bt.logging.info(f"step({self.step}) block({self.block})")
+                try:
+                    bt.logging.info(f"step({self.step}) block({self.block})")
 
-                # Run single forward.
-                self.forward()
+                    # Run single forward.
+                    self.forward()
 
-                # Check if we should exit.
-                if self.should_exit:
-                    break
+                    # Check if we should exit.
+                    if self.should_exit:
+                        break
 
-                # Sync metagraph and potentially set weights.
-                self.sync()
+                    # Sync metagraph and potentially set weights.
+                    self.sync()
 
-                # Sleep to rate limit the loop and reduce CPU usage.
-                time.sleep(self.config.neuron.forward_sleep_interval)
+                    # Sleep to rate limit the loop and reduce CPU usage.
+                    time.sleep(self.config.neuron.forward_sleep_interval)
 
-                self.step += 1
+                    self.step += 1
+                except Exception as err:
+                    bt.logging.error(f"Error during validation: {str(err)}")
+                    bt.logging.debug(
+                        str(print_exception(type(err), err, err.__traceback__))
+                    )
+                    # Continue the loop after transient errors (e.g. handshake timeout)
+                    time.sleep(5)
 
         # If someone intentionally stops the validator, it'll safely terminate operations.
         except KeyboardInterrupt:
             self.axon.stop()
             bt.logging.success("Validator killed by keyboard interrupt.")
             exit()
-
-        # In case of unforeseen errors, the validator will log the error and continue operations.
-        except Exception as err:
-            bt.logging.error(f"Error during validation: {str(err)}")
-            bt.logging.debug(
-                str(print_exception(type(err), err, err.__traceback__))
-            )
 
     def run_in_background_thread(self):
         """
