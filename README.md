@@ -4,13 +4,13 @@
 
 # **Enigma** (SN 63) <!-- omit in toc -->
 [![Discord Chat](https://img.shields.io/discord/1395424987816661103)](https://discord.gg/Gfr2mhft)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
 
 ## Decentralized Challenge Platform on Bittensor
 
-[Discord](https://discord.gg/Gfr2mhft) • [Network](https://taostats.io/subnets/63) • [Website](https://www.qbittensorlabs.com/enigma) • [GitHub](https://github.com/qbittensor-labs/enigma)
+[Discord](https://discord.gg/xJ9JKPMJQD) • [Network](https://taostats.io/subnets/63) • [Website](https://www.qbittensorlabs.com/enigma) • [GitHub](https://github.com/qbittensor-labs/enigma)
 
 </div>
 
@@ -27,7 +27,7 @@ By leveraging Bittensor's incentive layer, Enigma turns critical security resear
 ## How Enigma Works
 
 1. **Challenges are posted** with funded prize pools in SN63 Alpha.
-2. **Participants compete** by submitting verified solutions (code + exploits). Unlimited resubmissions allowed.
+2. **Participants compete** by submitting verified solutions (code + exploits). Unlimited resubmissions allowed. See [Miner Setup](#miner-setup) for how to submit.
 3. **Validators** score and verify solutions. A dedicated validator sets weights to the treasury wallet to distribute emissions and rewards.
 4. **Winner takes all** — the first valid solution drains the prize. Proof is on-chain.
 5. **Code is published** as open source after verification.
@@ -73,44 +73,27 @@ Challenges and prizes will be paid to the winner based upon a proposal and vote 
 
 ---
 
-## Voting
+## Current Live Challenge: Coming Soon
 
-*__Note:__ Please make sure to follow [the setup guide](#installation--setup-validator-only) first.*
+---
+
+## Voting Setup
+
+To participate in Treasury Governance and cast votes on proposals, validators must follow the [Validator Onboarding Guide](VALIDATORS.md) which provides setup instructions for an EVM wallet.
 
 - [Validator Voting Guide](VOTING.md)
 
 ---
 
-## Current Live Challenge: Breaking Treasury Wallets
+## Validator Setup
 
-- **Prize**: Entire contents of the treasury wallet (~$5,000 USD in SN63 Alpha at launch).
-- **Target**: Drain the **test** treasury wallet by any means (exploit code, consensus attacks, social engineering, etc.).
-- **Wallet Details**:
-  - Contract Address: `0x4DE748C04811d06c80D9c8234932Cb25A552B080`
-  - SS58 Cold Key: `5FsKhxJZuVpPU9JCpZcZvUW8cxqSZHDGAJrdmqTbXfRfTJWD`
-- **Rules**: First to drain wins. No partial prizes. No time limit. Disclose method to `support@qbittensorlabs.com` (identity optional).
-- **Participation**: Participation: Open to anyone. More details on the [Enigma website](https://www.qbittensorlabs.com/enigma).
-- **Deployment & Setup**: For detailed instructions on deploying and managing the Treasury Wallet, see [treasury/README.md](treasury/).
+For complete validator operator instructions (environment variables, Docker requirements, local database, high-level operation, etc.) see the dedicated guide:
 
-More challenges (Q-Day cryptography, AI security, etc.) are coming soon.
+**→ [qbittensor/validator/README.md](qbittensor/validator/README.md)**
 
----
+### Quick Launch
 
-## Installation & Setup (Validator Only)
-
-**Note**: Miner code is deprecated. Only validators are currently supported. The validator automatically sets weights to the treasury wallet.
-
-### Prerequisites
-- Python 3.12+
-- PM2 (recommended)
-- Git
-- [Validator Compute Requirements](min_compute.yml)
-
-### Voting Setup
-
-To participate in Treasury Governance and cast votes on proposals, validators must follow the [Validator Onboarding Guide](VALIDATORS.md) which provides setup instructions for an EVM wallet.
-
-### Runtime Setup (PM2)
+#### With PM2 (recommended)
 
 ```bash
 # 1. Create and activate virtual environment
@@ -130,31 +113,34 @@ pm2 start --interpreter .venv/bin/python --name enigma-validator neurons/validat
 
 #### Running Without PM2
 
-To run the validator directly in the terminal (foreground):
-
 ```bash
 python neurons/validator.py --netuid 63 --logging.info --wallet.name <your_wallet_name> --wallet.hotkey <your_hotkey>
 ```
 
-### Setting GPU Device
+### GPU Device
 
-To bind the validator to a specific GPU, use the `--neuron.device` flag:
+To bind the validator to a specific GPU, use the `--neuron.device` flag (see the validator README for details).
 
-```bash
-python neurons/validator.py --netuid 63 --logging.info --wallet.name <your_wallet_name> --wallet.hotkey <your_hotkey> --neuron.device cuda:0
-```
+## Miner Setup
 
-This sets the validator to use only the specified device, and system metrics will reflect only that GPU. If not specified, it defaults to the first available GPU or CPU.
+See the dedicated miner operator guide:
+
+**→ [qbittensor/miner/README.md](qbittensor/miner/README.md)**
+
+## Minimum Compute Requirements
+
+**Validator** (high requirements):
+- GPU: RTX PRO 6000 96 GB VRAM
+- CPU: 26 cores at 2.5 GHz+
+- RAM: 96 GB
+
+**Miner** (lightweight):
+- GPU: Not required
+- CPU: 1 core minimum at 2.0 GHz+
+- RAM: 8 GB minimum
+
+Full details (including storage, OS, and network recommendations) are in [`min_compute.yml`](min_compute.yml).
 
 ## Development
 
-### Additional Setup
-
-```bash
-pip install -r requirements-dev.txt
-```
-
-Run Tests:
-```bash
-pytest .
-```
+For contributor setup, development workflow, testing, and linting instructions (including the required `pip install -e .` step and `pip install -r requirements-dev.txt`), see [CONTRIBUTING.md](CONTRIBUTING.md).

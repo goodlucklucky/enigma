@@ -51,11 +51,11 @@ def main():
         "--rpc-url", args.rpc
     ]
     state_res = subprocess.run(state_cmd, capture_output=True, text=True)
-    
+
     if state_res.returncode != 0:
         print(f"❌ Proposal {prop_id} not found or error querying state on {contract}.")
         sys.exit(1)
-        
+
     try:
         state_val = int(state_res.stdout.strip().split()[0])
         if state_val != 1:
@@ -65,7 +65,7 @@ def main():
             print("   ↳ You can only vote on 'Active' proposals.")
             sys.exit(1)
     except ValueError:
-        pass 
+        pass
 
     support_val = 1 if args.support.lower() == 'true' else 0
     cmd = [
@@ -78,7 +78,7 @@ def main():
 
     print(f"\n🗳️  Casting vote {args.support} (value {support_val}) for whitelist proposal...")
     res = subprocess.run(cmd, capture_output=True, text=True)
-    
+
     if res.returncode == 0:
         print("✅ Vote cast successfully!")
     else:

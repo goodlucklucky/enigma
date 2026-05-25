@@ -8,7 +8,7 @@ Before you begin, you need to set up your environment with the necessary tools a
 
 ### Python Dependencies
 
-Follow the [Quick Setup](README.md#quick-setup) guide to install necessary python packages and `btcli`.
+Follow the [Installation & Setup](README.md#installation--setup-validator-only) section of the main README to install the package (including `bittensor[cli]`, which provides the `btcli` command).
 
 ### Foundry Toolchain
 
@@ -53,7 +53,7 @@ btcli wallet transfer --wallet.name <YOUR_COLDKEY> --dest <THE_SS58_ADDRESS> --a
 
 ## 4. Associate the EVM Wallet with Your Hotkey
 
-You must cryptographically link your EVM wallet to your Bittensor hotkey so the smart contract recognizes your voting power. 
+You must cryptographically link your EVM wallet to your Bittensor hotkey so the smart contract recognizes your voting power.
 
 Run the `associate_evm.py` script:
 

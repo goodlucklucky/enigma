@@ -37,12 +37,12 @@ except ImportError:
 def main():
     parser = argparse.ArgumentParser(description="Associate EVM address with Bittensor hotkey")
     parser.add_argument("--hotkey", required=True, help="Hotkey SS58 address or 0x hex (32 bytes)")
-    
+
     # Mutually exclusive group so the user provides exactly one authentication method
     auth_group = parser.add_mutually_exclusive_group(required=True)
     auth_group.add_argument("--hotkey-seed", help="Hotkey seed phrase")
     auth_group.add_argument("--hotkey-private-key", help="Hotkey private key / raw seed (0x hex)")
-    
+
     parser.add_argument("--netuid", type=int, required=True, help="The subnet netuid")
     parser.add_argument("--fast-mode", action="store_true", help="Apply fixes for fast localnet block production")
 
@@ -61,7 +61,7 @@ def main():
     if args.hotkey_private_key:
         clean_hex = args.hotkey_private_key.replace("0x", "").replace("0X", "")
         key_bytes = bytes.fromhex(clean_hex)
-        
+
         if len(key_bytes) == 32:
             # 32-byte seed (Maps to "secretSeed" in Polkadot/Substrate JSON)
             hotkey_keypair = Keypair.create_from_seed(seed_hex=key_bytes)

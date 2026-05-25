@@ -73,14 +73,14 @@ def setup_web3_with_account(args):
 def parse_oz_custom_error(err_out: str) -> str:
     """Extracts and formats known OpenZeppelin custom errors from cast output."""
     reason = err_out.split("revert ")[-1].split(", data:")[0].strip() if "revert " in err_out else err_out
-    
+
     if not reason and "data:" in err_out:
         hex_data = err_out.split('data:')[-1].strip().replace('"', '')
         selector = hex_data[:10].lower()
-        
+
         if selector in OZ_CUSTOM_ERRORS:
             error_name = OZ_CUSTOM_ERRORS[selector]
-            
+
             if selector == "0x31b75e4d" and len(hex_data) >= 138:
                 try:
                     state_val = int(hex_data[74:138], 16)
@@ -90,5 +90,5 @@ def parse_oz_custom_error(err_out: str) -> str:
                     pass
             return f"Contract Error: {error_name}"
         return f"Contract Custom Error {hex_data}"
-        
+
     return reason or err_out

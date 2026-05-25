@@ -61,7 +61,7 @@ export TREASURY_ADMIN="${TREASURY_ADMIN:-$INITIAL_VALIDATOR}" # Fallback to vali
 export INITIAL_VALIDATOR="${INITIAL_VALIDATOR:-}"
 
 # Forces Foundry to ask for 1 thing at a time instead of 100
-export ETH_RPC_MAX_BATCH_SIZE=1 
+export ETH_RPC_MAX_BATCH_SIZE=1
 # Forces Foundry to wait between requests
 export ETH_RPC_MAX_REQUESTS_PER_SECOND=2
 

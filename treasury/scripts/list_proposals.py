@@ -71,11 +71,11 @@ class ProposalViewer:
         snapshot_res = self.cast_call("proposalSnapshot(uint256)(uint256)", [str(proposal_id)])
         deadline_res = self.cast_call("proposalDeadline(uint256)(uint256)", [str(proposal_id)])
         eta_res = self.cast_call("proposalEta(uint256)(uint256)", [str(proposal_id)])
-        
+
         snapshot = int(snapshot_res.split()[0]) if snapshot_res and snapshot_res.split()[0].isdigit() else 0
         deadline = int(deadline_res.split()[0]) if deadline_res and deadline_res.split()[0].isdigit() else 0
         eta = int(eta_res.split()[0]) if eta_res and eta_res.split()[0].isdigit() else 0
-        
+
         return snapshot, deadline, eta, self.get_current_block()
 
     def evm_to_ss58(self, evm_addr: str) -> str:
@@ -95,7 +95,7 @@ class ProposalViewer:
             if output and output != "[]":
                 clean_output = output.strip("[]").replace('"', '').replace("'", "")
                 hex_keys = [k.strip() for k in clean_output.split(",") if k.strip()]
-                
+
                 ss58_keys = []
                 try:
                     import substrateinterface
@@ -112,7 +112,7 @@ class ProposalViewer:
 
     def decode_payload(self, calldata_str: str, target_addr: str) -> str:
         raw_calldata = calldata_str.strip("[]").split(",")[0].strip()
-        
+
         if not raw_calldata.startswith("0x") or len(raw_calldata) < 10:
             ss58_target = self.evm_to_ss58(target_addr)
             return f"Type: Native TAO Transfer\n      Recipient: {target_addr} (SS58: {ss58_target})"
@@ -121,7 +121,7 @@ class ProposalViewer:
             "updateTrustedValidators(address[],bool[])": ["Validators", "Trusted Status"],
             "transfer(address,uint256)": ["ERC20 Recipient", "Amount"],
             "transferStake(bytes32,bytes32,uint256,uint256,uint256)": [
-                "Destination Coldkey", "Source Hotkey", "Origin Netuid", 
+                "Destination Coldkey", "Source Hotkey", "Origin Netuid",
                 "Destination Netuid", "Amount (Alpha)"
             ]
         }
@@ -132,20 +132,20 @@ class ProposalViewer:
             cmd_sig = ["cast", "sig", sig]
             res_sig = subprocess.run(cmd_sig, capture_output=True, text=True)
             expected_selector = res_sig.stdout.strip().lower()
-            
+
             if actual_selector == expected_selector:
                 cmd = ["cast", "calldata-decode", sig, raw_calldata]
                 res = subprocess.run(cmd, capture_output=True, text=True)
-                
+
                 if res.returncode == 0:
                     lines = res.stdout.strip().split('\n')
                     method_name = sig.split('(')[0]
-                    
+
                     output = f"Type: {method_name}\n"
-                    
+
                     if len(lines) == len(labels):
                         for label, val in zip(labels, lines):
-                            clean_val = val.strip("[]") 
+                            clean_val = val.strip("[]")
                             raw_str_val = clean_val.split(' ')[0]
 
                             if label == "Amount (Alpha)":
@@ -167,7 +167,7 @@ class ProposalViewer:
                                     kp = substrateinterface.Keypair(public_key=bytes.fromhex(clean_val[2:]), ss58_format=42)
                                     val = f"{val} (SS58: {kp.ss58_address})"
                                 except Exception:
-                                    pass 
+                                    pass
                             elif "0x" in clean_val:
                                 evm_addrs = re.findall(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])', clean_val)
                                 if evm_addrs:
@@ -176,21 +176,21 @@ class ProposalViewer:
                                         ss58_mapped = self.evm_to_ss58(evm_addr)
                                         hotkeys = self.get_hotkeys_for_evm(evm_addr)
                                         hk_info = f" [Hotkeys: {', '.join(hotkeys)}]" if hotkeys else ""
-                                        
+
                                         if ss58_mapped and ss58_mapped not in ("unknown", "error"):
                                             replacement = f"{evm_addr} (SS58: {ss58_mapped}){hk_info}"
                                         else:
                                             replacement = f"{evm_addr}{hk_info}"
-                                            
+
                                         val_mod = val_mod.replace(evm_addr, replacement)
                                     val = val_mod
-                                    
+
                             output += f"      {label}: {val}\n"
                     else:
                         output += f"      Raw Args: {res.stdout.strip().replace(chr(10), ' ')}\n"
-                        
+
                     return output.strip()
-        
+
         return f"Type: Unknown Payload\n      Selector: {actual_selector}\n      Raw: {raw_calldata[:60]}..."
 
     def format_time_estimate(self, secs: int) -> str:
@@ -217,14 +217,14 @@ class ProposalViewer:
         except ValueError:
             numeric_id = prop_id
             hex_id = prop_id
-            
+
         state_str = self.get_state(numeric_id)
         state_int = -1
         if state_str != "Error":
             state_int = int(state_str.split()[0])
-            
+
         snapshot, deadline, eta, current_block = self.get_proposal_timings(numeric_id)
-        
+
         timing_str = f"Snapshot: {snapshot} | Deadline: {deadline}"
         if state_int == 0: # Pending
             blocks = snapshot - current_block
@@ -243,15 +243,15 @@ class ProposalViewer:
                 timing_str = "Timelock expired - Ready to Execute!"
 
         clean_target = targets.strip("[]")
-        
+
         # Format Native TAO Value
         clean_value_str = values.strip("[]").split(' ')[0]
         try:
             native_tao_amt = float(clean_value_str) / 1e18
             formatted_values = f"{native_tao_amt:,.4f} TAO"
         except ValueError:
-            formatted_values = values 
-        
+            formatted_values = values
+
         decoded_info = self.decode_payload(calldatas, clean_target)
 
         print(f"    ID:       {hex_id}")
@@ -265,10 +265,10 @@ class ProposalViewer:
 
     def _print_contract_config(self):
         print("🔍 Contract Configuration:")
-        
+
         name = self.cast_call("name()(string)")
         name = name.strip('"') if name else "Unknown"
-        
+
         def extract_int(val_str):
             if val_str:
                 parts = val_str.split()
@@ -278,7 +278,7 @@ class ProposalViewer:
 
         target_netuid = extract_int(self.cast_call("TARGET_NETUID()(uint16)"))
         treasury_admin = self.cast_call("treasuryAdmin()(address)")
-        
+
         tao_limit = extract_int(self.cast_call("TAO_LIMIT()(uint256)"))
         alpha_limit = extract_int(self.cast_call("ALPHA_LIMIT()(uint256)"))
         erc20_limit = extract_int(self.cast_call("ERC20_LIMIT()(uint256)"))
@@ -333,25 +333,25 @@ class ProposalViewer:
             print(f"→ Inspecting Proposal ID: {args.id}")
             # Note: proposalDetails returns 4 items: (targets, values, calldatas, descriptionHash)
             raw_details = self.cast_call(
-                "proposalDetails(uint256)(address[],uint256[],bytes[],bytes32)", 
+                "proposalDetails(uint256)(address[],uint256[],bytes[],bytes32)",
                 [args.id]
             )
-            
+
             if not raw_details:
                 print(f"    ❌ Failed to fetch details. Are you sure Proposal '{args.id}' exists?")
                 return
-                
+
             output = raw_details.split('\n')
             if len(output) >= 4:
                 targets = output[0].strip()
                 values = output[1].strip()
                 calldatas = output[2].strip()
                 desc_hash = output[3].strip()
-                
+
                 self._print_formatted_proposal(args.id, targets, values, calldatas, desc_hash)
             else:
                 print(f"    Raw Output: {raw_details}")
-            
+
             return
 
         # ---------------------------------------------------------
@@ -361,7 +361,7 @@ class ProposalViewer:
         if res_count is None:
             print("❌ Failed to fetch proposal count. Is the contract address correct?")
             return
-            
+
         total = int(res_count.split()[0])
         print(f"Total proposals ever created: {total}\n")
 
@@ -370,29 +370,29 @@ class ProposalViewer:
             return
 
         start = max(0, total - args.limit)
-        
+
         for i in range(total - 1, start - 1, -1):
             print(f"→ Index #{i}")
-            
+
             # Note: proposalDetailsAt returns 5 items: (id, targets, values, calldatas, descriptionHash)
             raw_details = self.cast_call(
-                "proposalDetailsAt(uint256)(uint256,address[],uint256[],bytes[],bytes32)", 
+                "proposalDetailsAt(uint256)(uint256,address[],uint256[],bytes[],bytes32)",
                 [str(i)]
             )
-            
+
             if not raw_details:
                 print("    ❌ Failed to fetch details.")
                 print("-" * 80)
                 continue
-                
+
             output = raw_details.split('\n')
             if len(output) >= 5:
-                prop_id = output[0].split()[0].strip() 
+                prop_id = output[0].split()[0].strip()
                 targets = output[1].strip()
                 values = output[2].strip()
                 calldatas = output[3].strip()
                 desc_hash = output[4].strip()
-                
+
                 self._print_formatted_proposal(prop_id, targets, values, calldatas, desc_hash)
             else:
                 print(f"    Raw Output: {raw_details}")

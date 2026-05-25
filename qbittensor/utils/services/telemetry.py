@@ -1,15 +1,35 @@
-import os
+# The MIT License (MIT)
+# Copyright © 2026 qBitTensor Labs
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
 import time
 import bittensor as bt
-import requests
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
-from .jwt_manager import JWTManager
 import queue
 import threading
 import psutil
 import platform
+
+from qbittensor.utils.request.request_manager import RequestManager
+from qbittensor.utils.timer import Timer
+import qbittensor
+from qbittensor.utils.time import timestamp_iso
+
 try:
     from pynvml import *
     NVML_AVAILABLE = True
@@ -17,41 +37,62 @@ except ImportError:
     NVML_AVAILABLE = False
     bt.logging.warning("pynvml not available, GPU metrics will be skipped")
 
-class MetricsService:
-    def __init__(self, keypair, netuid: int = 63, device: str = "cpu", export_interval_millis=5000, network: str = "", max_queue_size=1000, batch_size=10, retry_attempts=3, retry_delay=1):
+class TelemetryService:
+    def __init__(
+        self,
+        request_manager: Optional[RequestManager] = None,
+        device: str = "cpu",
+        export_interval_millis=5000,
+        max_queue_size=1000,
+        batch_size=10,
+        retry_attempts=3,
+        retry_delay=1,
+        service_name: Optional[str] = None,
+        network: Optional[str] = None,
+        *,
+        keypair: Optional[bt.Keypair] = None,
+        base_url: Optional[str] = None,
+        tensorauth_url: Optional[str] = None,
+        netuid: Optional[int] = None,
+    ):
         """
-        Initialize the MetricsService.
-        Metrics are disabled if the METRICS_API_URL environment variable is not set or keypair is missing.
-        :param keypair: Bittensor Keypair required for JWT authentication.
-        :param netuid: Network UID for the subnet.
-        :param device: Device string (e.g., "cuda:0", "cpu") for GPU filtering.
-        :param export_interval_millis: Flush interval in ms (for background sending).
-        :param network: Deployment network (logged but not used in requests).
-        :param max_queue_size: Max size of the internal queue before dropping items.
-        :param batch_size: Number of items to batch per send (if API supports; otherwise 1).
-        :param retry_attempts: Max retries per send.
-        :param retry_delay: Initial retry delay in seconds (exponential backoff).
+        Telemetry / metrics service for validators and miners.
+
+        Recommended: pass keypair + base_url (telemetry) + tensorauth_url + netuid
+        and the service will create its own RequestManager (one RM per client).
+
+        Alternatively, pass a pre-configured request_manager (advanced / testing).
         """
-        self.base_url = os.environ.get("METRICS_API_URL", "https://telemetry.qbittensorlabs.com")
-        self.service_name = f"bittensor.sn{netuid}.validator"
-        self.validator_hotkey = keypair.ss58_address
-        self.network = network
-        self.keypair = keypair
+        if request_manager is not None:
+            self.request_manager = request_manager
+        elif keypair is not None and base_url is not None:
+            self.request_manager = RequestManager(
+                keypair,
+                base_url=base_url,
+                tensorauth_url=tensorauth_url,
+                netuid=netuid,
+            )
+        else:
+            raise ValueError(
+                "TelemetryService requires either request_manager or (keypair + base_url)"
+            )
         self.max_queue_size = max_queue_size
         self.batch_size = batch_size
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
-        self.flush_interval = export_interval_millis / 1000.0  # Convert to seconds
-
-        bt.logging.info(f"Metrics sending to: {self.base_url}")
-        self.jwt_manager = JWTManager(self.keypair, netuid=netuid)
-        self.jwt = None
-        self.session = requests.Session()
+        self.flush_interval = export_interval_millis / 1000.0
+        self.device = device
+        self.gpu_indices = []
         self.queue = queue.Queue(maxsize=max_queue_size)
         self._stop_event = threading.Event()
         self._worker_thread = None
-        self.device = device
-        self.gpu_indices = []
+        self.heartbeat_timer = Timer(timeout=timedelta(minutes=5), run=self.record_heartbeat, run_on_start=True)
+        self.system_metrics_timer = Timer(timeout=timedelta(minutes=5), run=self.record_system_metrics, run_on_start=True)
+
+        self._service_name = service_name
+        self._network = network
+
+        bt.logging.info("TelemetryService initialized (using RequestManager for all API calls)")
         self._start_background_worker()
 
     def _to_python_scalar(self, x: Any) -> Any:
@@ -93,57 +134,56 @@ class MetricsService:
         self._worker_thread.start()
 
     def _flush_batch(self, batch: list[Dict[str, Any]]) -> None:
-        """Flush a batch of datapoints as a single API request (wrap in 'datapoints' array)."""
-        # Construct batch payload once, send in one request (instead of one-by-one)
+        """Flush a batch of datapoints via the RequestManager (single POST to /v1/datapoints)."""
+        # Build the payload once
         datapoints = []
         for item in batch:
             payload_item = {
-                "type": item['type'],
-                "timestamp": item['timestamp'],
+                "type": item["type"],
+                "timestamp": item["timestamp"],
             }
-            if item.get('miner_uid') is not None:
-                payload_item["minerUid"] = item['miner_uid']
-            if item.get('miner_hotkey'):
-                payload_item["minerHotkey"] = item['miner_hotkey']
-            if isinstance(item['value'], (int, float)):
-                payload_item["numericValue"] = item['value']
+            if item.get("miner_uid") is not None:
+                payload_item["miner_uid"] = item["miner_uid"]
+            if item.get("miner_hotkey"):
+                payload_item["miner_hotkey"] = item["miner_hotkey"]
+            if isinstance(item["value"], (int, float)):
+                payload_item["numeric_value"] = item["value"]
             else:
-                payload_item["stringValue"] = item['value']
-            if item.get('attributes'):
-                payload_item["attributes"] = item['attributes']
+                payload_item["string_value"] = item["value"]
+            if item.get("attributes"):
+                payload_item["attributes"] = item["attributes"]
             datapoints.append(payload_item)
 
-        # Send the full batch
+        additional_headers = []
+        if self._service_name:
+            additional_headers.append(("X-Service-Name", self._service_name))
+        if self._network:
+            additional_headers.append(("X-Network", self._network))
+
+        # Retry loop around the RequestManager call
         for attempt in range(self.retry_attempts):
             try:
-                headers = {
-                    "Authorization": f"Bearer {self._get_current_jwt()}",
-                    "Content-Type": "application/json",
-                    "X-Service-Name": self.service_name,
-                    "X-Network": self.network,
-                }
-                url = f"{self.base_url}/v1/datapoints"
-                response = self.session.post(url, json={"datapoints": datapoints}, headers=headers, timeout=5.0)
-                response.raise_for_status()
-                # Mark all as done after successful batch send
-                for _ in batch:
-                    self.queue.task_done()
-                break
+                response = self.request_manager.post(
+                    "v1/datapoints",
+                    json={"datapoints": datapoints},
+                    additional_headers=additional_headers,
+                )
+                if 200 <= response.status_code <= 299:
+                    for _ in batch:
+                        self.queue.task_done()
+                    return
+                else:
+                    raise RuntimeError(f"Telemetry POST returned {response.status_code}")
             except Exception as e:
                 bt.logging.warning(f"Batch send attempt {attempt + 1} failed (size {len(batch)}): {e}")
                 if attempt < self.retry_attempts - 1:
-                    time.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
+                    time.sleep(self.retry_delay * (2 ** attempt))
                 else:
-                    bt.logging.error(f"Failed to send batch of {len(batch)} after {self.retry_attempts} attempts; dropping.")
-                    # Mark as done even on failure to avoid stuck queue
+                    bt.logging.error(
+                        f"Failed to send batch of {len(batch)} after {self.retry_attempts} attempts; dropping."
+                    )
                     for _ in batch:
                         self.queue.task_done()
-
-    def _get_current_jwt(self) -> str:
-        """Get or refresh JWT access token if expired."""
-        if not self.jwt or self.jwt.expiration_date < datetime.now(timezone.utc):
-            self.jwt = self.jwt_manager.get_jwt()
-        return self.jwt.access_token
 
     def _enqueue_datapoint(self, type: str, timestamp: str, value: float | str, miner_uid: Optional[int] = None, miner_hotkey: Optional[str] = None, attributes: Optional[Dict[str, Any]] = None) -> bool:
         """Enqueue a datapoint; return True if enqueued, False if queue full (dropped)."""
@@ -187,13 +227,15 @@ class MetricsService:
             bt.logging.warning(f"Queue full; dropping datapoint {type}")
             return False
 
-    def record_heartbeat(self, version: str):
+    def record_heartbeat(self):
+        version = qbittensor.__version__
+        bt.logging.info(f"🫀 Recording heartbeat version: {version}")
         try:
-            timestamp = datetime.now(timezone.utc).isoformat()
+            timestamp: str = timestamp_iso()
             # Record version as string
             self._enqueue_datapoint("heartbeat_version", timestamp, version)
         except Exception as e:
-            bt.logging.debug(f"Failed to enqueue heartbeat: {e}")
+            bt.logging.info(f"Failed to enqueue heartbeat: {e}")
 
     def record_startup_metrics(self):
         """Record startup system metrics (CPU family, count, GPU count/models)."""
@@ -276,15 +318,16 @@ class MetricsService:
 
     def shutdown(self):
         """
-        Shuts down the requests session and flushes the queue.
-        This should be called during application cleanup.
+        Stop the background worker, flush any remaining datapoints, and shut down.
+        Note: We do not close the RequestManager's session (it may be shared).
         """
         try:
             bt.logging.info("Shutting down metrics service...")
             self._stop_event.set()
             if self._worker_thread:
-                self._worker_thread.join(timeout=5.0)  # Wait up to 5s for flush
-            # Force flush remaining
+                self._worker_thread.join(timeout=5.0)
+
+            # Force flush remaining items
             batch = []
             while not self.queue.empty():
                 try:
@@ -293,7 +336,7 @@ class MetricsService:
                     break
             if batch:
                 self._flush_batch(batch)
-            self.session.close()
+
             bt.logging.info("Metrics service shutdown complete. ✅")
         except Exception as e:
             bt.logging.warning(f"Error during shutdown: {e}")

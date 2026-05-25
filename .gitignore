@@ -169,8 +169,11 @@ testing/
 cache
 broadcast
 
+# Solution Files
+sn63solution_*
+
+# Database Files
+data/*
+
 # Proposals
 proposals
-
-#databases
-data/

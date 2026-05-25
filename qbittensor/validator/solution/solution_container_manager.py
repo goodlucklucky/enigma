@@ -1,0 +1,403 @@
+# The MIT License (MIT)
+# Copyright © 2026 qBitTensor Labs
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+from typing import List
+from datetime import datetime, timezone
+import json
+import subprocess
+from qbittensor.utils.timer import Timer
+from qbittensor.database.db_connection import DBConnection
+from qbittensor.validator.solution.run_solution import extract_stdout_output
+from qbittensor.validator.solution.validate_solution_output import validate_solution
+from qbittensor.utils.services.challenges import ChallengesClient
+from qbittensor.constants import SOLUTION_CONTAINER_MANAGER_TIMEOUT, MAX_SOLUTION_RUNTIME, MAX_SOLUTIONS
+import bittensor as bt
+
+
+class SolutionContainerManager:
+
+    def __init__(self, platform_client: ChallengesClient, database_connection: DBConnection, validator_label: str):
+        self.platform_client = platform_client
+        self.timer: Timer = Timer(timeout=SOLUTION_CONTAINER_MANAGER_TIMEOUT, run=self.run, run_on_start=True)
+        self.database_connection = database_connection
+        self.LABEL = validator_label
+
+
+    def run(self) -> None:
+        bt.logging.info("🐳 Checking on solution containers")
+
+        self.handle_completed_solutions()
+
+        number_of_running_solutions: int = self._get_number_of_running_solutions()
+        bt.logging.info(f"🏗️ Found {number_of_running_solutions} containers running")
+
+        overdue_containers: List[str] = self._get_overdue_containers()
+        if len(overdue_containers) > 0:
+            self._terminate_overdue_containers(overdue_containers)
+
+        self.database_connection.db_query.prune_old_solutions()
+
+        self._prune_containers()
+
+    def handle_completed_solutions(self) -> None:
+        """Find completed solution containers, validate their output, and report results to the platform"""
+        completed_containers = self._find_completed_solutions()
+        bt.logging.info(f"✅ Found {len(completed_containers)} completed containers")
+        if len(completed_containers) == 0:
+            return
+
+        # Pull each completed container's stdout via ``docker logs`` and split it into
+        # the run's log file and the run's solution-output zip before validation reads
+        # them; the container can be safely removed afterwards because nothing on disk
+        # was shared with the validator (no /output volume or bind mount).
+        self._extract_outputs_from_completed_containers(completed_containers)
+
+        solution_locations = self._find_location_of_completed_solutions(completed_containers)
+        bt.logging.info(f"📂 Found {len(solution_locations)} output folders for completed solutions")
+
+        self._validate_and_report_solutions(solution_locations)
+
+    def _extract_outputs_from_completed_containers(self, container_names: List[str]) -> None:
+        """
+        Pull each completed container's stdout via ``docker logs`` and split it into
+        the run's log file and the solution-output zip on the host workspace.
+        """
+        for name in container_names:
+            if not self._container_has_validator_label(name):
+                bt.logging.warning(
+                    f"⚠️ Skipping output extraction for container {name}; "
+                    f"validator label {self.LABEL} not found"
+                )
+                continue
+            solution = self.database_connection.db_query.get_challenge_solution_location(container_name=name)
+            if not solution:
+                bt.logging.warning(
+                    f"⚠️ Skipping output extraction for container {name}; "
+                    f"no solution location in database"
+                )
+                continue
+            extract_stdout_output(name, solution.absolute_path_to_solution)
+
+    def _validate_and_report_solutions(self, solution_locations: List[str]) -> None:
+        """Validate the outputs of completed solutions and report results to the platform"""
+        for location in solution_locations:
+            bt.logging.info(f"🔍 Validating solution output at {location}")
+            solution_status = validate_solution(location, self.platform_client, self.database_connection)
+            self.database_connection.db_query.update_solution_status_in_db(solution_location=location, solution_status=solution_status)
+
+        self._clean_up_solutions(solution_locations)
+
+    def _clean_up_solutions(self, solution_locations: List[str]) -> None:
+        for location in solution_locations:
+            bt.logging.info(f"🧹 Cleaning up solution at {location}")
+
+            container_name = str(self.database_connection.db_query.get_container_name_by_solution_location(location))
+            image_id = self.database_connection.db_query.get_image_id_from_solution_location(location)
+
+            try:
+                if container_name is not None:
+                    if not self._container_has_validator_label(container_name):
+                        bt.logging.warning(
+                            f"⚠️ Refusing to clean up container {container_name}; validator label {self.LABEL} not found"
+                        )
+                        continue
+                    bt.logging.info(f"🛑 Stopping container {container_name}")
+                    subprocess.run(["docker", "stop", container_name], check=False)
+                    bt.logging.info(f"🗑️ Removing container {container_name}")
+                    subprocess.run(["docker", "rm", "-v", container_name], check=False)
+                if image_id:
+                    if not self._image_ref_owned_by_validator(image_id):
+                        bt.logging.warning(
+                            f"⚠️ Refusing to remove image {image_id}; name does not match validator label prefix"
+                        )
+                    else:
+                        bt.logging.info(f"🗑️ Removing image {image_id}")
+                        subprocess.run(["docker", "rmi", "-f", image_id], check=False)
+
+                bt.logging.info(f"🗑️ Removing solution folder {location}")
+                subprocess.run(["rm", "-rf", location], check=False)
+
+            except Exception as e:
+                bt.logging.error(f"❌ Failed to clean up solution at {location}: {e}")
+
+
+    def _find_completed_solutions(self) -> List[str]:
+        """Find containers that have completed their run and are ready for output validation"""
+
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--filter", f"label={self.LABEL}", "--filter", "status=exited", "--format", "{{.Names}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            return names
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to list completed containers: {e}")
+            return []
+
+    def _find_location_of_completed_solutions(self, container_names: List[str]) -> List[str]:
+        """Find the host folder locations of completed solutions"""
+        solution_locations: List[str] = []
+        for name in container_names:
+            solution = self.database_connection.db_query.get_challenge_solution_location(container_name=name)
+            if solution:
+                bt.logging.info(f"📂 Found solution location for container {name}: {solution.absolute_path_to_solution}")
+                solution_locations.append(solution.absolute_path_to_solution) # type: ignore
+            else:
+                bt.logging.warning(f"⚠️ No solution location found for container {name}")
+                self._clean_up_orphaned_solutions(name)
+        return solution_locations
+
+    def validator_is_busy(self) -> bool:
+        """Check if the validator is running the max number of solutions"""
+        running_solutions: int = self._get_number_of_running_solutions()
+        return running_solutions >= MAX_SOLUTIONS
+
+    def _get_number_of_running_solutions(self) -> int:
+        """Get the number of currently running containers that match our solution label"""
+        containers = self._get_running_containers()
+        return len(containers)
+
+    def _get_running_containers(self) -> List[str]:
+        """Use the Docker CLI to find all running container ids that match our solution label"""
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "--filter", f"label={self.LABEL}", "--format", "{{.ID}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            return ids
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to list running containers: {e}")
+            return []
+
+    def _container_has_validator_label(self, container_identifier: str) -> bool:
+        """Verify a container is owned by this validator via Docker labels."""
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "--format", "{{json .Config.Labels}}", container_identifier],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            labels_raw = result.stdout.strip()
+            labels = json.loads(labels_raw) if labels_raw else {}
+            return isinstance(labels, dict) and self.LABEL in labels
+        except Exception as e:
+            bt.logging.error(
+                f"❌ Failed to inspect labels for container {container_identifier}: {e}"
+            )
+            return False
+
+    def _inspect_container_config_image(self, container_identifier: str) -> str | None:
+        """Return the image reference the container was created from (.Config.Image)."""
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "--format", "{{.Config.Image}}", container_identifier],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            ref = result.stdout.strip()
+            return ref or None
+        except Exception as e:
+            bt.logging.error(
+                f"❌ Failed to read Config.Image for container {container_identifier}: {e}"
+            )
+            return None
+
+    def _image_ref_owned_by_validator(self, image_ref: str) -> bool:
+        """
+        True if the image reference looks like a solution image for this validator
+        (folder/image tag starts with ``{LABEL}_``, matching manage_files.setup / run.py).
+        """
+        if not image_ref or not isinstance(image_ref, str):
+            return False
+        name = image_ref.strip().split("@", 1)[0]
+        if ":" in name:
+            name = name.rsplit(":", 1)[0]
+        name = name.lower()
+        prefix = f"{self.LABEL.lower()}_"
+        return name.startswith(prefix)
+
+    def _get_overdue_containers(self) -> List[str]:
+        """
+        Get all of the containers that match our solution label that have been running for too long and need to be terminated
+        """
+        overdue: List[str] = []
+        running = self._get_running_containers()
+        now = datetime.now(timezone.utc)
+
+        def _parse_started_at(started_at: str) -> datetime:
+            # Docker returns e.g. 2024-02-21T12:34:56.123456789Z
+            s = started_at
+            if s.endswith('Z'):
+                s = s[:-1] + '+00:00'
+            if '.' in s:
+                # Truncate fractional seconds to microseconds (6 digits)
+                date_part, rest = s.split('.', 1)
+                tz_index = rest.find('+') if '+' in rest else rest.find('-')
+                if tz_index != -1:
+                    frac = rest[:tz_index]
+                    tz = rest[tz_index:]
+                else:
+                    frac = rest
+                    tz = ''
+                frac = (frac + '000000')[:6]
+                s = f"{date_part}.{frac}{tz}"
+            return datetime.fromisoformat(s)
+
+        for cid in running:
+            if not self._container_has_validator_label(cid):
+                bt.logging.warning(
+                    f"⚠️ Skipping container {cid} because it is missing validator label {self.LABEL}"
+                )
+                continue
+            try:
+                res = subprocess.run(
+                    ["docker", "inspect", "--format", "{{.State.StartedAt}}", cid],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                started_at_raw = res.stdout.strip()
+                if not started_at_raw:
+                    continue
+                started_at = _parse_started_at(started_at_raw)
+                runtime = now - started_at
+                if runtime > MAX_SOLUTION_RUNTIME:
+                    overdue.append(cid)
+            except Exception as e:
+                bt.logging.error(f"❌ Failed to inspect container {cid}: {e}")
+
+        return overdue
+
+    def _terminate_overdue_containers(self, overdue_containers: List[str]) -> None:
+        """Terminate all overdue containers"""
+        bt.logging.info(f"Terminating {len(overdue_containers)} overdue solutions")
+        for cid in overdue_containers:
+            if not self._container_has_validator_label(cid):
+                bt.logging.warning(
+                    f"⚠️ Refusing to terminate container {cid}; validator label {self.LABEL} not found"
+                )
+                continue
+            config_image = self._inspect_container_config_image(cid)
+            db_image = self.database_connection.db_query.get_image_id_by_container_id(cid)
+            image_to_remove: str | None = None
+            if config_image and self._image_ref_owned_by_validator(config_image):
+                image_to_remove = config_image
+            elif db_image and self._image_ref_owned_by_validator(db_image):
+                image_to_remove = db_image
+            if not image_to_remove:
+                bt.logging.warning(
+                    f"⚠️ Skipping image removal for overdue container {cid}; "
+                    f"no image reference matched validator-owned naming (config={config_image!r}, db={db_image!r})"
+                )
+            try:
+                bt.logging.info(f"🛑 Stopping container {cid}")
+                subprocess.run(["docker", "stop", cid], check=False)
+            except Exception as e:
+                bt.logging.error(f"❌ Error stopping container {cid}: {e}")
+            try:
+                bt.logging.info(f"🗑️ Removing container {cid}")
+                subprocess.run(["docker", "rm", "-v", cid], check=False)
+            except Exception as e:
+                bt.logging.error(f"❌ Error removing container {cid}: {e}")
+            if image_to_remove:
+                bt.logging.info(f"🗑️ Removing overdue solution image {image_to_remove}")
+                subprocess.run(["docker", "rmi", "-f", image_to_remove], check=False)
+
+    def _prune_containers(self) -> None:
+        """Remove exited containers with our label and their images when image names match this validator."""
+        bt.logging.info("🗑️ Pruning exited solution containers and validator-owned images")
+        try:
+            cmd = [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label={self.LABEL}",
+                "--filter",
+                "status=exited",
+                "--format",
+                "{{.ID}}",
+            ]
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            exited = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+            for cid in exited:
+                if not self._container_has_validator_label(cid):
+                    bt.logging.warning(
+                        f"⚠️ Skipping prune for container {cid}; validator label {self.LABEL} not found"
+                    )
+                    continue
+                config_image = self._inspect_container_config_image(cid)
+                try:
+                    subprocess.run(["docker", "rm", "-v", cid], check=False)
+                except Exception as e:
+                    bt.logging.error(f"❌ Failed to remove container {cid}: {e}")
+                if not config_image or not self._image_ref_owned_by_validator(config_image):
+                    bt.logging.warning(
+                        f"⚠️ Skipping image removal for pruned container {cid}; "
+                        f"Config.Image not validator-owned (config_image={config_image!r})"
+                    )
+                    continue
+                try:
+                    subprocess.run(["docker", "rmi", "-f", config_image], check=False)
+                except Exception as e:
+                    bt.logging.info(f"❌ Failed to remove image {config_image}: {e}")
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to prune containers/images: {e}")
+
+
+    def _clean_up_orphaned_solutions(self, container_name: str) -> None:
+        """If we find a container that has no associated solution location, we should remove it to free up resources"""
+        bt.logging.info(f"🧹 Cleaning up orphaned container {container_name}")
+        try:
+            if not self._container_has_validator_label(container_name):
+                bt.logging.warning(
+                    f"⚠️ Refusing to clean up orphaned container {container_name}; "
+                    f"validator label {self.LABEL} not found"
+                )
+                return
+            bt.logging.info(f"🛑 Stopping container {container_name}")
+            subprocess.run(["docker", "stop", container_name], check=False)
+            bt.logging.info(f"🗑️ Removing container {container_name}")
+            subprocess.run(["docker", "rm", "-v", container_name], check=False)
+
+            # clean up image as well, if we can find it in the db
+            image_id = self.database_connection.db_query.get_image_id_by_container_name(container_name)
+            if image_id and self._image_ref_owned_by_validator(image_id):
+                bt.logging.info(f"🗑️ Removing image {image_id}")
+                subprocess.run(["docker", "rmi", "-f", image_id], check=False)
+            elif image_id:
+                bt.logging.warning(
+                    f"⚠️ Refusing to remove orphan image {image_id}; name does not match validator label prefix"
+                )
+
+            self.database_connection.db_query.remove_solution_from_db_by_conainer_name(container_name=container_name)
+
+        except Exception as e:
+            bt.logging.error(f"❌ Failed to clean up orphaned solution associated to container: {container_name}: {e}")

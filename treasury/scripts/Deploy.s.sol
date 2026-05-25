@@ -73,7 +73,7 @@ contract DeployGovernance is Script {
         // We use dynamic sizing so we can pass 0 validators if we want to start empty
         address envValidator = vm.envOr("INITIAL_VALIDATOR", address(0));
         address[] memory initialTrustedValidators;
-        
+
         if (envValidator != address(0)) {
             initialTrustedValidators = new address[](1);
             initialTrustedValidators[0] = envValidator;

@@ -59,7 +59,7 @@ def fetch_challenges():
         res = requests.get(f"{API_BASE_URL}/challenges")
         res.raise_for_status()
         base_challenges = res.json().get('challenges', [])
-        
+
         detailed_challenges = []
         for c in base_challenges:
             c_id = c['id']
@@ -83,7 +83,7 @@ def interactive_picker():
             if m.get('status', '').upper() == 'COMPLETE':
                 completed_at = m.get('completed_at') or m.get('completedAt') or 'Unknown'
                 options.append({'c_name': c['name'], 'm_name': m['name'], 'id': m['id'], 'prizeAlpha': m.get('prizeAlpha'), 'solved_address': m.get('solved_address'), 'completed_at': completed_at})
-    
+
     if not options:
         print("No completed milestones available for payout.")
         sys.exit(0)
@@ -91,7 +91,7 @@ def interactive_picker():
     print("\n--- Completed Milestones ---")
     for idx, opt in enumerate(options):
         print(f"[{idx}] {opt['c_name']} - {opt['m_name']} (ID: {opt['id']}, Prize: {opt['prizeAlpha']} Alpha, Completed: {opt['completed_at']})")
-    
+
     choice = input("\nSelect a milestone index to pay out: ")
     try:
         selected = options[int(choice)]
@@ -123,14 +123,14 @@ def main():
     prizeAlpha = 0
     desc_prefix = ""
     solved_address = None
-    
+
     if not milestone_id:
         milestone_id, prizeAlpha, desc_prefix, solved_address = interactive_picker()
     else:
         print("\n📡 Fetching Milestone Data from API...")
         challenges = fetch_challenges()
         found = False
-        
+
         for c in challenges:
             for m in c.get('milestones', []):
                 if m['id'] == milestone_id:
@@ -139,16 +139,17 @@ def main():
                     solved_address = m.get('solved_address')
                     found = True
                     break
-            if found: break
-        
+            if found:
+                break
+
         if not found:
             print(f"❌ Milestone {milestone_id} not found in API.")
             sys.exit(1)
-            
+
         if prizeAlpha is None or float(prizeAlpha) <= 0:
             print(f"❌ Milestone {milestone_id} does not have a valid prizeAlpha.")
             sys.exit(1)
-            
+
         prizeAlpha = float(prizeAlpha)
 
         if not solved_address:
@@ -194,9 +195,9 @@ def main():
             exact_desc += f" (Retry {args.retry})"
         if len(chunks) > 1:
             exact_desc += f" - Part {part_num} of {len(chunks)}"
-        
+
         calldata_cmd = [
-            "cast", "calldata", 
+            "cast", "calldata",
             "transferStake(bytes32,bytes32,uint256,uint256,uint256)",
             miner_coldkey, vault_hotkey_hex, str(args.netuid), str(args.netuid), exact_amount_rao
         ]
@@ -204,7 +205,7 @@ def main():
 
         print(f"🧮 Calculating Expected Proposal Hash...")
         prop_id = hash_proposal(args.contract, STAKING_V2_ADDRESS, "0", calldata_raw, exact_desc, args.rpc)
-        
+
         print(f"   ↳ Proposal ID: {prop_id}")
 
         # Pre-flight check: Verify the proposal is active
@@ -214,11 +215,11 @@ def main():
             "--rpc-url", args.rpc
         ]
         state_res = subprocess.run(state_cmd, capture_output=True, text=True)
-        
+
         if state_res.returncode != 0:
             print(f"❌ Proposal {prop_id} not found or error querying state on {args.contract}.")
             continue
-            
+
         try:
             state_val = int(state_res.stdout.strip().split()[0])
             if state_val != 1:
@@ -228,7 +229,7 @@ def main():
                 print("   ↳ You can only vote on 'Active' proposals.")
                 continue
         except ValueError:
-            pass 
+            pass
 
         cmd = [
             "cast", "send", args.contract,
@@ -240,7 +241,7 @@ def main():
 
         print(f"🗳️  Casting vote {args.support} (value {support_val}) for payout...")
         res = subprocess.run(cmd, capture_output=True, text=True)
-        
+
         if res.returncode == 0:
             print("✅ Vote cast successfully!")
         else:

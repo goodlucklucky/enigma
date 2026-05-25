@@ -15,20 +15,24 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import pytest
-import time
-import numpy as np
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import AsyncMock, Mock, patch
 
-import bittensor as bt
-import qbittensor
-from neurons.validator import Validator, TREASURY_HOTKEY
+import numpy as np
+import pytest
+
+from qbittensor.utils.services.challenges import ChallengesClient
+
+from neurons.validator import (
+    PRIVATE_MINER_HOTKEY,
+    TREASURY_HOTKEY,
+    TREASURY_WALLET_AMOUNT,
+    Validator,
+)
 
 
 @pytest.fixture
 def mock_config():
     """Mock config for validator."""
-    # Use the validator's config method to get proper config
     config = Validator.config()
     config.neuron.forward_sleep_interval = 5
     config.neuron.epoch_length = 100
@@ -36,31 +40,50 @@ def mock_config():
     config.neuron.moving_average_alpha = 0.1
     config.neuron.axon_off = True
     config.netuid = 1
-    config.mock = False  # Use real wallet but mock it
+    config.mock = False
     return config
 
 
 @pytest.fixture
 def mock_validator(mock_config):
-    """Create a mock validator instance with mocked dependencies."""
-    with patch('qbittensor.base.neuron.bt.Wallet') as mock_wallet, \
-         patch('qbittensor.base.neuron.bt.Subtensor') as mock_subtensor, \
-         patch('qbittensor.base.neuron.bt.Metagraph') as mock_metagraph, \
-         patch('qbittensor.base.validator.bt.Dendrite') as mock_dendrite, \
-         patch('qbittensor.base.validator.bt.Axon') as mock_axon, \
-         patch('qbittensor.base.neuron.BaseNeuron.sync') as mock_sync, \
-         patch('qbittensor.base.validator.BaseValidatorNeuron.load_state') as mock_load_state, \
-         patch('neurons.validator.MetricsService') as mock_metrics_service:
+    """Create a mock validator instance with mocked dependencies.
 
-        # Mock the dependencies
+    Patch strategy (post platform API consolidation):
+    - Primary patches target the canonical locations under qbittensor.*.
+    - Secondary patches on neurons.* are still required for classes that
+      neurons/validator.py imports locally (the name lookup happens in that
+      module's globals). This is transitional technical debt.
+    - ChallengesClient is now explicitly patched (and wired as .platform_client)
+      so that Validator construction and forward() paths are properly isolated.
+    """
+    with (
+        patch("qbittensor.base.neuron.bt.Wallet") as mock_wallet,
+        patch("qbittensor.base.neuron.bt.Subtensor") as mock_subtensor,
+        patch("qbittensor.base.neuron.bt.Metagraph") as mock_metagraph,
+        patch("qbittensor.base.validator.bt.Dendrite") as mock_dendrite,
+        patch("qbittensor.base.validator.bt.Axon") as mock_axon,
+        patch("qbittensor.base.neuron.BaseNeuron.sync") as mock_sync,
+        patch("qbittensor.base.validator.BaseValidatorNeuron.load_state") as mock_load_state,
+        patch("qbittensor.base.neuron.check_config"),
+        patch("qbittensor.utils.services.telemetry.TelemetryService") as mock_telemetry_service,
+        patch("neurons.validator.TelemetryService"),
+        # Explicitly isolate the platform client (new in post-consolidation Validator)
+        patch("qbittensor.utils.services.challenges.ChallengesClient") as mock_challenges_client,
+        patch("qbittensor.database.db_connection.DBConnection") as mock_db_connection,
+        patch("qbittensor.validator.synapse.process_responses.ResponseProcessor") as mock_response_processor_cls,
+        patch("qbittensor.validator.solution.solution_container_manager.SolutionContainerManager") as mock_solution_container_manager_cls,
+        patch("qbittensor.validator.solution.solution_cross_check.SolutionCrossChecker") as mock_cross_check_cls,
+    ):
+
         mock_wallet.return_value = Mock()
-        mock_wallet.return_value.hotkey.ss58_address = 'test_hotkey'
+        mock_wallet.return_value.hotkey.ss58_address = "test_hotkey"
         mock_subtensor.return_value = Mock()
         mock_metagraph.return_value = Mock()
         mock_metagraph.return_value.configure_mock(
-            hotkeys=['test_hotkey', 'hotkey1', 'test_treasury_hotkey'],
+            hotkeys=["test_hotkey", "hotkey1", "miner_hotkey"],
             last_update=[0, 0, 0],
-            uids=np.array([0, 1, 2])
+            uids=np.array([0, 1, 2]),
+            axons=[Mock(), Mock(), Mock()],
         )
         mock_metagraph.return_value.n = 3
         mock_subtensor.return_value.metagraph.return_value = mock_metagraph.return_value
@@ -72,103 +95,109 @@ def mock_validator(mock_config):
         mock_subtensor.serve_axon.return_value = None
 
         mock_dendrite.return_value = Mock()
+        mock_dendrite.return_value._session = None
+        mock_dendrite.return_value.aclose_session = AsyncMock()
+        mock_dendrite.return_value.forward = AsyncMock(return_value=Mock())
         mock_axon.return_value = Mock()
 
-        mock_metrics_service.return_value = Mock()
-        mock_metrics_service.return_value.record_startup_metrics = Mock()
-        mock_metrics_service.return_value.record_system_metrics = Mock()
+        mock_telemetry = Mock()
+        mock_telemetry.record_startup_metrics = Mock()
+        mock_telemetry.heartbeat_timer = Mock()
+        mock_telemetry.system_metrics_timer = Mock()
+        mock_telemetry_service.return_value = mock_telemetry
 
-        # Create validator
+        mock_db_connection.return_value = Mock()
+        mock_db_connection.return_value.db_query.get_miner_submission_statuses.return_value = []
+        mock_db_connection.return_value.db_query.get_active_miners.return_value = []
+        mock_db_connection.return_value.db_query.prune_old_miner_solutions.return_value = None
+        mock_response_processor_cls.return_value = Mock()
+        mock_solution_container_manager_cls.return_value = Mock()
+        mock_solution_container_manager_cls.return_value.validator_is_busy.return_value = False
+        mock_cross_check_cls.return_value = Mock()
+
         validator = Validator(config=mock_config)
 
-        # Mock additional methods
+        # Wire key post-consolidation mocks onto the live instance
+        validator.database_connection = mock_db_connection.return_value
+        validator.response_processor = mock_response_processor_cls.return_value
+        validator.platform_client = mock_challenges_client.return_value
+
+        # Give the ChallengesClient mock some sensible defaults used by forward/cross-check paths
+        mock_challenges_client.return_value.submit_solution.return_value = None
+        mock_challenges_client.return_value.get_next_cross_check_submission.return_value = None
+        mock_challenges_client.return_value.get_milestone_price_tao.return_value = 0.1
+
         validator.sync = Mock()
         validator.load_state = Mock()
         validator.save_state = Mock()
-
         yield validator
+
+
+class TestSetWeights:
+    """Test cases for weight distribution via the canonical Validator.set_weights().
+
+    This now follows the standard Bittensor pattern (override set_weights, populate
+    self.scores, call super().set_weights()). The old calculate_weights + custom timer
+    mechanism has been removed.
+    """
+
+    def test_set_weights_distributes_maintenance_and_treasury(self, mock_validator):
+        """Active miners receive maintenance share; treasury receives the remainder."""
+        mock_validator.metagraph.hotkeys = [TREASURY_HOTKEY, "miner1", "miner2"]
+        mock_validator.database_connection.db_query.get_active_miners.return_value = ["miner1"]
+
+        with patch("neurons.validator.BaseValidatorNeuron.set_weights") as mock_super:
+            mock_validator.set_weights()
+
+        weights = mock_validator.scores
+        maintenance_amount = (1.0 - TREASURY_WALLET_AMOUNT) / 2
+        treasury_uid = mock_validator.metagraph.hotkeys.index(TREASURY_HOTKEY)
+
+        assert weights[treasury_uid] == TREASURY_WALLET_AMOUNT
+        assert weights[1] == maintenance_amount
+        assert weights[2] == 0.0
+        mock_validator.database_connection.db_query.prune_old_miner_solutions.assert_called_once()
+        mock_super.assert_called_once()
+
+    def test_set_weights_includes_private_miner_when_not_in_db(self, mock_validator):
+        """Private miner hotkey is always eligible for maintenance weight."""
+        mock_validator.metagraph.hotkeys = [TREASURY_HOTKEY, "miner1", PRIVATE_MINER_HOTKEY]
+        mock_validator.database_connection.db_query.get_active_miners.return_value = []
+
+        with patch("neurons.validator.BaseValidatorNeuron.set_weights") as mock_super:
+            mock_validator.set_weights()
+
+        weights = mock_validator.scores
+        maintenance_amount = (1.0 - TREASURY_WALLET_AMOUNT) / 1
+        treasury_uid = mock_validator.metagraph.hotkeys.index(TREASURY_HOTKEY)
+        private_miner_uid = mock_validator.metagraph.hotkeys.index(PRIVATE_MINER_HOTKEY)
+
+        assert weights[treasury_uid] == TREASURY_WALLET_AMOUNT
+        assert weights[private_miner_uid] == maintenance_amount
+        mock_super.assert_called_once()
 
 
 class TestValidator:
     """Test cases for the Validator class."""
 
-    def test_set_weights_with_treasury_hotkey(self, mock_validator):
-        """Test that weights are set correctly when TREASURY_HOTKEY is configured."""
-        # Set up treasury hotkey
-        global TREASURY_HOTKEY
-        original_treasury = TREASURY_HOTKEY
-        TREASURY_HOTKEY = 'test_treasury_hotkey'
-        mock_validator.treasury_hotkey = TREASURY_HOTKEY
-
-        # Mock metagraph
-        mock_validator.metagraph.hotkeys = ['hotkey1', 'hotkey2', 'test_treasury_hotkey']
-        mock_validator.metagraph.n = 3
-
-        # Call set_weights
-        mock_validator.set_weights()
-
-        # Assert weights are set correctly
-        expected_uid = 2  # index of 'test_treasury_hotkey'
-        assert mock_validator.scores[expected_uid] == 1.0
-        assert np.all(mock_validator.scores[:expected_uid] == 0.0)
-        assert np.all(mock_validator.scores[expected_uid+1:] == 0.0)
-
-        # Restore original
-        TREASURY_HOTKEY = original_treasury
-
-    def test_set_weights_without_treasury_hotkey(self, mock_validator):
-        """Test that no weights are set when TREASURY_HOTKEY is None."""
-        # Ensure treasury hotkey is None
-        global TREASURY_HOTKEY
-        original_treasury = TREASURY_HOTKEY
-        TREASURY_HOTKEY = None
-        mock_validator.treasury_hotkey = TREASURY_HOTKEY
-
-        # Call set_weights
-        mock_validator.set_weights()
-
-        # Assert no weights are set (scores remain zeros)
-        assert np.all(mock_validator.scores == 0.0)
-
-        # Restore original
-        TREASURY_HOTKEY = original_treasury
-
     def test_forward_heartbeat_sent_when_due(self, mock_validator):
-        """Test that heartbeat is sent when 5 minutes have passed."""
-        # Set next heartbeat time to past
-        mock_validator.next_heartbeat_time = time.time() - 1
+        """Test that heartbeat is recorded when the timer is due."""
+        mock_validator.telemetry_service.record_heartbeat = Mock()
 
-        # Mock the metrics service
-        mock_validator.metrics_service.record_heartbeat = Mock()
+        def check_timer():
+            mock_validator.telemetry_service.record_heartbeat()
 
-        # Record time before calling forward
-        before_time = time.time()
-
-        # Call forward
+        mock_validator.telemetry_service.heartbeat_timer.check_timer = Mock(side_effect=check_timer)
         mock_validator.forward()
 
-        # Assert heartbeat was called
-        mock_validator.metrics_service.record_heartbeat.assert_called_once_with(qbittensor.__version__)
-
-        # Assert timestamp was updated (should be >= before_time)
-        assert mock_validator.last_heartbeat_time >= before_time
-        # Assert next heartbeat time was scheduled approximately 300 seconds later
-        assert abs(mock_validator.next_heartbeat_time - (before_time + 300)) < 10
+        mock_validator.telemetry_service.heartbeat_timer.check_timer.assert_called_once()
+        mock_validator.telemetry_service.record_heartbeat.assert_called_once()
 
     def test_forward_heartbeat_not_sent_too_soon(self, mock_validator):
-        """Test that heartbeat is not sent if less than 5 minutes have passed."""
-        # Set next heartbeat time to future
-        future_time = time.time() + 100
-        mock_validator.next_heartbeat_time = future_time
+        """Test that heartbeat is not recorded when the timer is not due."""
+        mock_validator.telemetry_service.record_heartbeat = Mock()
 
-        # Mock the metrics service
-        mock_validator.metrics_service.record_heartbeat = Mock()
-
-        # Call forward
         mock_validator.forward()
 
-        # Assert heartbeat was not called
-        mock_validator.metrics_service.record_heartbeat.assert_not_called()
-
-        # Assert next heartbeat time was not changed
-        assert mock_validator.next_heartbeat_time == future_time
+        mock_validator.telemetry_service.heartbeat_timer.check_timer.assert_called_once()
+        mock_validator.telemetry_service.record_heartbeat.assert_not_called()

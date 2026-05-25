@@ -29,12 +29,12 @@ Governance is heavily integrated with Bittensor's specific consensus and metagra
 ### 4. Rate Limiting and Spending Controls
 The `TreasuryController` enforces strict, time-based spending limits to mitigate the risk of draining the vault if a malicious proposal passes.
 * **Asset-Specific Limits:** Separate spending caps exist for Native tokens (`TAO_LIMIT`), Alpha tokens (`ALPHA_LIMIT`), and ERC20 tokens (`ERC20_LIMIT`).
-* **Time Periods:** Limits reset according to a configured `LIMIT_RESET_PERIOD` (converted from minutes to seconds during initialization). 
+* **Time Periods:** Limits reset according to a configured `LIMIT_RESET_PERIOD` (converted from minutes to seconds during initialization).
 * **Execution-Time Enforcement:** Spending limits are checked and updated during the `execute` phase, not the `propose` phase, ensuring that queued but unexecuted proposals don't artificially lock up the period's budget.
 
 ### 5. Vault Operations & Native Integrations
 The `TreasuryVault` handles the ultimate execution of timelocked payloads and includes custom logic for interacting with Bittensor network mechanics.
-* **Neuron Registration:** The vault includes a custom `registerNeuron` function allowing it to interact directly with the `NEURON_PRECOMPILE` (`0x...804`). 
+* **Neuron Registration:** The vault includes a custom `registerNeuron` function allowing it to interact directly with the `NEURON_PRECOMPILE` (`0x...804`).
 * **Safe Limit Price Handling:** When registering a neuron, it calculates the Rao limit, ensures it prevents `uint64` overflow, tracks the exact amount of native token burned by the precompile, and safely refunds any unspent msg.value back to the caller.
 
 ## Testing

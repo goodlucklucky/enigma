@@ -47,9 +47,9 @@ class VaultChecker:
 
     def get_ss58(self, evm_address: str) -> str:
         """Convert EVM address to SS58 using evm_to_ss58.py"""
-        script_path = Path("treasury-contract/scripts/evm_to_ss58.py")
+        script_path = Path(__file__).parent / "evm_to_ss58.py"
         if not script_path.exists():
-            print("❌ Error: evm_to_ss58.py not found in treasury-contract/scripts/")
+            print(f"❌ Error: evm_to_ss58.py not found at {script_path}")
             sys.exit(1)
 
         result = subprocess.run(
@@ -57,7 +57,7 @@ class VaultChecker:
             capture_output=True,
             text=True
         )
-        
+
         if result.returncode != 0:
             print(f"❌ Failed to convert EVM to SS58:\n{result.stderr}")
             sys.exit(1)
@@ -94,10 +94,10 @@ class VaultChecker:
         """Fetches all stake info for a coldkey across all hotkeys/netuids."""
         try:
             print(f"\nScanning network for all stakes on coldkey: {coldkey_ss58}...")
-            
+
             # The SDK handles the complex dTAO routing automatically
             stake_info_list = self.subtensor.get_stake_info_for_coldkey(coldkey_ss58)
-            
+
             if not stake_info_list:
                 print("  -> No stake found on any hotkey for this coldkey.")
                 return
@@ -128,7 +128,7 @@ class VaultChecker:
 
         print(f"\n{'='*90}")
         print(f"EVM Address : {args.address}")
-        
+
         ss58 = self.get_ss58(args.address)
         print(f"SS58 Address: {ss58}")
 

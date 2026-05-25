@@ -70,6 +70,12 @@ setup(
     license="MIT",
     python_requires=">=3.12",
     install_requires=requirements,
+    entry_points={
+        "console_scripts": [
+            "check-validation = qbittensor.cli.validator.check_validation:main",
+            "mine-enigma = qbittensor.cli.miner.mine_enigma:main",
+        ],
+    },
     classifiers=[
         "Development Status :: 1 - Initial Release",
         "Intended Audience :: Developers",

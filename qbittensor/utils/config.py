@@ -1,7 +1,6 @@
 # The MIT License (MIT)
 # Copyright © 2023 Yuma Rao
 # Copyright © 2023 Opentensor Foundation
-# Copyright © 2026 qBitTensor Labs
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 # documentation files (the “Software”), to deal in the Software without restriction, including without limitation
@@ -48,7 +47,7 @@ def check_config(cls, config: "bt.Config"):
 
     full_path = os.path.expanduser(
         "{}/{}/{}/netuid{}/{}".format(
-            config.logging.logging_dir,  # TODO: change from ~/.bittensor/miners to ~/.bittensor/neurons
+            config.logging.logging_dir,
             config.wallet.name,
             config.wallet.hotkey,
             config.netuid,
@@ -159,7 +158,7 @@ def add_miner_args(cls, parser):
     parser.add_argument(
         "--wandb.project_name",
         type=str,
-        default="template-miners",
+        default="qbittensor-miners",
         help="Wandb project to log to.",
     )
 
@@ -186,6 +185,13 @@ def add_validator_args(cls, parser):
         type=float,
         help="The timeout for each forward call in seconds.",
         default=10,
+    )
+
+    parser.add_argument(
+        "--neuron.num_concurrent_forwards",
+        type=int,
+        help="The number of concurrent forwards running at any time.",
+        default=1,
     )
 
     parser.add_argument(
@@ -230,7 +236,7 @@ def add_validator_args(cls, parser):
         "--wandb.project_name",
         type=str,
         help="The name of the project where you are sending the new run.",
-        default="template-validators",
+        default="qbittensor-validators",
     )
 
     parser.add_argument(

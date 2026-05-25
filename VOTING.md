@@ -33,7 +33,7 @@ Validators must vote on two different types of proposals:
     Voting should then be completed with the script:
 
     ```bash
-    python treasury-contract/scripts/vote_whitelist.py --contract <treasury governor address> --proposal-id <proposal id> --support <true/false> --rpc <rpc url> --pk <validator evm private key>
+    python treasury/scripts/vote_whitelist.py --contract <treasury governor address> --proposal-id <proposal id> --support <true/false> --rpc <rpc url> --pk <validator evm private key>
     ```
 
 - ### Payout
@@ -42,12 +42,27 @@ Validators must vote on two different types of proposals:
 
     Existing validators in the whitelist will be notified via Discord and expected to vote within the voting period (36 hours).
 
-    Validator Check Script: `TBD`
+    **Validator Check Script**
+
+    After your validator has processed a milestone, you can inspect its local database using the `check-validation` CLI (available after `pip install -e .`):
+
+    ```bash
+    check-validation --submission <submission_id> [--hotkey <your_validator_hotkey_ss58>]
+    ```
+
+    This queries your local validator database (`~/.enigma/challenge_solutions_*.db`) and shows the current status of the submission (e.g. `validated`, `cross_checked`, etc.), the associated milestone ID, miner hotkey, transaction hash, and timestamps.
+
+    Example:
+    ```bash
+    check-validation --submission sn63solution_abc123...
+    ```
+
+    Use this before voting on payout proposals to confirm that the milestone was successfully validated (and cross-checked) by your validator.
 
     Voting should then be completed with the script:
-    
+
     ```bash
-    python vote_payout.py --contract <treasury governor address> --netuid 63 --vault-hotkey <vault hotkey> --support <true/false> --rpc <rpc url> --pk <validator evm private key> 
+    python treasury/scripts/vote_payout.py --contract <treasury governor address> --netuid 63 --vault-hotkey <vault hotkey> --support <true/false> --rpc <rpc url> --pk <validator evm private key>
     ```
 
     You will be prompted for the challenge and milestone being completed and the proposal will be looked up from the hashed data.

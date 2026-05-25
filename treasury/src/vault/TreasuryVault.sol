@@ -34,10 +34,10 @@ interface INeuron {
 
 interface IStakingV2 {
     function moveStake(
-        bytes32 originHotkey, 
-        bytes32 destinationHotkey, 
-        uint256 originNetuid, 
-        uint256 destinationNetuid, 
+        bytes32 originHotkey,
+        bytes32 destinationHotkey,
+        uint256 originNetuid,
+        uint256 destinationNetuid,
         uint256 amountAlpha
     ) external;
 }

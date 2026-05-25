@@ -1,0 +1,368 @@
+# The MIT License (MIT)
+# Copyright © 2026 qBitTensor Labs
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+#
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+import base64
+import binascii
+import os
+import shutil
+import subprocess
+import zipfile
+
+import bittensor as bt
+
+from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
+from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
+from .constants import (
+    CHALLENGE_INPUT_DIRNAME,
+    CONTAINER_CHALLENGE_INPUT_PATH,
+    CONTAINER_OUTPUT_DIRNAME,
+    CONTAINER_SOLUTION_DIRNAME,
+    SOLUTION_LOG_FILENAME,
+    SOLUTION_OUTPUT_SEPARATOR,
+    SOLUTION_OUTPUT_ZIP_FILENAME,
+    SOLUTION_STDOUT_MAX_BYTES_DEFAULT,
+    SOLUTION_STDOUT_MAX_BYTES_ENV,
+    VALIDATOR_DOCKER_CAP_DROP_DEFAULT,
+    VALIDATOR_DOCKER_CAP_DROP_ENV,
+    VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT,
+    VALIDATOR_DOCKER_CPU_LIMIT_ENV,
+    VALIDATOR_DOCKER_MINER_USER_DEFAULT,
+    VALIDATOR_DOCKER_MINER_USER_ENV,
+    VALIDATOR_DOCKER_NO_NEW_PRIVILEGES_DEFAULT,
+    VALIDATOR_DOCKER_NO_NEW_PRIVILEGES_ENV,
+    VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT,
+    VALIDATOR_DOCKER_PIDS_LIMIT_ENV,
+    VALIDATOR_DOCKER_READ_ONLY_DEFAULT,
+    VALIDATOR_DOCKER_READ_ONLY_ENV,
+    VALIDATOR_DOCKER_TMPFS_DEFAULT,
+    VALIDATOR_DOCKER_TMPFS_ENV,
+    VALIDATOR_DOCKER_ULIMIT_NOFILE_DEFAULT,
+    VALIDATOR_DOCKER_ULIMIT_NOFILE_ENV,
+    VALIDATOR_MEMORY_LIMIT_DEFAULT,
+    VALIDATOR_MEMORY_LIMIT_ENV,
+    VALIDATOR_CONTAINER_STOP_TIMEOUT_DEFAULT,
+    VALIDATOR_CONTAINER_STOP_TIMEOUT_ENV,
+)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _stdout_max_bytes() -> int:
+    raw = os.getenv(SOLUTION_STDOUT_MAX_BYTES_ENV, str(SOLUTION_STDOUT_MAX_BYTES_DEFAULT)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        bt.logging.warning(
+            f"Invalid {SOLUTION_STDOUT_MAX_BYTES_ENV}={raw!r}; "
+            f"using default {SOLUTION_STDOUT_MAX_BYTES_DEFAULT} bytes."
+        )
+        return SOLUTION_STDOUT_MAX_BYTES_DEFAULT
+
+
+def prepare_challenge_input_mount_dir(workspace: str) -> str:
+    """
+    Create a fresh host directory for this run's challenge input (mounted ``:ro``).
+    Challenge setup should write files only under this path.
+    """
+    mount_dir = os.path.join(os.path.abspath(workspace), CHALLENGE_INPUT_DIRNAME)
+    if os.path.isdir(mount_dir):
+        shutil.rmtree(mount_dir)
+    os.makedirs(mount_dir, mode=0o755)
+    return mount_dir
+
+
+def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
+    """
+    Pull a stopped miner container's stdout via ``docker logs`` and split it into
+    the run's log file and the run's solution-output zip.
+
+    The miner contract is:
+
+        <text logs...>
+        <SOLUTION_OUTPUT_SEPARATOR>
+        <base64-encoded zip of the solution_artifacts directory>
+
+    Docker's json-file logging driver treats stdout as UTF-8 text and corrupts
+    raw binary bytes; base64 encoding survives the round-trip intact.
+
+    Everything before the first occurrence of the separator is written verbatim to
+    ``<host_workspace>/output/stdout.log``. The base64 payload after the separator
+    is decoded, written to ``<host_workspace>/output/solution_artifacts.zip``, and
+    (when valid) extracted into ``<host_workspace>/output/solution_artifacts/``.
+
+    Returns ``True`` when at least the log file was produced; the function still
+    returns ``True`` if the separator was missing (whole stdout → logs, no
+    artifacts). Returns ``False`` when ``docker logs`` fails, the payload is not
+    valid base64, or the decoded bytes are not a valid zip.
+    """
+    host_output = os.path.join(os.path.abspath(host_workspace), CONTAINER_OUTPUT_DIRNAME)
+    os.makedirs(host_output, exist_ok=True)
+
+    max_bytes = _stdout_max_bytes()
+    try:
+        result = subprocess.run(
+            ["docker", "logs", container_ref],
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = ((e.stderr or e.stdout or b"").decode("utf-8", errors="replace")).strip()
+        bt.logging.error(
+            f"❌ Failed to read stdout from '{container_ref}': {stderr}"
+        )
+        return False
+    except OSError as e:
+        bt.logging.error(f"❌ Failed to invoke docker logs for '{container_ref}': {e}")
+        return False
+
+    raw_stdout = result.stdout or b""
+    if len(raw_stdout) > max_bytes:
+        bt.logging.error(
+            f"❌ Container '{container_ref}' produced {len(raw_stdout)} bytes of stdout, "
+            f"exceeding the {max_bytes} byte cap; truncating and refusing to extract artifacts."
+        )
+        truncated = raw_stdout[:max_bytes]
+        _write_log_file(host_output, truncated)
+        return False
+
+    logs_bytes, payload_b64, separator_found = _split_on_separator(raw_stdout)
+    _write_log_file(host_output, logs_bytes)
+
+    if not separator_found:
+        bt.logging.warning(
+            f"⚠️ No solution-output separator found in stdout of '{container_ref}'; "
+            f"treating the entire stdout as logs and skipping artifact extraction."
+        )
+        return True
+
+    try:
+        payload_bytes = base64.b64decode(payload_b64.strip(), validate=True)
+    except (binascii.Error, ValueError) as e:
+        bt.logging.error(
+            f"❌ Solution payload from '{container_ref}' is not valid base64: {e}"
+        )
+        return False
+
+    zip_path = os.path.join(host_output, SOLUTION_OUTPUT_ZIP_FILENAME)
+    try:
+        with open(zip_path, "wb") as f:
+            f.write(payload_bytes)
+    except OSError as e:
+        bt.logging.error(
+            f"❌ Failed to write solution zip for '{container_ref}' to '{zip_path}': {e}"
+        )
+        return False
+
+    artifacts_dir = os.path.join(host_output, CONTAINER_SOLUTION_DIRNAME)
+    if os.path.isdir(artifacts_dir):
+        shutil.rmtree(artifacts_dir)
+    os.makedirs(artifacts_dir, exist_ok=True)
+
+    if not payload_bytes:
+        bt.logging.warning(
+            f"⚠️ Solution-output payload from '{container_ref}' is empty after the separator; "
+            f"leaving '{artifacts_dir}' empty."
+        )
+        return True
+
+    if not zipfile.is_zipfile(zip_path):
+        bt.logging.error(
+            f"❌ Solution-output payload from '{container_ref}' at '{zip_path}' "
+            f"is not a valid zip archive; skipping artifact extraction."
+        )
+        return False
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            _safe_extract_zip(zf, artifacts_dir)
+    except zipfile.BadZipFile as e:
+        bt.logging.error(
+            f"❌ Failed to read solution zip for '{container_ref}' at '{zip_path}': {e}"
+        )
+        return False
+    except (OSError, RuntimeError) as e:
+        bt.logging.error(
+            f"❌ Failed to extract solution zip for '{container_ref}' to '{artifacts_dir}': {e}"
+        )
+        return False
+
+    bt.logging.info(
+        f"✅ Extracted solution output from '{container_ref}' to '{artifacts_dir}'"
+    )
+    return True
+
+
+def _split_on_separator(raw_stdout: bytes) -> tuple[bytes, bytes, bool]:
+    """
+    Split a stdout byte stream around the first occurrence of
+    :data:`SOLUTION_OUTPUT_SEPARATOR`.
+
+    Returns ``(logs_bytes, payload_bytes, separator_found)``. The separator itself
+    is consumed (it appears in neither the logs nor the payload).
+    """
+    idx = raw_stdout.find(SOLUTION_OUTPUT_SEPARATOR)
+    if idx == -1:
+        return raw_stdout, b"", False
+    return raw_stdout[:idx], raw_stdout[idx + len(SOLUTION_OUTPUT_SEPARATOR):], True
+
+
+def _write_log_file(host_output_dir: str, logs_bytes: bytes) -> None:
+    log_path = os.path.join(host_output_dir, SOLUTION_LOG_FILENAME)
+    try:
+        with open(log_path, "wb") as f:
+            f.write(logs_bytes)
+    except OSError as e:
+        bt.logging.error(f"❌ Failed to write log file '{log_path}': {e}")
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, destination: str) -> None:
+    """Extract a zip while rejecting absolute paths and ``..`` traversal."""
+    destination_abs = os.path.abspath(destination)
+    for member in zf.infolist():
+        member_path = os.path.normpath(os.path.join(destination_abs, member.filename))
+        if not (
+            member_path == destination_abs
+            or member_path.startswith(destination_abs + os.sep)
+        ):
+            raise RuntimeError(
+                f"Refusing to extract '{member.filename}': escapes destination directory"
+            )
+    zf.extractall(destination_abs)
+
+
+def _container_run_user() -> str | None:
+    """Return the ``docker run --user`` value, or None if non-root enforcement is disabled."""
+    raw = os.getenv(
+        VALIDATOR_DOCKER_MINER_USER_ENV,
+        VALIDATOR_DOCKER_MINER_USER_DEFAULT,
+    )
+    if raw is None:
+        return VALIDATOR_DOCKER_MINER_USER_DEFAULT or None
+    user = raw.strip()
+    return user or None
+
+
+def docker_run_security_args() -> list[str]:
+    """
+    Extra ``docker run`` flags that harden miner solution containers.
+    Each setting is controlled by an environment variable (see constants.py).
+    """
+    args: list[str] = []
+
+    stop_timeout = os.getenv(VALIDATOR_CONTAINER_STOP_TIMEOUT_ENV, VALIDATOR_CONTAINER_STOP_TIMEOUT_DEFAULT).strip()
+    if stop_timeout:
+        args.extend(["--stop-timeout", stop_timeout])
+
+    pids_limit = os.getenv(VALIDATOR_DOCKER_PIDS_LIMIT_ENV, VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT).strip()
+    if pids_limit:
+        args.extend(["--pids-limit", pids_limit])
+
+    ulimit_nofile = os.getenv(
+        VALIDATOR_DOCKER_ULIMIT_NOFILE_ENV, VALIDATOR_DOCKER_ULIMIT_NOFILE_DEFAULT
+    ).strip()
+    if ulimit_nofile:
+        args.extend(["--ulimit", f"nofile={ulimit_nofile}"])
+
+    cap_drop = os.getenv(VALIDATOR_DOCKER_CAP_DROP_ENV, VALIDATOR_DOCKER_CAP_DROP_DEFAULT).strip()
+    if cap_drop:
+        args.extend(["--cap-drop", cap_drop])
+
+    if _env_bool(VALIDATOR_DOCKER_NO_NEW_PRIVILEGES_ENV, VALIDATOR_DOCKER_NO_NEW_PRIVILEGES_DEFAULT):
+        args.extend(["--security-opt", "no-new-privileges:true"])
+
+    if _env_bool(VALIDATOR_DOCKER_READ_ONLY_ENV, VALIDATOR_DOCKER_READ_ONLY_DEFAULT):
+        args.append("--read-only")
+
+    tmpfs = os.getenv(VALIDATOR_DOCKER_TMPFS_ENV, VALIDATOR_DOCKER_TMPFS_DEFAULT).strip()
+    if tmpfs:
+        args.extend(["--tmpfs", tmpfs])
+
+    cpus = os.getenv(VALIDATOR_DOCKER_CPU_LIMIT_ENV, VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT).strip()
+    if cpus:
+        args.extend(["--cpus", cpus])
+
+    memory = os.getenv(VALIDATOR_MEMORY_LIMIT_ENV, VALIDATOR_MEMORY_LIMIT_DEFAULT).strip()
+    if memory:
+        args.extend(["--memory", memory, "--memory-swap", memory])
+
+    run_user = _container_run_user()
+    if run_user:
+        args.extend(["--user", run_user])
+
+    return args
+
+
+def run_image_detached(
+    image_name: str,
+    container_name: str,
+    validator_label: str,
+    challenge_input_mount_dir: str,
+) -> str:
+    """
+    Run a Docker container in detached mode with hardened mounts.
+
+    - Challenge input: fresh host dir per run, read-only at ``/challenge_input``.
+    - Solution output: nothing is mounted into the container. The miner writes
+      text logs + a :data:`SOLUTION_OUTPUT_SEPARATOR` line + a base64-encoded
+      zip of artifacts to stdout. The validator captures this after the container
+      exits using ``docker logs`` (see :func:`extract_stdout_output`).
+    """
+    try:
+        challenge_mount = os.path.abspath(challenge_input_mount_dir)
+
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--network",
+                "none",
+                *docker_run_security_args(),
+                "--name",
+                container_name,
+                "-v", f"{challenge_mount}:{CONTAINER_CHALLENGE_INPUT_PATH}:ro",
+                "--label",
+                validator_label,
+                image_name,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        container_id = result.stdout.strip()
+
+        bt.logging.info(
+            f"🚀 Container '{container_name}' started in background (ID: {container_id}) "
+            f"with label '{validator_label}'"
+        )
+        return container_id
+
+    except subprocess.CalledProcessError as e:
+        bt.logging.error(
+            f"❌ Failed to start container '{container_name}' from image '{image_name}': {e.stderr}"
+        )
+        raise InvalidSolutionError(message=str(ValidationErrors.DOCKER_RUN_FAILED))
+
+    except Exception as e:
+        bt.logging.error(f"❌ An error occurred while starting the container: {e}")
+        raise InvalidSolutionError(message=str(ValidationErrors.DOCKER_RUN_FAILED))

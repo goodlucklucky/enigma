@@ -75,7 +75,7 @@ def main():
     print("→ Fetching deployer address...")
     try:
         result = subprocess.run(
-            ["cast", "wallet", "address", "--private-key", args.private_key], 
+            ["cast", "wallet", "address", "--private-key", args.private_key],
             capture_output=True, text=True, check=True
         )
         deployer_address = result.stdout.strip()
@@ -89,7 +89,7 @@ def main():
 
     # Setup Environment Variables for deploy.sh
     env = os.environ.copy()
-    
+
     # Ensure Foundry is in PATH
     foundry_path = os.path.expanduser("~/.foundry/bin")
     if foundry_path not in env.get("PATH", ""):
@@ -102,7 +102,7 @@ def main():
         "NETUID": str(args.netuid),
         "TREASURY_ADMIN": deployer_address,
         "GOV_NAME": args.gov_name,
-        
+
         # --- TIMING & GOVERNANCE PARAMS ---
         "MIN_DELAY": str(args.min_delay),
         "VOTING_DELAY": str(args.voting_delay),
@@ -111,7 +111,7 @@ def main():
         "QUORUM_BPS": str(args.quorum_bps),
         "SUCCESS_THRESHOLD_BPS": str(args.success_threshold_bps),
         "PROPOSAL_EXPIRATION": str(args.proposal_expiration),
-        
+
         # --- CIRCUIT BREAKERS ---
         "TAO_LIMIT": to_wei(args.tao_limit),
         "ALPHA_LIMIT": to_rao(args.alpha_limit),
@@ -120,10 +120,10 @@ def main():
     })
 
     print("🚀 Executing Foundry deployment...")
-    
+
     # Run the bash script from the expected directory
     process = subprocess.run(
-        ["bash", "scripts/deploy.sh"], 
+        ["bash", "scripts/deploy.sh"],
         cwd=treasury_dir,
         env=env,
         text=True

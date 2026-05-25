@@ -88,7 +88,7 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     struct ProposalTallies {
         uint256 forVotes;
         uint256 againstVotes;
-        mapping(address => bool) hasVoted; 
+        mapping(address => bool) hasVoted;
     }
 
     mapping(uint256 => ProposalTallies) private _proposalTallies;
@@ -106,8 +106,8 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
 
     modifier onlyAdminOrWhitelisted() {
         require(
-            msg.sender == treasuryAdmin || 
-            (_trustedValidators.contains(msg.sender) && _hasActiveValidatorStatus(msg.sender)), 
+            msg.sender == treasuryAdmin ||
+            (_trustedValidators.contains(msg.sender) && _hasActiveValidatorStatus(msg.sender)),
             "Not admin or whitelisted/active"
         );
         _;
@@ -208,8 +208,8 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     // QUEUE WRAPPERS
     // ==========================================
 
-    function queueWhitelistUpdate(address[] memory validators, bool[] memory trusted, string memory description) 
-        external returns (uint256) 
+    function queueWhitelistUpdate(address[] memory validators, bool[] memory trusted, string memory description)
+        external returns (uint256)
     {
         address[] memory targets = new address[](1);
         uint256[] memory values = new uint256[](1);
@@ -233,7 +233,7 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     function queueAlphaTransfer(
         bytes32 destinationColdkey, bytes32 hotkey, uint16 originNetuid, uint16 destinationNetuid, uint256 amount, string memory description
     ) external returns (uint256) {
-        (address[] memory targets, uint256[] memory values, bytes[] memory calldatas) = 
+        (address[] memory targets, uint256[] memory values, bytes[] memory calldatas) =
             _buildAlphaPayload(destinationColdkey, hotkey, originNetuid, destinationNetuid, amount);
         return super.queue(targets, values, calldatas, keccak256(bytes(description)));
     }
@@ -242,8 +242,8 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     // EXECUTE WRAPPERS
     // ==========================================
 
-    function executeWhitelistUpdate(address[] memory validators, bool[] memory trusted, string memory description) 
-        external payable returns (uint256) 
+    function executeWhitelistUpdate(address[] memory validators, bool[] memory trusted, string memory description)
+        external payable returns (uint256)
     {
         address[] memory targets = new address[](1);
         uint256[] memory values = new uint256[](1);
@@ -294,8 +294,8 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     // CANCELLATION FUNCTIONS
     // ==========================================
 
-    function _executeCancel(address[] memory targets, uint256[] memory values, bytes[] memory calldatas, string memory description) 
-        internal returns (uint256) 
+    function _executeCancel(address[] memory targets, uint256[] memory values, bytes[] memory calldatas, string memory description)
+        internal returns (uint256)
     {
         bytes32 descriptionHash = keccak256(bytes(description));
         uint256 proposalId = hashProposal(targets, values, calldatas, descriptionHash);
@@ -304,8 +304,8 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
         return _cancel(targets, values, calldatas, descriptionHash);
     }
 
-    function cancelWhitelistUpdate(address[] memory validators, bool[] memory trusted, string memory description) 
-        external onlyAdminOrWhitelisted returns (uint256) 
+    function cancelWhitelistUpdate(address[] memory validators, bool[] memory trusted, string memory description)
+        external onlyAdminOrWhitelisted returns (uint256)
     {
         address[] memory targets = new address[](1);
         uint256[] memory values = new uint256[](1);
@@ -353,16 +353,16 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
             require(_trustedValidators.contains(account) && _hasActiveValidatorStatus(account), "Not an active, trusted validator");
         }
     }
-        
-    function _castVote(uint256 proposalId, address account, uint8 support, string memory reason) 
-        internal virtual override returns (uint256) 
+
+    function _castVote(uint256 proposalId, address account, uint8 support, string memory reason)
+        internal virtual override returns (uint256)
     {
         _requireValidVoter(proposalId, account);
         return super._castVote(proposalId, account, support, reason);
     }
 
-    function _castVote(uint256 proposalId, address account, uint8 support, string memory reason, bytes memory params) 
-        internal virtual override returns (uint256) 
+    function _castVote(uint256 proposalId, address account, uint8 support, string memory reason, bytes memory params)
+        internal virtual override returns (uint256)
     {
         _requireValidVoter(proposalId, account);
         return super._castVote(proposalId, account, support, reason, params);
@@ -390,7 +390,7 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     function quorum(uint256 /*timepoint*/) public view virtual override returns (uint256) {
         uint256 totalWhitelistPower = 0;
         address[] memory validators = _trustedValidators.values();
-        
+
         for (uint256 i = 0; i < validators.length; i++) {
             // Only count them if they are actively registered on the subnet
             if (_hasActiveValidatorStatus(validators[i])) {
@@ -400,7 +400,7 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
                 }
             }
         }
-        
+
         return (totalWhitelistPower * SUPPORT_THRESHOLD_NUMERATOR) / 10000;
     }
 
@@ -420,21 +420,21 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     function _voteSucceeded(uint256 proposalId) internal view virtual override returns (bool) {
         uint256 forVotes = _proposalTallies[proposalId].forVotes;
         uint256 totalVotes = forVotes + _proposalTallies[proposalId].againstVotes;
-        
+
         if (totalVotes == 0) return false;
         return (forVotes * 10000) >= (totalVotes * SUCCESS_THRESHOLD_BPS);
     }
 
-    function _getVotes(address account, uint256 /*timepoint*/, bytes memory /*params*/) 
-        internal view virtual override returns (uint256) 
+    function _getVotes(address account, uint256 /*timepoint*/, bytes memory /*params*/)
+        internal view virtual override returns (uint256)
     {
         if (_trustedValidators.length() == 0 && account == treasuryAdmin) {
-            return 1; 
+            return 1;
         }
 
         bytes32[] memory hotkeys = getHotkeysForAddress(account);
         uint256 totalPower = 0;
-        
+
         for (uint256 i = 0; i < hotkeys.length; i++) {
             totalPower += IBittensorVotes(BITTENSOR_VOTES_ADDRESS).getVotingPower(TARGET_NETUID, hotkeys[i]);
         }
@@ -545,20 +545,20 @@ contract TreasuryController is Governor, GovernorSettings, GovernorTimelockContr
     // GOVERNOR OVERRIDES
     // ==========================================
 
-    function propose(address[] memory, uint256[] memory, bytes[] memory, string memory) 
-        public pure override(Governor) returns (uint256) 
+    function propose(address[] memory, uint256[] memory, bytes[] memory, string memory)
+        public pure override(Governor) returns (uint256)
     {
         revert("Use specific propose functions");
     }
 
-    function queue(address[] memory, uint256[] memory, bytes[] memory, bytes32) 
-        public pure override(Governor) returns (uint256) 
+    function queue(address[] memory, uint256[] memory, bytes[] memory, bytes32)
+        public pure override(Governor) returns (uint256)
     {
         revert("Use specific queue functions");
     }
 
-    function execute(address[] memory, uint256[] memory, bytes[] memory, bytes32) 
-        public payable override(Governor) returns (uint256) 
+    function execute(address[] memory, uint256[] memory, bytes[] memory, bytes32)
+        public payable override(Governor) returns (uint256)
     {
         revert("Use specific execute functions");
     }
