@@ -381,6 +381,7 @@ class TestMinerForward:
         submission.transfer_amount_rao = "1000000"
         submission.upload_endpoint_id = "upload123"
         submission.challenge_milestone_id = "milestone-42"
+        submission.challenge_id = "challenge-99"
         submission.upload_id = "upload123"          # used by from_miner_submission
         submission.miner_hotkey = "5MinerHotkey123"
 
@@ -389,11 +390,13 @@ class TestMinerForward:
         # Ensure the build function returns a real string (the construction-time patch
         # sometimes doesn't fully intercept because of how the name is bound in neurons/miner).
         with patch("qbittensor.utils.transfer_proof.build_transfer_proof_message", return_value="signed_proof_message"), \
-             patch("neurons.miner.build_transfer_proof_message", return_value="signed_proof_message"):
+                patch("neurons.miner.build_transfer_proof_message", return_value="signed_proof_message"):
             result = self._run_forward(mock_miner, synapse)
 
         # Proof should be attached
         assert result.tx_hash == "0xdeadbeef"
+        assert result.challenge_id == "challenge-99"
+        assert result.solution_candidate.challenge_id == "challenge-99"
         assert result.transfer_proof_signature_hex is not None
 
         # Should have recorded that we served it

@@ -22,6 +22,7 @@ import bittensor as bt
 from ..base_query import BaseDBQuery
 from .db_models import MinerSubmission, MinerSubmissionStatus
 
+
 class DBQueryMiner(BaseDBQuery):
     """
     SQLAlchemy-backed query layer for miner-side submissions and status tracking.
@@ -40,6 +41,7 @@ class DBQueryMiner(BaseDBQuery):
         miner_hotkey: str,
         tx_hash: str,
         *,
+        challenge_id: str,
         transfer_block_hash: str,
         transfer_from_ss58: str,
         transfer_to_ss58: str,
@@ -56,6 +58,7 @@ class DBQueryMiner(BaseDBQuery):
                     bt.logging.info(f"Updating existing miner submission for tx_hash: {tx_hash}")
                     existing_submission.upload_id = upload_id
                     existing_submission.miner_hotkey = miner_hotkey
+                    existing_submission.challenge_id = challenge_id
                     existing_submission.challenge_milestone_id = challenge_milestone_id
                     existing_submission.transfer_block_hash = transfer_block_hash
                     existing_submission.transfer_from_ss58 = transfer_from_ss58
@@ -68,6 +71,7 @@ class DBQueryMiner(BaseDBQuery):
                     bt.logging.info(f"Inserting new miner submission for tx_hash: {tx_hash}")
                     new_submission = MinerSubmission(
                         upload_id=upload_id,
+                        challenge_id=challenge_id,
                         challenge_milestone_id=challenge_milestone_id,
                         miner_hotkey=miner_hotkey,
                         tx_hash=tx_hash,

@@ -37,6 +37,7 @@ except ImportError:
     NVML_AVAILABLE = False
     bt.logging.warning("pynvml not available, GPU metrics will be skipped")
 
+
 class TelemetryService:
     def __init__(
         self,

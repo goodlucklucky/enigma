@@ -16,7 +16,6 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import argparse
 import time
 import typing
 from types import SimpleNamespace
@@ -131,6 +130,7 @@ class Miner(BaseMinerNeuron):
         signature = self.wallet.hotkey.sign(proof_message.encode("utf-8"))
 
         synapse.solution_candidate = solution_candidate
+        synapse.challenge_id = miner_submission.challenge_id
         synapse.tx_hash = miner_submission.tx_hash
         synapse.transfer_block_hash = miner_submission.transfer_block_hash
         synapse.transfer_from_ss58 = miner_submission.transfer_from_ss58
@@ -215,6 +215,10 @@ class Miner(BaseMinerNeuron):
         pass
 
     @classmethod
+    def config(cls):
+        return cls._apply_secure_blacklist_defaults(super().config())
+
+    @classmethod
     def _apply_secure_blacklist_defaults(cls, config: "bt.Config") -> "bt.Config":
         """Force secure defaults for blacklist settings.
 
@@ -233,12 +237,7 @@ class Miner(BaseMinerNeuron):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    Miner.add_args(parser)
-    config = bt.Config(parser)
-    config = Miner._apply_secure_blacklist_defaults(config)
-
-    with Miner(config=config) as miner:
-        while True:
+    with Miner() as miner:
+        while miner.is_running and miner.thread and miner.thread.is_alive():
             bt.logging.info(f"Miner running... {timestamp_str()}")
             time.sleep(5)

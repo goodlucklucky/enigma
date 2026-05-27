@@ -100,8 +100,6 @@ class RequestManager:
         self.check_error_code(response, full_url, "POST", ignore_codes=ignore_codes)
         return response
 
-
-
     def patch(self, endpoint: str, json: Dict, params: Dict = {}, ignore_codes: List[int] = []) -> requests.Response:
         """Make a PATCH request to the job server with signed header"""
         headers = self._get_header()

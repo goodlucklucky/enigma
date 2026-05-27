@@ -17,15 +17,11 @@
 
 from datetime import timedelta
 
-# --- Heartbeat ---
-HEARTBEAT_TIMEOUT: timedelta = timedelta(minutes=5) # TODO Change to ~5 minutes
-
 # --- Cross-Check ---
 CROSS_CHECK_TIMEOUT: timedelta = timedelta(seconds=30)
 CROSS_CHECK_MAX_BATCH_SIZE: int = 3
 
 # --- Solutions Container Management ---
-SOLUTION_CONTAINER_MANAGER_TIMEOUT: timedelta = timedelta(minutes=2) # TODO Change to ~30 minutes
-SOLUTION_CONTAINER_MANAGER_POLLING_TIMEOUT: timedelta = timedelta(minutes=1)
+SOLUTION_CONTAINER_MANAGER_TIMEOUT: timedelta = timedelta(minutes=30)
 MAX_SOLUTION_RUNTIME: timedelta = timedelta(minutes=30)
 MAX_SOLUTIONS: int = 1

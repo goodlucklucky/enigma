@@ -284,7 +284,7 @@ class TestDockerRunSecurityArgs:
         assert ["--pids-limit", "128"] == args[2:4]
         assert "--ulimit" in args
         assert "nofile=1024:1024" in args
-        assert ["--cap-drop", "ALL"] == args[args.index("--cap-drop") : args.index("--cap-drop") + 2]
+        assert ["--cap-drop", "ALL"] == args[args.index("--cap-drop"): args.index("--cap-drop") + 2]
         assert "--security-opt" in args
         assert "--read-only" in args
         assert "--tmpfs" in args
@@ -293,15 +293,15 @@ class TestDockerRunSecurityArgs:
             if token == "--tmpfs":
                 assert "/output" not in args[i + 1]
         assert ["--user", VALIDATOR_DOCKER_MINER_USER_DEFAULT] == args[
-            args.index("--user") : args.index("--user") + 2
+            args.index("--user"): args.index("--user") + 2
         ]
         assert ["--cpus", VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT] == args[
-            args.index("--cpus") : args.index("--cpus") + 2
+            args.index("--cpus"): args.index("--cpus") + 2
         ]
         mem_idx = args.index("--memory")
-        assert ["--memory", VALIDATOR_MEMORY_LIMIT_DEFAULT] == args[mem_idx : mem_idx + 2]
+        assert ["--memory", VALIDATOR_MEMORY_LIMIT_DEFAULT] == args[mem_idx: mem_idx + 2]
         swap_idx = args.index("--memory-swap")
-        assert ["--memory-swap", VALIDATOR_MEMORY_LIMIT_DEFAULT] == args[swap_idx : swap_idx + 2]
+        assert ["--memory-swap", VALIDATOR_MEMORY_LIMIT_DEFAULT] == args[swap_idx: swap_idx + 2]
 
     def test_env_overrides(self, monkeypatch):
         monkeypatch.setenv("VALIDATOR_DOCKER_PIDS_LIMIT", "64")
@@ -321,7 +321,7 @@ class TestDockerRunSecurityArgs:
     def test_non_root_user_env_override(self, monkeypatch):
         monkeypatch.setenv("VALIDATOR_DOCKER_MINER_USER", "10001:10001")
         args = docker_run_security_args()
-        assert ["--user", "10001:10001"] == args[args.index("--user") : args.index("--user") + 2]
+        assert ["--user", "10001:10001"] == args[args.index("--user"): args.index("--user") + 2]
 
     def test_empty_non_root_user_disables_user_flag(self, monkeypatch):
         monkeypatch.setenv("VALIDATOR_DOCKER_MINER_USER", "")
@@ -331,7 +331,7 @@ class TestDockerRunSecurityArgs:
     def test_cpu_limit_env_override(self, monkeypatch):
         monkeypatch.setenv("VALIDATOR_DOCKER_CPU_LIMIT", "1.5")
         args = docker_run_security_args()
-        assert ["--cpus", "1.5"] == args[args.index("--cpus") : args.index("--cpus") + 2]
+        assert ["--cpus", "1.5"] == args[args.index("--cpus"): args.index("--cpus") + 2]
 
     def test_empty_cpu_limit_disables_cpus_flag(self, monkeypatch):
         monkeypatch.setenv("VALIDATOR_DOCKER_CPU_LIMIT", "")
@@ -342,7 +342,7 @@ class TestDockerRunSecurityArgs:
         monkeypatch.setenv("VALIDATOR_MEMORY_LIMIT", "512m")
         args = docker_run_security_args()
         mem_idx = args.index("--memory")
-        assert args[mem_idx : mem_idx + 4] == ["--memory", "512m", "--memory-swap", "512m"]
+        assert args[mem_idx: mem_idx + 4] == ["--memory", "512m", "--memory-swap", "512m"]
 
     def test_empty_memory_limit_disables_memory_flags(self, monkeypatch):
         monkeypatch.setenv("VALIDATOR_MEMORY_LIMIT", "")
@@ -533,7 +533,6 @@ class TestRunSolutionManagement:
         db.db_query.has_seen_tx_hash = Mock(return_value=False)
         db.db_query.create_challenge_solution = Mock(return_value=True)
         db.db_query.update_challenge_solution = Mock(return_value=True)
-        request_manager = Mock()
 
         with patch(
             "qbittensor.validator.solution.run.run_image_detached",
@@ -548,6 +547,7 @@ class TestRunSolutionManagement:
                 tx_hash="0xtx",
                 miner_hotkey="miner_hk",
                 submission_id="sub-id",
+                challenge_id="challenge-id",
             )
 
         assert image == "tag_image"
@@ -564,8 +564,6 @@ class TestRunSolutionManagement:
         db.db_query.has_seen_tx_hash = Mock(return_value=False)
         db.db_query.create_challenge_solution = Mock(return_value=True)
         db.db_query.update_challenge_solution_status = Mock(return_value=True)
-        request_manager = Mock()
-        request_manager.patch.return_value = Mock(status_code=200)
 
         result = run_solution_management(
             db_conn=db,
@@ -576,6 +574,7 @@ class TestRunSolutionManagement:
             tx_hash="tx",
             miner_hotkey="hk",
             submission_id="sub",
+            challenge_id="challenge-id",
         )
         assert result == (None, None, None)
         mock_cleanup.assert_called_once()

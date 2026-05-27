@@ -29,6 +29,7 @@ Create folder(s) for solution management. Delete them when done.
 FOLDER_NAME = ""
 # FOLDER_PREFIX: str = CHALLENGE_SOLTION_PREFIX
 
+
 def setup(validator_label: str, challenge_validation_solution_id: str) -> tuple[str, str]:
     """Setup folder for solution management
 

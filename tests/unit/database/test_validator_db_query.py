@@ -31,6 +31,7 @@ def _insert_solution(query, **overrides):
         container_id="cid-abc123",
         container_name="ctr_name",
         image_id="val_label_sol_image",
+        challenge_id="ch-1",
         challenge_milestone_id="milestone-1",
         absolute_path_to_solution="/tmp/solution/path",
         submission_id="sub-1",
@@ -67,6 +68,7 @@ class TestDBQuery:
             solution_status=SolutionStatus.PENDING.value,
             tx_hash="0xearly",
             miner_hotkey="5Miner",
+            challenge_id="ch-1",
         )
         row = validator_query.get_challenge_solution_location(
             validator_query._pending_placeholder("0xearly", "container_name")
@@ -86,6 +88,22 @@ class TestDBQuery:
         assert row.container_id == "cid-final"
         assert row.absolute_path_to_solution == "/tmp/final/path"
         assert row.solution_status == SolutionStatus.RUNNING.value
+
+    def test_create_challenge_solution_without_challenge_id(self, validator_query):
+        assert validator_query.create_challenge_solution(
+            challenge_validation_solution_id="cv-cross",
+            challenge_milestone_id="milestone-1",
+            submission_id="sub-cross",
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash="0xcross",
+            miner_hotkey="5Miner",
+            challenge_id=None,
+        )
+        row = validator_query.get_challenge_solution_location(
+            validator_query._pending_placeholder("0xcross", "container_name")
+        )
+        assert row is not None
+        assert row.challenge_id is None
 
     def test_get_container_name_by_solution_location(self, validator_query):
         data = _insert_solution(validator_query)

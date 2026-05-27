@@ -61,7 +61,7 @@ def transfer_fee_extrinsic_subtensor(
     """
     Submit Balances.transfer_keep_alive for the explicitly supplied fee_tao (RAO value)
     to TRANSFER_DEST_SS58. fee_tao MUST come from a successful call to
-    ChallengesClient.get_milestone_price_tao(challenge_id=..., milestone_id=...) 
+    ChallengesClient.get_milestone_price_tao(challenge_id=..., milestone_id=...)
     (or the convenience get_milestone_transfer_amount_rao()). No internal fallback is permitted.
     Raises ValueError on any failure.
     """
@@ -111,7 +111,7 @@ def transfer_tao_for_submission(
     """Submit TAO transfer and return extrinsic + inclusion block hash for verification.
 
     fee_tao MUST be provided by the caller (obtained via
-    ChallengesClient.get_milestone_price_tao(challenge_id=..., milestone_id=...) 
+    ChallengesClient.get_milestone_price_tao(challenge_id=..., milestone_id=...)
     or get_milestone_transfer_amount_rao()). This function does not perform any Challenges API calls itself.
     """
     if not milestone_id:

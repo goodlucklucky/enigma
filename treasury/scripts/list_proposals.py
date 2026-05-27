@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+from utils.common import DEFAULT_RPC_URL
+
 
 class ProposalViewer:
     STATES = {
@@ -226,15 +228,15 @@ class ProposalViewer:
         snapshot, deadline, eta, current_block = self.get_proposal_timings(numeric_id)
 
         timing_str = f"Snapshot: {snapshot} | Deadline: {deadline}"
-        if state_int == 0: # Pending
+        if state_int == 0:  # Pending
             blocks = snapshot - current_block
             est = self.format_time_estimate(blocks * 12)
             timing_str = f"Voting starts in ~{blocks} blocks (~{est}) (at block {snapshot})"
-        elif state_int == 1: # Active
+        elif state_int == 1:  # Active
             blocks = deadline - current_block
             est = self.format_time_estimate(blocks * 12)
             timing_str = f"Voting ends in ~{blocks} blocks (~{est}) (at block {deadline})"
-        elif state_int == 5: # Queued
+        elif state_int == 5:  # Queued
             now = int(time.time())
             if eta > now:
                 est = self.format_time_estimate(eta - now)
@@ -313,7 +315,11 @@ class ProposalViewer:
 
     def run(self):
         parser = argparse.ArgumentParser(description="View governance proposals")
-        parser.add_argument("--rpc", required=True, help="RPC URL")
+        parser.add_argument(
+            "--rpc",
+            default=DEFAULT_RPC_URL,
+            help=f"RPC URL (default: {DEFAULT_RPC_URL})"
+        )
         parser.add_argument("--contract", required=True, help="TreasuryController address")
         parser.add_argument("--limit", type=int, default=10, help="Number of recent proposals to show (if no ID provided)")
         parser.add_argument("--id", type=str, help="Specific Proposal ID to fetch")

@@ -40,7 +40,10 @@ from qbittensor.protocol import MinerSubmissionStatus
 
 TREASURY_HOTKEY: str = "5DCLafsAKaLeZwm9hjMHvrQNjtucSwBhKyTLYnYmMvhxF2Uc"
 TREASURY_WALLET_AMOUNT: float = 0.99
-PRIVATE_MINER_HOTKEY: str = "5GQni5zYEG8QLxQnrb2PBmCdJnEnyph1iZ6rL4rPe1G5LQtH"
+PRIVATE_MINER_HOTKEY: str = "5HmQDNh8BrbDeT1bjgqXZ3KGAEb9n6doozNL2mQiJ9rYmuqh"
+MIN_DUST_FLOOR: float = 2.5e-5
+
+
 class Validator(BaseValidatorNeuron):
 
     def __init__(self, config=None):
@@ -179,13 +182,7 @@ class Validator(BaseValidatorNeuron):
     def set_weights(self):
         """Compute maintenance incentive + treasury weights from recent verified miners (DB),
         then delegate to BaseValidatorNeuron.set_weights() which normalizes and submits on-chain.
-
-        If the treasury hotkey cannot be located in the current metagraph, we refuse to set
-        weights this round. This prevents the previous failure mode where only dust weights
-        existed and downstream normalization produced bad (uniform) on-chain weights.
-
-        The private miner is still always force-included, and the remaining 1% is still split
-        equally across all hotkeys_to_maintain (DB active miners + private miner).
+        If the treasury hotkey cannot be located, we refuse to set weights this round.
         """
         try:
             # Use numpy array (matching the clean template pattern) for scores
@@ -197,27 +194,31 @@ class Validator(BaseValidatorNeuron):
             if PRIVATE_MINER_HOTKEY not in hotkeys_to_maintain:
                 hotkeys_to_maintain.append(PRIVATE_MINER_HOTKEY)
 
-            # Calculate the amount of weight to distribute to each miner
-            maintenance_amount: float = (1.0 - TREASURY_WALLET_AMOUNT) / len(hotkeys_to_maintain) if hotkeys_to_maintain else 0.0
+            n_maintain = len(hotkeys_to_maintain)
 
-            # Set the weights for each miner (by hotkey lookup, never by assumed UID)
+            floor = MIN_DUST_FLOOR if n_maintain > 0 else 0.0
             for uid, hotkey in enumerate(self.metagraph.hotkeys):
                 if hotkey in hotkeys_to_maintain:
-                    weights[uid] = maintenance_amount
+                    weights[uid] = floor
+
+            mass_reserved_for_miners = floor * n_maintain
+            remaining = max(0.0, 1.0 - mass_reserved_for_miners)
+
+            treasury_assigned = remaining
 
             # Prune old maintenance incentive rows from the db (always run for hygiene)
             self.database_connection.db_query.prune_old_miner_solutions()
 
-            # Set treasury weight by looking up its hotkey (never hardcode UID, as UIDs are not stable across registrations)
+            # Set treasury weight by looking up its hotkey
             treasury_uid = None
             if TREASURY_HOTKEY in self.metagraph.hotkeys:
                 treasury_uid = self.metagraph.hotkeys.index(TREASURY_HOTKEY)
-                weights[treasury_uid] = TREASURY_WALLET_AMOUNT if len(hotkeys_to_maintain) > 0 else 1.0
+                weights[treasury_uid] = treasury_assigned
             else:
                 bt.logging.error(
                     f"CRITICAL: Treasury hotkey {TREASURY_HOTKEY} not found in current metagraph. "
                     "Refusing to set weights this round to avoid emitting incorrect distribution. "
-                    f"Intended dust recipients: {len(hotkeys_to_maintain)} (including forced private miner)."
+                    f"Intended dust recipients: {n_maintain} (including forced private miner)."
                 )
 
             self.scores = weights
@@ -227,6 +228,21 @@ class Validator(BaseValidatorNeuron):
             # Only proceed to on-chain set if we successfully placed the treasury weight
             if treasury_uid is None:
                 return
+
+            # Helpful post-assignment visibility for the private miner (the one we care most about not losing)
+            if PRIVATE_MINER_HOTKEY in self.metagraph.hotkeys:
+                pm_uid = self.metagraph.hotkeys.index(PRIVATE_MINER_HOTKEY)
+                actual = float(weights[pm_uid])
+                bt.logging.info(
+                    f"Private miner dust: {PRIVATE_MINER_HOTKEY} @ UID {pm_uid} "
+                    f"assigned {actual:.8f} (floor={floor:.8f}) before normalization."
+                )
+            else:
+                bt.logging.error(
+                    f"PRIVATE MINER HOTKEY NOT FOUND IN METAGRAPH: {PRIVATE_MINER_HOTKEY} "
+                    "— 0 weight will be emitted for it this round. "
+                    "Verify the miner is registered on this netuid using this exact hotkey."
+                )
 
         except Exception as exc:
             if "NeuronNoValidatorPermit" in str(exc):

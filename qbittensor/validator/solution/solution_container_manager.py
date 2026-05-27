@@ -36,7 +36,6 @@ class SolutionContainerManager:
         self.database_connection = database_connection
         self.LABEL = validator_label
 
-
     def run(self) -> None:
         bt.logging.info("🐳 Checking on solution containers")
 
@@ -134,7 +133,6 @@ class SolutionContainerManager:
             except Exception as e:
                 bt.logging.error(f"❌ Failed to clean up solution at {location}: {e}")
 
-
     def _find_completed_solutions(self) -> List[str]:
         """Find containers that have completed their run and are ready for output validation"""
 
@@ -158,7 +156,7 @@ class SolutionContainerManager:
             solution = self.database_connection.db_query.get_challenge_solution_location(container_name=name)
             if solution:
                 bt.logging.info(f"📂 Found solution location for container {name}: {solution.absolute_path_to_solution}")
-                solution_locations.append(solution.absolute_path_to_solution) # type: ignore
+                solution_locations.append(solution.absolute_path_to_solution)  # type: ignore
             else:
                 bt.logging.warning(f"⚠️ No solution location found for container {name}")
                 self._clean_up_orphaned_solutions(name)
@@ -370,7 +368,6 @@ class SolutionContainerManager:
                     bt.logging.info(f"❌ Failed to remove image {config_image}: {e}")
         except Exception as e:
             bt.logging.error(f"❌ Failed to prune containers/images: {e}")
-
 
     def _clean_up_orphaned_solutions(self, container_name: str) -> None:
         """If we find a container that has no associated solution location, we should remove it to free up resources"""

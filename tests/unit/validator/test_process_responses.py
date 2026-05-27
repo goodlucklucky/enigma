@@ -24,8 +24,9 @@ from qbittensor.validator.synapse.process_responses import ResponseProcessor
 from qbittensor.utils.services.challenges import ChallengesClient
 
 
-def _make_synapse(*, milestone_id="m1", upload_id="up1", prep_id="prep1"):
+def _make_synapse(*, milestone_id="m1", upload_id="up1", prep_id="prep1", challenge_id="ch1"):
     synapse = Mock()
+    synapse.challenge_id = challenge_id
     synapse.tx_hash = "0xabc"
     synapse.transfer_block_hash = "0xblock123"
     synapse.transfer_from_ss58 = "5ColdkeyFrom"
@@ -36,6 +37,7 @@ def _make_synapse(*, milestone_id="m1", upload_id="up1", prep_id="prep1"):
     synapse.solution_candidate = SolutionCandidate(
         challenge_milestone_id=milestone_id,
         upload_endpoint_id=upload_id,
+        challenge_id=challenge_id,
         challenge_preparation_id=prep_id,
     )
     return synapse
@@ -104,9 +106,6 @@ class TestResponseProcessor:
         call_args = processor.platform_client.submit_solution.call_args
         payload = call_args.kwargs.get("payload") or call_args.args[1]
         assert getattr(payload, "validator_busy", None) is True
-
-    # Tests for the old private method _post_challenge_submission have been removed
-    # as part of aggressive cleanup. All submission logic now flows through ChallengesClient.
 
 
 class TestResponseProcessorAdditionalPaths:

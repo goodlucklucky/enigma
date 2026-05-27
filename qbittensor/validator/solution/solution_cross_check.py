@@ -48,7 +48,7 @@ class SolutionCrossChecker:
         bt.logging.info("🎁 Running cross-check for solutions")
 
         if self.solution_container_manager.validator_is_busy():
-            bt.logging.info("🚫 Validator is busy. Not performing any cross-checks.")
+            bt.logging.info("🐝 Validator is busy. Not performing any cross-checks.")
             return
 
         submission: ChallengeSubmissionRead | None = self.platform_client.get_next_cross_check_submission()
@@ -101,11 +101,13 @@ class SolutionCrossChecker:
         )
 
         bt.logging.info(f"Running solution cross-check on solution with miner hotkey {submission.address}")
+
         image_name, container_id, folder_name = execute_verified_solution(
             db_conn=self.database_connection,
             platform_client=self.platform_client,
             validator_label=self.validator_label,
             download_url=submission.file_download_url,
+            challenge_id=submission.challenge_id,
             challenge_milestone_id=submission.challenge_milestone_id,
             challenge_validation_solution_id=submission.id,
             submission_id=submission.id,
@@ -121,7 +123,3 @@ class SolutionCrossChecker:
             f"✨ Solution cross-check running on solution {submission.id} "
             f"with image name {image_name}, container id {container_id}"
         )
-
-
-
-

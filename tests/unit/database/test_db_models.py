@@ -27,6 +27,7 @@ class TestMinerModels:
     def test_miner_submission_repr(self):
         sub = MinerSubmission(
             upload_id="u1",
+            challenge_id="ch-1",
             challenge_milestone_id="m1",
             miner_hotkey="5Miner",
             tx_hash="0xabc",
@@ -53,6 +54,7 @@ class TestValidatorModels:
             container_id="cid",
             container_name="cname",
             image_id="img",
+            challenge_id="ch-1",
             challenge_milestone_id="m1",
             absolute_path_to_solution="/tmp/sol",
             submission_id="sub1",
@@ -61,6 +63,22 @@ class TestValidatorModels:
             miner_hotkey="5Miner",
         )
         assert "ChallengeSolution" in repr(sol)
+
+    def test_challenge_solution_allows_null_challenge_id(self):
+        sol = ChallengeSolution(
+            challenge_validation_solution_id="cv1",
+            container_id="cid",
+            container_name="cname",
+            image_id="img",
+            challenge_id=None,
+            challenge_milestone_id="m1",
+            absolute_path_to_solution="/tmp/sol",
+            submission_id="sub1",
+            solution_status="Running",
+            tx_hash="0xabc",
+            miner_hotkey="5Miner",
+        )
+        assert sol.challenge_id is None
 
     def test_miner_maintenance_incentive_repr(self):
         row = MinerMaintenanceIncentive(

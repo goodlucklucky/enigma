@@ -23,10 +23,12 @@ from ..base import Base
 
 logger = logging.getLogger(__name__)
 
+
 class MinerSubmission(Base):
     __tablename__ = "miner_submissions"
 
     id = Column(String(50), primary_key=True, default=lambda: str(uuid.uuid4()))
+    challenge_id = Column(String(100), nullable=False)
     challenge_milestone_id = Column(String(100), nullable=False)
     upload_id = Column(String(100), nullable=False)
     miner_hotkey = Column(String(100), nullable=False)
@@ -46,6 +48,7 @@ class MinerSubmission(Base):
             f"challenge_milestone_id='{self.challenge_milestone_id}', "
             f"miner_hotkey='{self.miner_hotkey}')"
         )
+
     def __str__(self):
         return self.__repr__()
 
@@ -73,5 +76,6 @@ class MinerSubmissionStatus(Base):
             f"solution_status='{self.solution_status}', "
             f"validator_hotkey='{self.validator_hotkey}')"
         )
+
     def __str__(self):
         return self.__repr__()

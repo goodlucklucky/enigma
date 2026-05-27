@@ -35,7 +35,6 @@ from .build_docker_image import build_image
 from .validate_docker_image import reject_dockerfile, validate_image
 from .run_solution import prepare_challenge_input_mount_dir, run_image_detached
 from qbittensor.utils.solution_status import SolutionStatus
-from qbittensor.utils.request.request_manager import RequestManager
 from qbittensor.utils.services.challenges import ChallengesClient
 
 
@@ -48,6 +47,7 @@ def run_solution_management(
     tx_hash: str,
     miner_hotkey: str,
     submission_id: str | None,
+    challenge_id: str | None = None,
     platform_client: ChallengesClient | None = None,
 ) -> Tuple[str | None, str | None, str | None]:
 
@@ -69,6 +69,7 @@ def run_solution_management(
             solution_status=SolutionStatus.PENDING.value,
             tx_hash=tx_hash,
             miner_hotkey=miner_hotkey,
+            challenge_id=challenge_id,
         ):
             bt.logging.error("Failed to insert pending challenge solution.")
             return None, None, None
@@ -177,6 +178,7 @@ def run_solution_management(
 
     return image_name, container_id, folder_name
 
+
 def clean_up_failed_solution(image_name: str | None, container_id: str | None, folder_name: str | None) -> None:
     bt.logging.info(f"Cleaning up failed solution with image name {image_name}, container id {container_id}, and folder name {folder_name}")
     if container_id is not None:
@@ -223,7 +225,7 @@ def execute_verified_solution(
     submission_id: str,
     tx_hash: str,
     miner_hotkey: str,
-    request_manager: RequestManager | None = None,
+    challenge_id: str | None = None,
     # Optional: include these when the logs and solution output have been uploaded
     # so they can be reported together with the final status (as required by the platform).
     log_data_key: Optional[str] = None,
@@ -249,8 +251,8 @@ def execute_verified_solution(
         submission_id=submission_id,
         tx_hash=tx_hash,
         miner_hotkey=miner_hotkey,
+        challenge_id=challenge_id,
         platform_client=platform_client,
-        request_manager=request_manager,
     )
 
     if image_name is None or container_id is None or folder_name is None:

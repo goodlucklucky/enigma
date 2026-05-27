@@ -29,6 +29,8 @@ from urllib.parse import urlparse, urlunparse
 
 import bittensor as bt
 
+from utils.common import DEFAULT_RPC_URL
+
 
 class VaultChecker:
     def __init__(self):
@@ -119,14 +121,18 @@ class VaultChecker:
     def run(self):
         parser = argparse.ArgumentParser(description="Check Vault / Governor balances and stake")
         parser.add_argument("--address", required=True, help="EVM address of Vault or Governor")
-        parser.add_argument("--rpc", required=True, help="RPC URL")
+        parser.add_argument(
+            "--rpc",
+            default=DEFAULT_RPC_URL,
+            help=f"RPC URL (default: {DEFAULT_RPC_URL})"
+        )
 
         args = parser.parse_args()
 
         ws_url = self.http_to_ws(args.rpc)
         self.subtensor = bt.Subtensor(network=ws_url)
 
-        print(f"\n{'='*90}")
+        print(f"\n{'=' * 90}")
         print(f"EVM Address : {args.address}")
 
         ss58 = self.get_ss58(args.address)
@@ -142,7 +148,7 @@ class VaultChecker:
         # Run the broad scan instead of the specific query
         self.scan_all_stakes(ss58)
 
-        print(f"{'='*90}\n")
+        print(f"{'=' * 90}\n")
 
 
 if __name__ == "__main__":

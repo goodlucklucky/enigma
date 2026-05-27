@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from qbittensor.utils.env import get_api_config
+from qbittensor.utils.services.challenges import ChallengesClient
 
 _api_cfg = get_api_config()
 
@@ -83,17 +84,34 @@ class CliApiAuth:
     wallet_name: str
     wallet_hotkey: str
     network: str
+    netuid: int
+
+
+def _resolve_cli_netuid(netuid: int | None) -> int:
+    if netuid is not None:
+        return netuid
+    env_val = (os.getenv("NETUID") or "63").strip()
+    try:
+        return int(env_val)
+    except ValueError as e:
+        raise click.ClickException(f"Invalid NETUID env value: {env_val!r}") from e
 
 
 def _resolve_cli_api_auth(
     wallet_name: str | None,
     wallet_hotkey: str | None,
     network: str | None,
+    netuid: int | None,
 ) -> CliApiAuth:
     cold = (wallet_name or os.getenv("BUY_WALLET_COLDKEY") or "default").strip() or "default"
     hot = (wallet_hotkey or os.getenv("BUY_WALLET_HOTKEY") or "default").strip() or "default"
     net = (network or os.getenv("NETWORK") or "finney").strip() or "finney"
-    return CliApiAuth(wallet_name=cold, wallet_hotkey=hot, network=net)
+    return CliApiAuth(
+        wallet_name=cold,
+        wallet_hotkey=hot,
+        network=net,
+        netuid=_resolve_cli_netuid(netuid),
+    )
 
 
 def _prompt_for_keyfile_path(console: Console) -> Path | None:
@@ -182,8 +200,8 @@ def _load_signing_keypair(console: Console, auth: CliApiAuth) -> bt.Keypair:
 
 
 def _challenges_client_for_api(
-    auth: CliApiAuth, console: Console, netuid: int | None = None
-) -> "ChallengesClient":
+    auth: CliApiAuth, console: Console
+) -> ChallengesClient:
     """Create an authenticated ChallengesClient for the challenges platform API.
 
     The client owns its own RequestManager (pointed at the challenges base URL).
@@ -196,7 +214,7 @@ def _challenges_client_for_api(
         keypair=keypair,
         base_url=_api_cfg.challenges_api_url,
         tensorauth_url=_api_cfg.tensorauth_url,
-        netuid=netuid,
+        netuid=auth.netuid,
     )
 
 
@@ -228,7 +246,7 @@ def run_milestone_solution_upload(
     console: Console,
     milestone_id: str,
     *,
-    challenge_id: str | None = None,
+    challenge_id: str,
     api_auth: CliApiAuth,
 ) -> None:
     """Prompt for a ``.zip``, then upload via ``submissions/upload`` and presigned storage."""
@@ -395,7 +413,7 @@ def run_milestone_solution_upload(
         console.print(_styled_panel("Cancelled", "No source mnemonic entered.", border=f"dim {c(3)}"))
         return
     try:
-        challenges_client = _challenges_client_for_api(api_auth, console, netuid=None)
+        challenges_client = _challenges_client_for_api(api_auth, console)
         submit_solution(
             console,
             milestone_id,
@@ -425,13 +443,13 @@ def submit_solution(
     source_ss58: str,
     source_mnemonic: str,
     network: str,
-    challenge_id: str | None = None,
+    challenge_id: str,
 ) -> dict[str, Any]:
 
     # store solution in the database for the miner_hotkey
-
-
     """Request slot, transfer, upload zip, then persist DB row for the miner."""
+    if not challenge_id:
+        raise click.ClickException("challenge_id is required to submit a solution.")
     zip_path = Path(solution_path)
     size = zip_path.stat().st_size
     upload_path = "v1/submissions/upload"
@@ -532,6 +550,7 @@ def submit_solution(
         milestone_id,
         str(upload_id),
         tx_hash,
+        challenge_id=challenge_id,
         transfer_block_hash=transfer_block_hash,
         transfer_to_ss58=TRANSFER_DEST_SS58,
         transfer_amount_rao=auth_client.get_milestone_transfer_amount_rao(challenge_id=challenge_id, milestone_id=milestone_id),
@@ -549,6 +568,7 @@ def store_solution_in_database(
     upload_id: str,
     tx_hash: str,
     *,
+    challenge_id: str,
     transfer_block_hash: str,
     transfer_to_ss58: str,
     transfer_amount_rao: str,
@@ -561,6 +581,7 @@ def store_solution_in_database(
         challenge_milestone_id=milestone_id,
         miner_hotkey=miner_hotkey,
         tx_hash=tx_hash,
+        challenge_id=challenge_id,
         transfer_block_hash=transfer_block_hash,
         transfer_from_ss58=source_ss58,
         transfer_to_ss58=transfer_to_ss58,
@@ -591,6 +612,10 @@ def store_solution_in_database(
                 (": ", f"dim {c(3)}"),
                 (milestone_id, f"bold {c(2)}"),
                 ("\n", ""),
+                ("Challenge id", f"dim {c(3)}"),
+                (": ", f"dim {c(3)}"),
+                (challenge_id, f"bold {c(2)}"),
+                ("\n", ""),
                 ("Upload id", f"dim {c(3)}"),
                 (": ", f"dim {c(3)}"),
                 (upload_id, f"bold {c(2)}"),
@@ -608,6 +633,7 @@ def store_solution_in_database(
     )
     console.print(Text("Submission Data Created!", style=f"bold {c(0)}"))
     _exit_cli_successfully(console)
+
 
 def _upload_solution_zip(console: Console, spec: dict[str, Any], zip_path: Path) -> None:
     """PUT or POST multipart to the URL / fields returned by the upload API."""
@@ -656,6 +682,7 @@ def query_challenge_data(
     challenge: dict[str, Any],
     *,
     console: Console | None = None,
+    api_auth: CliApiAuth,
 ) -> None:
     """Load challenge detail from the API, then show milestones."""
     cid = challenge.get("id")
@@ -669,7 +696,7 @@ def query_challenge_data(
     if not isinstance(payload, dict):
         raise ValueError("Challenge data is not a dictionary")
     out = console or Console()
-    format_milestones(out, payload)
+    format_milestones(out, payload, api_auth=api_auth)
 
 
 def _milestones_from_detail(detail: dict[str, Any]) -> list[dict[str, Any]]:
@@ -757,6 +784,8 @@ def _milestones_frame(
 def format_milestones(
     console: Console,
     detail: dict[str, Any],
+    *,
+    api_auth: CliApiAuth,
 ) -> None:
     """Show milestones for a challenge detail payload; ↑/↓ to move selection, q to leave."""
     milestones = _milestones_from_detail(detail)
@@ -797,12 +826,18 @@ def format_milestones(
                             pending_id = str(mid)
                             break
 
+        if pending_id is None:
+            continue
+
         try:
             challenge_id = detail.get("id")
+            if not challenge_id:
+                raise click.ClickException("Challenge detail did not include an id.")
             run_milestone_solution_upload(
                 console,
                 pending_id,
-                challenge_id=str(challenge_id) if challenge_id else None,
+                challenge_id=str(challenge_id),
+                api_auth=api_auth,
             )
         except click.exceptions.Exit:
             raise
@@ -994,6 +1029,7 @@ def query_and_format_challenges(
     console: Console,
     *,
     base_url: str | None = None,
+    api_auth: CliApiAuth,
 ) -> dict[str, Any]:
     """Fetch ``GET /v1/challenges``, then let the user cycle views of the payload (← →, q)."""
     effective_base = base_url or _api_cfg.challenges_api_url
@@ -1069,6 +1105,7 @@ def query_and_format_challenges(
         query_challenge_data(
             pending,
             console=console,
+            api_auth=api_auth,
         )
 
 
@@ -1093,17 +1130,24 @@ def query_and_format_challenges(
     default=None,
     help="Bittensor network label passed to RequestManager (default: NETWORK env or finney).",
 )
+@click.option(
+    "--netuid",
+    default=None,
+    type=int,
+    help="Subnet netuid for TensorAuth JWT claims (default: NETUID env or 63).",
+)
 @click.version_option(version="0.1.0", prog_name="mine-enigma")
 def main(
     base_url: str | None,
     wallet_name: str | None,
     wallet_hotkey: str | None,
     network: str | None,
+    netuid: int | None,
 ) -> None:
     """Welcome banner, then browse challenges response views."""
     # Environment is already loaded at module import time via get_api_config()
     # (which calls load_dotenv()). _resolve_cli_api_auth reads directly from os.getenv.
-    api_auth = _resolve_cli_api_auth(wallet_name, wallet_hotkey, network)
+    api_auth = _resolve_cli_api_auth(wallet_name, wallet_hotkey, network, netuid)
     console = Console()
     console.print()
     console.print(Align.center(_welcome_panel(api_auth.network)))
@@ -1113,6 +1157,7 @@ def main(
         query_and_format_challenges(
             console,
             base_url=base_url,
+            api_auth=api_auth,
         )
     except requests.HTTPError as e:
         body = ""

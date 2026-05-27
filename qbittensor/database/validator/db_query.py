@@ -26,6 +26,7 @@ from qbittensor.protocol import MinerSubmissionStatus
 # SQLite datetime() does not support "weeks" modifier; use equivalent day count.
 OLDEST_ALLOWED_TIMESTAMP = "-21 days"  # Used to prune solutions that are older than 3 weeks.
 
+
 class DBQuery(BaseDBQuery):
     """
     SQLAlchemy-backed query layer for validator-side challenge solution
@@ -49,6 +50,7 @@ class DBQuery(BaseDBQuery):
         solution_status: str,
         tx_hash: str,
         miner_hotkey: str,
+        challenge_id: str | None = None,
     ) -> bool:
         """Insert a challenge solution row before container/runtime fields are known."""
         return self.insert_challenge_solution(
@@ -56,6 +58,7 @@ class DBQuery(BaseDBQuery):
             container_id=self._pending_placeholder(tx_hash, "container_id"),
             container_name=self._pending_placeholder(tx_hash, "container_name"),
             image_id=self._pending_placeholder(tx_hash, "image_id"),
+            challenge_id=challenge_id,
             challenge_milestone_id=challenge_milestone_id,
             absolute_path_to_solution=self._pending_placeholder(tx_hash, "path"),
             submission_id=submission_id or "",
@@ -106,7 +109,20 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f" ❌ Error updating challenge solution: {e}")
             return False
 
-    def insert_challenge_solution(self, challenge_validation_solution_id, container_id, container_name, image_id, challenge_milestone_id, absolute_path_to_solution, submission_id, solution_status, tx_hash, miner_hotkey):
+    def insert_challenge_solution(
+        self,
+        challenge_validation_solution_id,
+        container_id,
+        container_name,
+        image_id,
+        challenge_milestone_id,
+        absolute_path_to_solution,
+        submission_id,
+        solution_status,
+        tx_hash,
+        miner_hotkey,
+        challenge_id: str | None = None,
+    ):
         """Insert a new challenge solution record into the database."""
         bt.logging.info(f"Inserting challenge solution with tx_hash: {tx_hash}")
         try:
@@ -116,6 +132,7 @@ class DBQuery(BaseDBQuery):
                     container_id=container_id,
                     container_name=container_name,
                     image_id=image_id,
+                    challenge_id=challenge_id,
                     challenge_milestone_id=challenge_milestone_id,
                     absolute_path_to_solution=absolute_path_to_solution,
                     submission_id=submission_id,
@@ -159,7 +176,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error pruning old solutions: {e}")
             return False
 
-
     def remove_challenge_solution(self, challenge_validation_solution_id):
         """Remove a challenge solution record from the database."""
         try:
@@ -176,7 +192,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error removing challenge solution: {e}")
             return False
 
-
     def get_challenge_solution_location(self, container_name):
         """Retrieve a challenge solution record from the database."""
         try:
@@ -192,7 +207,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error retrieving challenge solution: {e}")
             return None
 
-
     def get_container_name_by_solution_location(self, absolute_path_to_solution):
         """Retrieve a challenge solution record from the database."""
         try:
@@ -207,7 +221,6 @@ class DBQuery(BaseDBQuery):
         except Exception as e:
             bt.logging.error(f"Error retrieving challenge solution: {e}")
             return None
-
 
     def get_miner_submission_statuses(self, miner_hotkey):
         """Retrieve the challenge solutions for a given miner hotkey from the database."""
@@ -280,7 +293,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error retrieving challenge solution by container_id: {e}")
             return None
 
-
     def remove_solution_from_db_by_conainer_name(self, container_name):
         """Remove a challenge solution record from the database."""
         try:
@@ -297,7 +309,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error removing challenge solution: {e}")
             return False
 
-
     def get_submission_id_by_solution_location(self, absolute_path_to_solution):
         """Retrieve a challenge solution record from the database."""
         try:
@@ -312,7 +323,6 @@ class DBQuery(BaseDBQuery):
         except Exception as e:
             bt.logging.error(f"❌ Error retrieving challenge solution: {e}")
             return None
-
 
     def get_challenge_milestone_id_by_file_path(self, absolute_path_to_solution):
         """Retrieve a challenge solution record from the database."""
@@ -407,7 +417,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error pruning old miner solutions: {e}")
             return False
 
-
     def _get_active_maintenance_hotkeys(self, cutoff_time) -> list[str]:
         """
         Internal helper: return distinct miner hotkeys that have recent
@@ -458,4 +467,3 @@ class DBQuery(BaseDBQuery):
             # (upstream code will handle duplicates safely via on_conflict_do_nothing)
             bt.logging.warning(f"Error checking has_seen_tx_hash for {tx_hash}, assuming not seen")
             return False
-

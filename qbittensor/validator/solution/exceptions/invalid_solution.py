@@ -17,6 +17,7 @@
 
 import qbittensor.validator.solution.exceptions.validation_errors as validation_errors
 
+
 class InvalidSolutionError(Exception):
     """Custom exception for invalid solution errors."""
     container_id: str | None = None
@@ -32,4 +33,3 @@ class InvalidSolutionError(Exception):
         self.image_name = image_name
         self.challenge_id = challenge_id
         self.transaction_id = transaction_id
-

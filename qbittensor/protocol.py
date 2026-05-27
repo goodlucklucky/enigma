@@ -43,7 +43,6 @@ class MinerSubmissionStatus(BaseModel):
     )
 
 
-
 class SolutionSynapse(bt.Synapse):
     validator_busy: bool = Field(
         description="Whether or not the validator sendig this request is currently running a solution",
@@ -57,6 +56,11 @@ class SolutionSynapse(bt.Synapse):
     submission_statuses: Optional[list[MinerSubmissionStatus]] = Field(
         default=None,
         description="The statuses of the miner submissions.",
+    )
+
+    challenge_id: Optional[str] = Field(
+        default=None,
+        description="Top-level challenge id (used for milestone price lookup).",
     )
 
     tx_hash: Optional[str] = Field(
@@ -95,6 +99,7 @@ class SolutionSynapse(bt.Synapse):
             "SolutionSynapse(\n"
             f"  validator_busy={self.validator_busy!r},\n"
             f"  solution_candidate={self.solution_candidate!r},\n"
+            f"  challenge_id={self.challenge_id!r},\n"
             f"  tx_hash={self.tx_hash!r},\n"
             f"  transfer_block_hash={self.transfer_block_hash!r},\n"
             f"  transfer_from_ss58={self.transfer_from_ss58!r},\n"

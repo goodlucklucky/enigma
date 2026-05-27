@@ -27,15 +27,16 @@ import sys
 import os
 import requests
 
-from utils.common import parse_oz_custom_error
+from utils.common import parse_oz_custom_error, DEFAULT_RPC_URL
 try:
     from substrateinterface import SubstrateInterface, Keypair
 except ImportError:
     sys.exit("Please install: pip install substrate-interface")
 
 API_BASE_URL = f"{os.getenv('CHALLENGES_API_URL', 'https://challenges.qbittensorlabs.com')}/v1"
-ALPHA_LIMIT = 25000 # Must match the limit used in your propose script
+ALPHA_LIMIT = 25000  # Must match the limit used in your propose script
 STAKING_V2_ADDRESS = "0x0000000000000000000000000000000000000805"
+
 
 def hash_proposal(contract, targets, values, calldatas, desc, rpc):
     desc_cmd = ["cast", "keccak", desc]
@@ -54,6 +55,7 @@ def hash_proposal(contract, targets, values, calldatas, desc, rpc):
         print(f"❌ Failed to hash proposal: {res.stderr}")
         sys.exit(1)
 
+
 def fetch_challenges():
     try:
         res = requests.get(f"{API_BASE_URL}/challenges")
@@ -71,6 +73,7 @@ def fetch_challenges():
         print(f"❌ Failed to fetch challenges: {e}")
         sys.exit(1)
 
+
 def interactive_picker():
     challenges = fetch_challenges()
     if not challenges:
@@ -82,7 +85,14 @@ def interactive_picker():
         for m in c.get('milestones', []):
             if m.get('status', '').upper() == 'COMPLETE':
                 completed_at = m.get('completed_at') or m.get('completedAt') or 'Unknown'
-                options.append({'c_name': c['name'], 'm_name': m['name'], 'id': m['id'], 'prizeAlpha': m.get('prizeAlpha'), 'solved_address': m.get('solved_address'), 'completed_at': completed_at})
+                options.append({
+                    'c_name': c['name'],
+                    'm_name': m['name'],
+                    'id': m['id'],
+                    'prizeAlpha': m.get('prizeAlpha'),
+                    'solved_address': m.get('solved_address'),
+                    'completed_at': completed_at,
+                })
 
     if not options:
         print("No completed milestones available for payout.")
@@ -90,7 +100,11 @@ def interactive_picker():
 
     print("\n--- Completed Milestones ---")
     for idx, opt in enumerate(options):
-        print(f"[{idx}] {opt['c_name']} - {opt['m_name']} (ID: {opt['id']}, Prize: {opt['prizeAlpha']} Alpha, Completed: {opt['completed_at']})")
+        print(
+            f"[{idx}] {opt['c_name']} - {opt['m_name']} "
+            f"(ID: {opt['id']}, Prize: {opt['prizeAlpha']} Alpha, "
+            f"Completed: {opt['completed_at']})"
+        )
 
     choice = input("\nSelect a milestone index to pay out: ")
     try:
@@ -102,21 +116,40 @@ def interactive_picker():
         if not selected.get('solved_address'):
             print("❌ Milestone does not have a solved_address set.")
             sys.exit(1)
-        return selected['id'], float(prize_alpha_raw), f"{selected['c_name']} - {selected['m_name']}", selected['solved_address']
+        return (
+            selected['id'],
+            float(prize_alpha_raw),
+            f"{selected['c_name']} - {selected['m_name']}",
+            selected['solved_address'],
+        )
     except (IndexError, ValueError):
         print("Invalid selection.")
         sys.exit(1)
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Vote on a Payout proposal by verifying with the API first.")
+    parser = argparse.ArgumentParser(
+        description="Vote on a Payout proposal by verifying with the API first."
+    )
     parser.add_argument("--contract", required=True, help="Treasury contract address")
     parser.add_argument("--milestone-id", help="Direct milestone ID (skips interactive picker)")
-    parser.add_argument("--retry", type=int, default=0, help="Retry counter used in the proposal description (e.g. 1)")
+    parser.add_argument(
+        "--retry", type=int, default=0,
+        help="Retry counter used in the proposal description (e.g. 1)"
+    )
     parser.add_argument("--vault-hotkey", required=True, help="Vault hotkey (hex)")
     parser.add_argument("--netuid", type=int, required=True, help="The subnet netuid")
-    parser.add_argument("--support", required=True, type=str, choices=['true', 'false'], help="'false' = Against, 'true' = For")
+    parser.add_argument(
+        "--support", required=True, type=str,
+        choices=['true', 'false'],
+        help="'false' = Against, 'true' = For"
+    )
     parser.add_argument("--pk", required=True, help="Validator Private Key")
-    parser.add_argument("--rpc", required=True, help="RPC URL")
+    parser.add_argument(
+        "--rpc",
+        default=DEFAULT_RPC_URL,
+        help=f"RPC URL (default: {DEFAULT_RPC_URL})"
+    )
     args = parser.parse_args()
 
     milestone_id = args.milestone_id
@@ -188,7 +221,8 @@ def main():
     for i, target_amount in enumerate(chunks):
         part_num = i + 1
         print(f"\n--- Processing Part {part_num} of {len(chunks)} ---")
-        # Alpha transfers use 9 decimals (RAO) for Bittensor precompiles, unlike standard 18-decimal EVM tokens
+        # Alpha transfers use 9 decimals (RAO) for Bittensor precompiles,
+        # unlike standard 18-decimal EVM tokens
         exact_amount_rao = str(int(target_amount * (10**9)))
         exact_desc = desc_prefix
         if args.retry > 0:
@@ -203,8 +237,10 @@ def main():
         ]
         calldata_raw = subprocess.run(calldata_cmd, capture_output=True, text=True).stdout.strip()
 
-        print(f"🧮 Calculating Expected Proposal Hash...")
-        prop_id = hash_proposal(args.contract, STAKING_V2_ADDRESS, "0", calldata_raw, exact_desc, args.rpc)
+        print("🧮 Calculating Expected Proposal Hash...")
+        prop_id = hash_proposal(
+            args.contract, STAKING_V2_ADDRESS, "0", calldata_raw, exact_desc, args.rpc
+        )
 
         print(f"   ↳ Proposal ID: {prop_id}")
 
@@ -223,9 +259,15 @@ def main():
         try:
             state_val = int(state_res.stdout.strip().split()[0])
             if state_val != 1:
-                states = {0: "Pending", 1: "Active", 2: "Canceled", 3: "Defeated", 4: "Succeeded", 5: "Queued", 6: "Expired", 7: "Executed"}
+                states = {
+                    0: "Pending", 1: "Active", 2: "Canceled", 3: "Defeated",
+                    4: "Succeeded", 5: "Queued", 6: "Expired", 7: "Executed",
+                }
                 state_name = states.get(state_val, "Unknown")
-                print(f"❌ Cannot vote: Proposal is '{state_name}' (State {state_val}) on {args.contract}.")
+                print(
+                    f"❌ Cannot vote: Proposal is '{state_name}' "
+                    f"(State {state_val}) on {args.contract}."
+                )
                 print("   ↳ You can only vote on 'Active' proposals.")
                 continue
         except ValueError:
@@ -255,8 +297,12 @@ def main():
             elif "gas required exceeds allowance" in err_out:
                 print("   ↳ ERROR: Gas estimation failed. This usually means:")
                 print("            1. Your EVM account (derived from --pk) has 0 TAO balance.")
-                print("            2. The transaction reverted (e.g., you are not an active, trusted validator).")
+                print(
+                    "            2. The transaction reverted (e.g., you are "
+                    "not an active, trusted validator)."
+                )
             sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

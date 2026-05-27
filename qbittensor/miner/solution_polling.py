@@ -19,6 +19,7 @@ import bittensor as bt
 from qbittensor.database.miner.db_query import DBQueryMiner
 from qbittensor.database.miner.db_models import MinerSubmission
 
+
 class SolutionPoller:
 
     def __init__(self, db_query: DBQueryMiner):

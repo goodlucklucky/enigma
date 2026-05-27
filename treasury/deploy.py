@@ -28,13 +28,16 @@ import argparse
 import subprocess
 from pathlib import Path
 
+
 def to_wei(amount: float) -> str:
     """Converts human-readable token amount to Wei string (10^18)"""
     return str(int(amount * 10**18))
 
+
 def to_rao(amount: float) -> str:
     """Converts human-readable token amount to RAO string (10^9)"""
     return str(int(amount * 10**9))
+
 
 def main():
     parser = argparse.ArgumentParser(description="Deploy Treasury Contracts to Mainnet")
@@ -134,6 +137,7 @@ def main():
         sys.exit(process.returncode)
 
     print("\n✅ Deployment script completed.")
+
 
 if __name__ == "__main__":
     main()

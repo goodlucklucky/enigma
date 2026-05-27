@@ -18,6 +18,7 @@
 """Canonical transfer↔miner binding for synapse verification (off-chain + on-chain)."""
 
 from __future__ import annotations
+from typing import Any
 
 from bittensor_wallet import Keypair
 

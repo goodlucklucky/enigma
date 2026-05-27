@@ -51,6 +51,7 @@ class TestSolutionCrossChecker:
             id="cc-1",
             address="5Miner",
             challenge_milestone_id="m1",
+            challenge_id="ch-1",
             challenge_preparation_id=None,
             upload_endpoint_id="upload-xyz",
             tx_hash="0xabc",
@@ -70,3 +71,41 @@ class TestSolutionCrossChecker:
 
         mock_run.assert_called_once()
         cross_checker.database_connection.db_query.insert_for_maintenance_incentive.assert_called_once()
+
+    def test_run_cross_check_without_challenge_id(self, cross_checker):
+        cross_checker.solution_container_manager.validator_is_busy.return_value = False
+
+        submission = ChallengeSubmissionRead(
+            id="cc-2",
+            address="5Miner",
+            challenge_milestone_id="m1",
+            challenge_id=None,
+            challenge_preparation_id=None,
+            upload_endpoint_id="upload-xyz",
+            tx_hash="0xdef",
+            file_download_url="https://example.com/z.zip",
+            transfer_block_hash="0xblock",
+            transfer_from_ss58="5From",
+            transfer_to_ss58="5Treasury",
+            transfer_amount_rao="1000000000",
+            transfer_proof_message="msg",
+            transfer_proof_signature_hex="sig",
+        )
+        cross_checker.platform_client.get_next_cross_check_submission.return_value = submission
+
+        with patch("qbittensor.validator.solution.solution_cross_check.execute_verified_solution") as mock_run:
+            mock_run.return_value = ("img", "cid", "/tmp/f")
+            cross_checker.run()
+
+        mock_run.assert_called_once_with(
+            db_conn=cross_checker.database_connection,
+            platform_client=cross_checker.platform_client,
+            validator_label="val_label",
+            download_url=submission.file_download_url,
+            challenge_id=None,
+            challenge_milestone_id=submission.challenge_milestone_id,
+            challenge_validation_solution_id=submission.id,
+            submission_id=submission.id,
+            tx_hash=submission.tx_hash,
+            miner_hotkey=submission.address,
+        )

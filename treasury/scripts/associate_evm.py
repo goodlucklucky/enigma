@@ -94,14 +94,14 @@ def main():
     w3, evm_account = setup_web3_with_account(args)
     evm_address = evm_account.address
 
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"EVM ASSOCIATION")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Hotkey (Signer): {args.hotkey}")
     print(f"Netuid:          {args.netuid}")
     print(f"EVM:             {evm_address}")
     print(f"Fast Mode:       {args.fast_mode}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     substrate_url = args.rpc_url.replace("http://", "ws://").replace("https://", "wss://")
     substrate = SubstrateInterface(url=substrate_url)
@@ -153,6 +153,7 @@ def main():
     else:
         print(f"\n❌ Association failed: {receipt.error_message}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

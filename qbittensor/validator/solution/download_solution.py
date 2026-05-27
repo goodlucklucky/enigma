@@ -19,6 +19,7 @@ import bittensor as bt
 import urllib.request
 from typing import Optional
 
+
 def download_zip(url: str, folder_name: str) -> Optional[str]:
     """Download the vip file from the url. Validate that the file type is .zip
 

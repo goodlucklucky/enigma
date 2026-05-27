@@ -155,7 +155,6 @@ class DBConnection:
         self.DATABASE_URL = f"sqlite:///{self.DB_PATH}"
         self.create_database()
 
-
         if database_name_prefix == "challenge_solutions":
             self.db_query = DBQuery(self.get_db_session)
         elif database_name_prefix == "miner_submissions":
@@ -203,7 +202,6 @@ class DBConnection:
         except Exception as e:
             bt.logging.error(f" ❌ Error creating database: {e}")
             return False
-
 
     def get_db_session(self):
         """Get a SQLAlchemy database session."""

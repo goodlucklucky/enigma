@@ -25,7 +25,8 @@ import argparse
 import subprocess
 import sys
 
-from utils.common import parse_oz_custom_error
+from utils.common import parse_oz_custom_error, DEFAULT_RPC_URL
+
 
 def main():
     parser = argparse.ArgumentParser(description="Vote on a whitelist proposal.")
@@ -33,7 +34,11 @@ def main():
     parser.add_argument("--proposal-id", required=True, help="The Proposal ID")
     parser.add_argument("--support", required=True, type=str, choices=['true', 'false'], help="'false' = Against, 'true' = For")
     parser.add_argument("--pk", required=True, help="Validator Private Key")
-    parser.add_argument("--rpc", required=True, help="RPC URL")
+    parser.add_argument(
+        "--rpc",
+        default=DEFAULT_RPC_URL,
+        help=f"RPC URL (default: {DEFAULT_RPC_URL})"
+    )
     args = parser.parse_args()
 
     contract = args.contract
@@ -94,6 +99,7 @@ def main():
             print("            1. Your EVM account (derived from --pk) has 0 TAO balance.")
             print("            2. The transaction reverted (e.g., you are not an active, trusted validator).")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

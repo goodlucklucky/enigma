@@ -30,13 +30,20 @@ try:
 except ImportError:
     sys.exit("Please install: pip install substrate-interface")
 
+from utils.common import DEFAULT_RPC_URL
+
 BITTENSOR_VOTES_ADDRESS = "0x000000000000000000000000000000000000080D"
+
 
 def main():
     parser = argparse.ArgumentParser(description="Lookup hotkeys and voting power for an EVM address")
     parser.add_argument("--contract", required=True, help="TreasuryController address")
     parser.add_argument("--evm", required=True, help="Validator EVM address")
-    parser.add_argument("--rpc", required=True, help="RPC URL")
+    parser.add_argument(
+        "--rpc",
+        default=DEFAULT_RPC_URL,
+        help=f"RPC URL (default: {DEFAULT_RPC_URL})"
+    )
     args = parser.parse_args()
 
     print(f"\n🔍 Looking up EVM Address: {args.evm}")
@@ -136,9 +143,10 @@ def main():
             print(f"\n   → Hotkey #{i}")
             print(f"     Invalid Hex Format: {hk_hex}")
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print(f"✅ Total Combined Voting Power: {total_power / 1e9:,.4f} τ")
-    print("="*50 + "\n")
+    print("=" * 50 + "\n")
+
 
 if __name__ == "__main__":
     main()

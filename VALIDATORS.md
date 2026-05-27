@@ -23,7 +23,7 @@ foundryup
 
 ### Network Access
 
-You will need an RPC URL to communicate with the Bittensor EVM. You can obtain one from a provider like [Nodies](https://www.nodies.app). Keep this URL handy as you will need it for several commands.
+The treasury scripts default to the public lite endpoint `https://lite.chain.opentensor.ai`. For higher reliability or if you hit rate limits during busy periods, you can obtain a dedicated RPC URL from a provider like [Nodies](https://www.nodies.app) and pass it via the `--rpc` / `--rpc-url` flag.
 
 ## 2. Create an EVM Wallet
 
@@ -59,12 +59,13 @@ Run the `associate_evm.py` script:
 
 ```bash
 python3 treasury/scripts/associate_evm.py \
-  --rpc-url <RPC_URL> \
   --private-key <YOUR_EVM_PRIVATE_KEY> \
   --hotkey <YOUR_HOTKEY_SS58_ADDRESS> \
   --hotkey-private-key "<YOUR_HOTKEY_PRIVATE_KEY>" \
   --netuid <SUBNET_ID>
 ```
+
+The script defaults to `https://lite.chain.opentensor.ai`. Pass `--rpc-url YOUR_RPC` if needed.
 
 *Note: The script requires your hotkey's seed phrase to sign a message proving ownership of the hotkey, and your EVM private key to submit the transaction to the EVM network.*
 

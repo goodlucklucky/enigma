@@ -72,7 +72,6 @@ def validate_solution(solution_workspace_path: str, challenges_client: Challenge
     return solution_status
 
 
-
 def establish_upload_locations_for_solution_data(
     submission_location: str, output_type: str, challenges_client: ChallengesClient
 ) -> ChallengeSubmissionVerifyUploadAddressResponse | None:
@@ -162,6 +161,7 @@ def perform_solution_output_validation(
             return SolutionStatus.FAILED.value
         else:
             return SolutionStatus.FAILED_UPLOAD.value
+
 
 def upload_zip_to_platform(
     output_file_path: str,

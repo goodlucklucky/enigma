@@ -17,6 +17,7 @@
 
 from enum import Enum
 
+
 class ValidationErrors(Enum):
     INVALID_TARBALL = "The tarball is invalid. It may be corrupted or not a tarball at all."
     TARBALL_DOWNLOAD_FAILED = "Failed to download the tarball from the provided URL."

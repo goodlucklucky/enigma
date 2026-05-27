@@ -12,8 +12,10 @@ Validators must vote on two different types of proposals:
 
     Example:
     ```bash
-    python treasury/scripts/list_proposals.py --contract CONTRACT --id PROPOSAL_ID --rpc RPC_URL
+    python treasury/scripts/list_proposals.py --contract CONTRACT --id PROPOSAL_ID
     ```
+
+    The scripts default to the public lite endpoint (`https://lite.chain.opentensor.ai`). Use `--rpc YOUR_RPC` if you need a dedicated endpoint.
 
     The output will show one or more addresses. The EVM address if properly associated with the validator hotkey will be decoded as well. Ensure before votign that this is a true validator on the subnet. Additions to the whitelist will have a trusted status of `true` and removals will have a trusted status of `false`.
 
@@ -33,7 +35,7 @@ Validators must vote on two different types of proposals:
     Voting should then be completed with the script:
 
     ```bash
-    python treasury/scripts/vote_whitelist.py --contract <treasury governor address> --proposal-id <proposal id> --support <true/false> --rpc <rpc url> --pk <validator evm private key>
+    python treasury/scripts/vote_whitelist.py --contract <treasury governor address> --proposal-id <proposal id> --support <true/false> --pk <validator evm private key>
     ```
 
 - ### Payout
@@ -62,7 +64,7 @@ Validators must vote on two different types of proposals:
     Voting should then be completed with the script:
 
     ```bash
-    python treasury/scripts/vote_payout.py --contract <treasury governor address> --netuid 63 --vault-hotkey <vault hotkey> --support <true/false> --rpc <rpc url> --pk <validator evm private key>
+    python treasury/scripts/vote_payout.py --contract <treasury governor address> --netuid 63 --vault-hotkey <vault hotkey> --support <true/false> --pk <validator evm private key>
     ```
 
     You will be prompted for the challenge and milestone being completed and the proposal will be looked up from the hashed data.

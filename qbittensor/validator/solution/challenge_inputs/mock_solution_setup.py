@@ -21,6 +21,7 @@ import bittensor as bt
     and then the solution container reads the output from the file.
 '''
 
+
 def mock_solution_setup(absolute_output_folder_location: str) -> str:
 
     try:

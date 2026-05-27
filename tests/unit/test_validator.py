@@ -26,7 +26,13 @@ from neurons.validator import (
     PRIVATE_MINER_HOTKEY,
     TREASURY_HOTKEY,
     TREASURY_WALLET_AMOUNT,
+    MIN_DUST_FLOOR,
     Validator,
+)
+
+from qbittensor.base.utils.weight_utils import (
+    process_weights_for_netuid,
+    convert_weights_and_uids_for_emit,
 )
 
 
@@ -142,7 +148,7 @@ class TestSetWeights:
     """
 
     def test_set_weights_distributes_maintenance_and_treasury(self, mock_validator):
-        """Active miners receive maintenance share; treasury receives the remainder."""
+        """Every maintenance miner gets at least the floor; treasury takes (nearly) all remaining mass."""
         mock_validator.metagraph.hotkeys = [TREASURY_HOTKEY, "miner1", "miner2"]
         mock_validator.database_connection.db_query.get_active_miners.return_value = ["miner1"]
 
@@ -150,17 +156,18 @@ class TestSetWeights:
             mock_validator.set_weights()
 
         weights = mock_validator.scores
-        maintenance_amount = (1.0 - TREASURY_WALLET_AMOUNT) / 2
         treasury_uid = mock_validator.metagraph.hotkeys.index(TREASURY_HOTKEY)
 
-        assert weights[treasury_uid] == TREASURY_WALLET_AMOUNT
-        assert weights[1] == maintenance_amount
+        # New floor-based policy: maintenance miners get the guaranteed floor (or more)
+        assert weights[1] >= MIN_DUST_FLOOR
         assert weights[2] == 0.0
+        # Treasury gets almost everything left after the tiny floors
+        assert weights[treasury_uid] >= 0.999
         mock_validator.database_connection.db_query.prune_old_miner_solutions.assert_called_once()
         mock_super.assert_called_once()
 
     def test_set_weights_includes_private_miner_when_not_in_db(self, mock_validator):
-        """Private miner hotkey is always eligible for maintenance weight."""
+        """Private miner hotkey always receives the guaranteed floor (even with zero DB miners)."""
         mock_validator.metagraph.hotkeys = [TREASURY_HOTKEY, "miner1", PRIVATE_MINER_HOTKEY]
         mock_validator.database_connection.db_query.get_active_miners.return_value = []
 
@@ -168,12 +175,230 @@ class TestSetWeights:
             mock_validator.set_weights()
 
         weights = mock_validator.scores
-        maintenance_amount = (1.0 - TREASURY_WALLET_AMOUNT) / 1
         treasury_uid = mock_validator.metagraph.hotkeys.index(TREASURY_HOTKEY)
         private_miner_uid = mock_validator.metagraph.hotkeys.index(PRIVATE_MINER_HOTKEY)
 
-        assert weights[treasury_uid] == TREASURY_WALLET_AMOUNT
-        assert weights[private_miner_uid] == maintenance_amount
+        assert weights[private_miner_uid] >= MIN_DUST_FLOOR
+        # Treasury still dominates
+        assert weights[treasury_uid] >= 0.999
+        mock_super.assert_called_once()
+
+    def test_floor_protects_many_miners_at_high_treasury_from_quantization(self, mock_validator):
+        """With MIN_DUST_FLOOR, even at very high treasury % + many maintenance miners,
+        every maintained UID survives the full processing + u16 quantization with >0 weight.
+
+        This is the key proof that we can raise TREASURY_WALLET_AMOUNT safely.
+        """
+        n = 256
+        treasury_uid = 87
+
+        # Realistic metagraph
+        hotkeys = [f"hk_{i:03d}" for i in range(n)]
+        hotkeys[treasury_uid] = TREASURY_HOTKEY
+
+        # 60 maintenance miners (typical active set size) + the private one
+        db_maintain = [f"hk_{i:03d}" for i in range(20, 80)]  # 60
+        all_maintain = list(db_maintain) + [PRIVATE_MINER_HOTKEY]
+
+        # Place the private miner at a plausible UID
+        private_uid = 171
+        hotkeys[private_uid] = PRIVATE_MINER_HOTKEY
+
+        mock_validator.metagraph.hotkeys = hotkeys
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.uids = np.arange(n, dtype=np.int64)
+        mock_validator.database_connection.db_query.get_active_miners.return_value = db_maintain
+
+        # Use a high treasury target (what the user wants to be able to do)
+        original_treasury = TREASURY_WALLET_AMOUNT
+        try:
+            import neurons.validator as vmod
+            vmod.TREASURY_WALLET_AMOUNT = 0.997
+
+            with patch("neurons.validator.BaseValidatorNeuron.set_weights") as mock_super:
+                mock_validator.set_weights()
+
+            scores = mock_validator.scores
+
+            # Replicate exactly what BaseValidatorNeuron.set_weights does
+            norm = np.linalg.norm(scores, ord=1)
+            if norm == 0 or np.isnan(norm):
+                norm = 1.0
+            raw_weights = scores / norm
+
+            mock_st = mock_validator.subtensor
+            mock_st.min_allowed_weights.return_value = 1
+            mock_st.max_weight_limit.return_value = 1.0
+
+            processed_uids, processed_w = process_weights_for_netuid(
+                uids=mock_validator.metagraph.uids,
+                weights=raw_weights,
+                netuid=63,
+                subtensor=mock_st,
+                metagraph=mock_validator.metagraph,
+            )
+
+            uint_uids, uint_weights = convert_weights_and_uids_for_emit(
+                uids=processed_uids, weights=processed_w
+            )
+            emitted = dict(zip([int(u) for u in uint_uids], uint_weights))
+
+            # Proof: every single maintenance hotkey must have a non-zero emitted weight
+            zeroed = []
+            for hk in all_maintain:
+                if hk in hotkeys:
+                    uid = hotkeys.index(hk)
+                    if emitted.get(uid, 0) == 0:
+                        zeroed.append(uid)
+
+            assert not zeroed, (
+                f"With floor={MIN_DUST_FLOOR}, these maintenance UIDs were zeroed after "
+                f"quantization at 99.7% treasury: {zeroed}"
+            )
+
+            # Also sanity: treasury itself must be present and large
+            assert emitted.get(treasury_uid, 0) > 10000  # comfortably non-zero
+        finally:
+            # Restore
+            import neurons.validator as vmod
+            vmod.TREASURY_WALLET_AMOUNT = original_treasury
+
+    def test_one_maintenance_miner_dust_survives_full_pipeline(self, mock_validator):
+        """1 maintenance miner (only the forced private miner, zero from DB).
+
+        This is the *most* stressful dust case: the single floor is at its smallest
+        relative size after max-scaling against a near-1.0 treasury weight.
+        The final u16 quantization in convert_weights_and_uids_for_emit must still
+        produce a non-zero weight for it.
+        """
+        n = 256
+        treasury_uid = 42
+
+        hotkeys = [f"hk_{i:03d}" for i in range(n)]
+        hotkeys[treasury_uid] = TREASURY_HOTKEY
+
+        # Only the private miner is maintained (simulates get_active_miners() returning [])
+        private_uid = 17
+        hotkeys[private_uid] = PRIVATE_MINER_HOTKEY
+
+        mock_validator.metagraph.hotkeys = hotkeys
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.uids = np.arange(n, dtype=np.int64)
+        mock_validator.database_connection.db_query.get_active_miners.return_value = []
+
+        with patch("neurons.validator.BaseValidatorNeuron.set_weights") as mock_super:
+            mock_validator.set_weights()
+
+        scores = mock_validator.scores
+
+        # Full on-chain pipeline (identical to BaseValidatorNeuron.set_weights + utils)
+        norm = np.linalg.norm(scores, ord=1)
+        if norm == 0 or np.isnan(norm):
+            norm = 1.0
+        raw_weights = scores / norm
+
+        mock_st = mock_validator.subtensor
+        mock_st.min_allowed_weights.return_value = 1
+        mock_st.max_weight_limit.return_value = 1.0
+
+        processed_uids, processed_w = process_weights_for_netuid(
+            uids=mock_validator.metagraph.uids,
+            weights=raw_weights,
+            netuid=63,
+            subtensor=mock_st,
+            metagraph=mock_validator.metagraph,
+        )
+        uint_uids, uint_weights = convert_weights_and_uids_for_emit(
+            uids=processed_uids, weights=processed_w
+        )
+        emitted = dict(zip([int(u) for u in uint_uids], uint_weights))
+
+        # The single maintenance miner (private) must survive with non-zero u16 weight
+        assert emitted.get(private_uid, 0) > 0, (
+            f"Private miner (only maintenance UID) was zeroed in u16 emit. "
+            f"floor={MIN_DUST_FLOOR}, emitted={emitted.get(private_uid, 0)}"
+        )
+
+        # Treasury must also be present and dominant
+        assert emitted.get(treasury_uid, 0) > 10000
+
+        mock_super.assert_called_once()
+
+    def test_255_maintenance_miners_dust_survives_full_pipeline(self, mock_validator):
+        """255 maintenance miners (maximum possible on a 256-UID subnet with 1 treasury).
+
+        Every one of the 255 floors must survive process_weights + u16 quantization.
+        This stresses the path with the largest number of tiny non-zero weights.
+        """
+        n = 256
+        treasury_uid = 0
+
+        hotkeys = [f"hk_{i:03d}" for i in range(n)]
+        hotkeys[treasury_uid] = TREASURY_HOTKEY
+
+        # 255 maintenance hotkeys (all except treasury). Include the canonical private one.
+        maintenance_hotkeys = [f"hk_{i:03d}" for i in range(1, 256)]
+        # Make the last one the private miner hotkey so we also prove it is protected
+        private_uid = 255
+        hotkeys[private_uid] = PRIVATE_MINER_HOTKEY
+        # Replace the last maintenance entry with the real private hotkey string for realism
+        maintenance_hotkeys[-1] = PRIVATE_MINER_HOTKEY
+
+        # DB returns all except the private one (proves the "always append private" path)
+        db_maintain = maintenance_hotkeys[:-1]
+
+        mock_validator.metagraph.hotkeys = hotkeys
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.uids = np.arange(n, dtype=np.int64)
+        mock_validator.database_connection.db_query.get_active_miners.return_value = db_maintain
+
+        with patch("neurons.validator.BaseValidatorNeuron.set_weights") as mock_super:
+            mock_validator.set_weights()
+
+        scores = mock_validator.scores
+
+        # Verify in scores (pre-normalization) that all 255 got the floor
+        for hk in maintenance_hotkeys:
+            uid = hotkeys.index(hk)
+            assert scores[uid] >= MIN_DUST_FLOOR - 1e-12
+
+        # Full pipeline to emitted u16 weights
+        norm = np.linalg.norm(scores, ord=1)
+        if norm == 0 or np.isnan(norm):
+            norm = 1.0
+        raw_weights = scores / norm
+
+        mock_st = mock_validator.subtensor
+        mock_st.min_allowed_weights.return_value = 1
+        mock_st.max_weight_limit.return_value = 1.0
+
+        processed_uids, processed_w = process_weights_for_netuid(
+            uids=mock_validator.metagraph.uids,
+            weights=raw_weights,
+            netuid=63,
+            subtensor=mock_st,
+            metagraph=mock_validator.metagraph,
+        )
+        uint_uids, uint_weights = convert_weights_and_uids_for_emit(
+            uids=processed_uids, weights=processed_w
+        )
+        emitted = dict(zip([int(u) for u in uint_uids], uint_weights))
+
+        # Every single one of the 255 maintenance UIDs must have positive emitted weight
+        zeroed = []
+        for hk in maintenance_hotkeys:
+            uid = hotkeys.index(hk)
+            if emitted.get(uid, 0) == 0:
+                zeroed.append(uid)
+
+        assert not zeroed, (
+            f"With 255 maintenance miners and floor={MIN_DUST_FLOOR}, "
+            f"these UIDs were zeroed after full quantization: {zeroed}"
+        )
+
+        # Treasury must still receive a large share
+        assert emitted.get(treasury_uid, 0) > 10000
+
         mock_super.assert_called_once()
 
 

@@ -340,7 +340,7 @@ class TreasuryTest:
     # =========================================================================
 
     def test_1_bootstrap(self):
-        print("\n" + "="*80 + "\nTEST 1: Empty Whitelist Bootstrap (Admin Only)\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 1: Empty Whitelist Bootstrap (Admin Only)\n" + "=" * 80)
         args = [f"[{self.validator_addr}]", "[true]", "Bootstrap"]
 
         step1 = self.cast("proposeUpdateTrustedValidators(address[],bool[],string)", args, self.malicious_pk, "Malicious Propose", expected_revert="Only the treasury admin can propose")
@@ -362,7 +362,7 @@ class TreasuryTest:
         return all([step1, step2, step3, step4, step5])
 
     def test_2_non_empty_whitelist(self):
-        print("\n" + "="*80 + "\nTEST 2: Non-Empty Whitelist Behavior\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 2: Non-Empty Whitelist Behavior\n" + "=" * 80)
         args = [f"[{self.admin_addr}]", "[true]", "AddAdmin"]
         step1 = self.cast("proposeUpdateTrustedValidators(address[],bool[],string)", args, self.admin_pk, "Propose WL Update")
 
@@ -376,12 +376,12 @@ class TreasuryTest:
         return all([step1, step2, step3])
 
     def test_3_malicious_propose_transfer(self):
-        print("\n" + "="*80 + "\nTEST 3: Malicious Propose Transfer (Should Fail)\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 3: Malicious Propose Transfer (Should Fail)\n" + "=" * 80)
         args = [self.admin_addr, "1000000000000000000", "MaliciousTransfer"]
         return self.cast("proposeNativeTransfer(address,uint256,string)", args, self.malicious_pk, "Malicious Propose Transfer", expected_revert="Only the treasury admin can propose")
 
     def test_4_malicious_vote_reverts(self):
-        print("\n" + "="*80 + "\nTEST 4: Malicious / Non-Whitelisted Vote Attempt\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 4: Malicious / Non-Whitelisted Vote Attempt\n" + "=" * 80)
         args = [self.admin_addr, "100000", "VoteGriefingTest"]
 
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Admin Propose")
@@ -398,12 +398,12 @@ class TreasuryTest:
     # =========================================================================
 
     def test_5_native_transfer_success(self):
-        print("\n" + "="*80 + "\nTEST 5: Native TAO Transfer + Balance Check\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 5: Native TAO Transfer + Balance Check\n" + "=" * 80)
 
         print("\n→ [Funding Treasury Vault]")
         fund_cmd = [
             "cast", "send", self.vault_addr,
-            "--value", "10000000000000000000", # 10 Tokens
+            "--value", "10000000000000000000",  # 10 Tokens
             "--private-key", self.admin_pk,
             "--rpc-url", self.rpc_url
         ]
@@ -431,7 +431,7 @@ class TreasuryTest:
         return all([step1, step2, step3, step4]) and balance_increased
 
     def test_6_native_rate_limit_failure(self):
-        print("\n" + "="*80 + "\nTEST 6: Native TAO Rate Limiting Enforcement\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 6: Native TAO Rate Limiting Enforcement\n" + "=" * 80)
         # 8 TAO (exceeds the 5 TAO limit, but is within the 10 TAO initial vault balance)
         args = [self.admin_addr, "8000000000000000000", "RateLimitTest"]
 
@@ -450,9 +450,9 @@ class TreasuryTest:
         return all([step1, step2, step3, step4])
 
     def test_7_native_insufficient_funds(self):
-        print("\n" + "="*80 + "\nTEST 7: Execution Fails if Vault is Broke\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 7: Execution Fails if Vault is Broke\n" + "=" * 80)
         vault_balance = self.get_balance(self.vault_addr)
-        impossible_amount = str(vault_balance + 1000000000000000000) # Balance + 1 TAO
+        impossible_amount = str(vault_balance + 1000000000000000000)  # Balance + 1 TAO
 
         args = [self.admin_addr, impossible_amount, "BrokeVaultTest"]
 
@@ -475,7 +475,7 @@ class TreasuryTest:
     # =========================================================================
 
     def test_8_alpha_transfer_success(self):
-        print("\n" + "="*80 + "\nTEST 8: Alpha Precompile Transfer (Staking V2)\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 8: Alpha Precompile Transfer (Staking V2)\n" + "=" * 80)
 
         if not self.vault_hotkey_hex or not self.miner_coldkey_hex:
             print("  ERROR: Vault hotkey or Miner coldkey missing. Run load() first.")
@@ -493,7 +493,7 @@ class TreasuryTest:
         ]
 
         sig_propose = "proposeAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)"
-        sig_queue   = "queueAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)"
+        sig_queue = "queueAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)"
         sig_execute = "executeAlphaTransfer(bytes32,bytes32,uint16,uint16,uint256,string)"
 
         m_stake_b = self._get_all_balances(self.miner_evm, self.miner_ss58, self.vault_hotkey_ss58)[2]
@@ -517,8 +517,8 @@ class TreasuryTest:
         return all([step1, step2, step3, step4]) and miner_increased
 
     def test_9_alpha_rate_limit_failure(self):
-        print("\n" + "="*80 + "\nTEST 9: Alpha Rate Limit Enforcement\n" + "="*80)
-        limit_exceeding_alpha_amount = "150000000000" # 150 Alpha (exceeds 100 limit but within 200 wallet balance)
+        print("\n" + "=" * 80 + "\nTEST 9: Alpha Rate Limit Enforcement\n" + "=" * 80)
+        limit_exceeding_alpha_amount = "150000000000"  # 150 Alpha (exceeds 100 limit but within 200 wallet balance)
         args = [
             self.miner_coldkey_hex,
             self.vault_hotkey_hex,
@@ -547,7 +547,7 @@ class TreasuryTest:
     # =========================================================================
 
     def test_10_erc20_transfer_success(self):
-        print("\n" + "="*80 + "\nTEST 10: ERC20 Transfer Success\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 10: ERC20 Transfer Success\n" + "=" * 80)
         if not hasattr(self, 'mock_erc20_addr') or not self.mock_erc20_addr:
             print("  ⚠️ Skipping: No mock_erc20_addr defined in load().")
             return True
@@ -569,12 +569,12 @@ class TreasuryTest:
         return all([step1, step2, step3, step4])
 
     def test_11_erc20_rate_limit_failure(self):
-        print("\n" + "="*80 + "\nTEST 11: ERC20 Rate Limit Enforcement\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 11: ERC20 Rate Limit Enforcement\n" + "=" * 80)
         if not hasattr(self, 'mock_erc20_addr') or not self.mock_erc20_addr:
             print("  ⚠️ Skipping: No mock_erc20_addr defined in load().")
             return True
 
-        massive_erc20_amount = "500000000000000000000000" # Way above expected limits
+        massive_erc20_amount = "500000000000000000000000"  # Way above expected limits
         args = [self.mock_erc20_addr, self.admin_addr, massive_erc20_amount, "ERC20LimitTest"]
 
         step1 = self.cast("proposeERC20Transfer(address,address,uint256,string)", args, self.admin_pk, "Propose Massive ERC20")
@@ -596,7 +596,7 @@ class TreasuryTest:
     # =========================================================================
 
     def test_12_pending_cancellation(self):
-        print("\n" + "="*80 + "\nTEST 12: Pending Cancellation\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 12: Pending Cancellation\n" + "=" * 80)
         args = [self.admin_addr, "1000000000000000000", "CancelPending"]
 
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Propose")
@@ -606,7 +606,7 @@ class TreasuryTest:
         return all([step1, step2, step3])
 
     def test_13_queued_cancellation(self):
-        print("\n" + "="*80 + "\nTEST 13: Queued Cancellation\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 13: Queued Cancellation\n" + "=" * 80)
         args = [self.admin_addr, "1000000000000000000", "CancelQueued"]
 
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Propose")
@@ -622,7 +622,7 @@ class TreasuryTest:
         return all([step1, step2, step3, step4])
 
     def test_14_against_vote_defeats_proposal(self):
-        print("\n" + "="*80 + "\nTEST 14: Against Vote Defeats Proposal\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 14: Against Vote Defeats Proposal\n" + "=" * 80)
         args = [self.admin_addr, "100000", "DefeatTest"]
 
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Propose Transfer")
@@ -638,7 +638,7 @@ class TreasuryTest:
         return all([step1, step2]) and (state == 3)
 
     def test_15_passive_quorum_failure(self):
-        print("\n" + "="*80 + "\nTEST 15: Proposal Fails if Quorum Not Reached\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 15: Proposal Fails if Quorum Not Reached\n" + "=" * 80)
         args = [self.admin_addr, "100000", "PassiveFailTest"]
 
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Propose Transfer")
@@ -657,7 +657,7 @@ class TreasuryTest:
     # =========================================================================
 
     def test_16_admin_move_stake(self):
-        print("\n" + "="*80 + "\nTEST 16: Fragment Stake & Admin Move Stake\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 16: Fragment Stake & Admin Move Stake\n" + "=" * 80)
 
         if not hasattr(self, 'validator_hotkey_hex') or not self.validator_hotkey_hex:
             print("  ⚠️ Skipping: Validator hotkey not found.")
@@ -667,7 +667,7 @@ class TreasuryTest:
             print("  ⚠️ Skipping: Vault coldkey not found.")
             return True
 
-        amount_to_fragment = "10000000000" # 10 Alpha
+        amount_to_fragment = "10000000000"  # 10 Alpha
 
         vault_main_stake_before = self.get_alpha_balance(self.vault_ss58, self.vault_hotkey_ss58)
         print(f"  Vault Stake on Vault Hotkey (Initial): {vault_main_stake_before} Alpha")
@@ -765,7 +765,7 @@ class TreasuryTest:
     # =========================================================================
 
     def test_17_remove_from_whitelist(self):
-        print("\n" + "="*80 + "\nTEST 17: Remove Validator from Whitelist\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 17: Remove Validator from Whitelist\n" + "=" * 80)
         args = [f"[{self.validator_addr}]", "[false]", "RemoveValidator"]
 
         step1 = self.cast("proposeUpdateTrustedValidators(address[],bool[],string)", args, self.admin_pk, "Propose Removal")
@@ -784,7 +784,7 @@ class TreasuryTest:
         return all([step1, step2, step3, step4])
 
     def test_18_post_removal_voting_fails(self):
-        print("\n" + "="*80 + "\nTEST 18: Verify Removed Validator Cannot Vote\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 18: Verify Removed Validator Cannot Vote\n" + "=" * 80)
 
         args = [self.admin_addr, "100000", "PostRemovalTest"]
         step1 = self.cast("proposeNativeTransfer(address,uint256,string)", args, self.admin_pk, "Propose Transfer")
@@ -796,7 +796,7 @@ class TreasuryTest:
         return all([step1, step2])
 
     def test_19_proposal_listing(self):
-        print("\n" + "="*80 + "\nTEST 19: Proposal Listing (GovernorStorage)\n" + "="*80)
+        print("\n" + "=" * 80 + "\nTEST 19: Proposal Listing (GovernorStorage)\n" + "=" * 80)
 
         # 1. Get total proposal count from standard OpenZeppelin storage
         cmd_count = ["cast", "call", self.contract, "proposalCount()(uint256)", "--rpc-url", self.rpc_url]
@@ -977,7 +977,7 @@ class TreasuryTest:
             self.test_19_proposal_listing(),
         ]
 
-        print("\n" + "="*90 + "\nFINAL SUMMARY\n" + "="*90)
+        print("\n" + "=" * 90 + "\nFINAL SUMMARY\n" + "=" * 90)
         for i, passed in enumerate(results, 1):
             print(f"Test {i}: {'✅ PASS' if passed else '❌ FAIL'}")
 

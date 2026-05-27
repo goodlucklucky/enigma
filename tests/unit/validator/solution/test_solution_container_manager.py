@@ -121,11 +121,11 @@ class TestFindCompletedSolutions:
 class TestRun:
     def test_run_executes_full_orchestration(self, container_manager):
         with patch.object(container_manager, "handle_completed_solutions") as mock_handle, \
-             patch.object(container_manager, "_get_number_of_running_solutions", return_value=1), \
-             patch.object(container_manager, "_get_overdue_containers", return_value=["ctr1"]), \
-             patch.object(container_manager, "_terminate_overdue_containers") as mock_term, \
-             patch.object(container_manager.database_connection.db_query, "prune_old_solutions") as mock_prune, \
-             patch.object(container_manager, "_prune_containers") as mock_prune_ctrs:
+                patch.object(container_manager, "_get_number_of_running_solutions", return_value=1), \
+                patch.object(container_manager, "_get_overdue_containers", return_value=["ctr1"]), \
+                patch.object(container_manager, "_terminate_overdue_containers") as mock_term, \
+                patch.object(container_manager.database_connection.db_query, "prune_old_solutions") as mock_prune, \
+                patch.object(container_manager, "_prune_containers") as mock_prune_ctrs:
 
             container_manager.run()
 
@@ -145,9 +145,9 @@ class TestHandleCompletedSolutions:
         locations = ["/path/a", "/path/b"]
 
         with patch.object(container_manager, "_find_completed_solutions", return_value=containers), \
-             patch.object(container_manager, "_extract_outputs_from_completed_containers") as mock_extract, \
-             patch.object(container_manager, "_find_location_of_completed_solutions", return_value=locations), \
-             patch.object(container_manager, "_validate_and_report_solutions") as mock_validate:
+                patch.object(container_manager, "_extract_outputs_from_completed_containers") as mock_extract, \
+                patch.object(container_manager, "_find_location_of_completed_solutions", return_value=locations), \
+                patch.object(container_manager, "_validate_and_report_solutions") as mock_validate:
 
             container_manager.handle_completed_solutions()
 
@@ -161,8 +161,8 @@ class TestValidateAndReportSolutions:
         mock_validate = Mock(return_value="Success")
 
         with patch("qbittensor.validator.solution.solution_container_manager.validate_solution", mock_validate), \
-             patch.object(container_manager.database_connection.db_query, "update_solution_status_in_db") as mock_update, \
-             patch.object(container_manager, "_clean_up_solutions") as mock_clean:
+                patch.object(container_manager.database_connection.db_query, "update_solution_status_in_db") as mock_update, \
+                patch.object(container_manager, "_clean_up_solutions") as mock_clean:
 
             container_manager._validate_and_report_solutions(locations)
 
@@ -178,8 +178,8 @@ class TestCleanUpSolutions:
         container_manager.database_connection.db_query.get_image_id_from_solution_location.return_value = "img1"
 
         with patch("subprocess.run") as mock_run, \
-             patch.object(container_manager, "_container_has_validator_label", return_value=True), \
-             patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True):
+                patch.object(container_manager, "_container_has_validator_label", return_value=True), \
+                patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True):
 
             container_manager._clean_up_solutions(locations)
 
@@ -192,8 +192,8 @@ class TestOverdueContainers:
     def test_get_overdue_filters_by_runtime(self, container_manager):
         # Mock one running container
         with patch.object(container_manager, "_get_running_containers", return_value=["ctr_overdue"]), \
-             patch.object(container_manager, "_container_has_validator_label", return_value=True), \
-             patch("subprocess.run") as mock_run:
+                patch.object(container_manager, "_container_has_validator_label", return_value=True), \
+                patch("subprocess.run") as mock_run:
 
             # Return a very old started time
             mock_run.return_value = MagicMock(stdout="2020-01-01T00:00:00Z", returncode=0)
@@ -206,9 +206,9 @@ class TestOverdueContainers:
         container_manager.database_connection.db_query.get_image_id_by_container_id.return_value = None
 
         with patch.object(container_manager, "_container_has_validator_label", return_value=True), \
-             patch.object(container_manager, "_inspect_container_config_image", return_value="val_label_img"), \
-             patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True), \
-             patch("subprocess.run") as mock_run:
+                patch.object(container_manager, "_inspect_container_config_image", return_value="val_label_img"), \
+                patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True), \
+                patch("subprocess.run") as mock_run:
 
             container_manager._terminate_overdue_containers(overdue)
 
@@ -219,9 +219,9 @@ class TestOverdueContainers:
 class TestPruneContainers:
     def test_prune_removes_exited_validator_containers(self, container_manager):
         with patch("subprocess.run") as mock_run, \
-             patch.object(container_manager, "_container_has_validator_label", return_value=True), \
-             patch.object(container_manager, "_inspect_container_config_image", return_value="val_label_img"), \
-             patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True):
+                patch.object(container_manager, "_container_has_validator_label", return_value=True), \
+                patch.object(container_manager, "_inspect_container_config_image", return_value="val_label_img"), \
+                patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True):
 
             mock_run.return_value = MagicMock(stdout="ctr_exited\n", returncode=0)
 
@@ -244,8 +244,8 @@ class TestOrphanedAndLocationHandling:
         container_manager.database_connection.db_query.get_image_id_by_container_name.return_value = "val_label_img"
 
         with patch.object(container_manager, "_container_has_validator_label", return_value=True), \
-             patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True), \
-             patch("subprocess.run") as mock_run:
+                patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True), \
+                patch("subprocess.run") as mock_run:
 
             container_manager._clean_up_orphaned_solutions("orphan_ctr")
 

@@ -92,13 +92,25 @@ class ResponseProcessor:
                 solution_candidate=SolutionCandidateProof(
                     challenge_milestone_id=synapse.solution_candidate.challenge_milestone_id,
                     upload_endpoint_id=synapse.solution_candidate.upload_endpoint_id,
-                    challenge_id=synapse.solution_candidate.challenge_preparation_id,
+                    challenge_id=(
+                        synapse.challenge_id
+                        or synapse.solution_candidate.challenge_id
+                    ),
                 ),
             )
+            challenge_id = (
+                synapse.challenge_id
+                or synapse.solution_candidate.challenge_id
+            )
+            if not challenge_id:
+                bt.logging.error(
+                    f"❌ Synapse from miner '{miner_hotkey}' is missing challenge_id; "
+                    f"cannot look up milestone price for tx_hash {synapse.tx_hash}."
+                )
+                continue
             # Validator must obtain the authoritative fee from the platform via ChallengesClient.
-            # Prefer passing challenge_id when available for efficiency.
             price_tao = self.platform_client.get_milestone_price_tao(
-                challenge_id=synapse.solution_candidate.challenge_preparation_id,
+                challenge_id=challenge_id,
                 milestone_id=synapse.solution_candidate.challenge_milestone_id,
             )
             expected_transfer_amount_rao = str(int(bt.Balance.from_tao(price_tao).rao))
@@ -176,59 +188,16 @@ class ResponseProcessor:
                 platform_client=self.platform_client,
                 validator_label=self.validator_label,
                 download_url=download_url,
+                challenge_id=challenge_id,
                 challenge_milestone_id=solution_candidate.challenge_milestone_id,
                 challenge_validation_solution_id=solution_candidate.upload_endpoint_id,
                 submission_id=response.id,
                 tx_hash=synapse.tx_hash,
                 miner_hotkey=miner_hotkey,
-                request_manager=self.request_manager,
             )
 
             bt.logging.info(f"Started solution with image name {image_name} and container id {container_id}. Solution files are located in {folder_name}")
             solution_started = True
-
-    def _post_challenge_submission(
-        self,
-        upload_endpoint_id: str,
-        challenge_preparation_id: Optional[str],
-        milestone_id: str,
-        tx_hash: str,
-        miner_hotkey: str,
-        validator_busy: bool = False,
-        transfer_block_hash: Optional[str] = None,
-        transfer_from_ss58: Optional[str] = None,
-        transfer_to_ss58: Optional[str] = None,
-        transfer_amount_rao: Optional[str] = None,
-        transfer_proof_message: Optional[str] = None,
-        transfer_proof_signature_hex: Optional[str] = None,
-    ) -> ChallengeSubmissionResponse | None:
-        """Get the file download URL if file_id is valid"""
-
-        bt.logging.info(f"📬 Posting challenge submission for upload endpoint id: {upload_endpoint_id}, challenge preparation id: {challenge_preparation_id}, milestone id: {milestone_id}, tx hash: {tx_hash}")
-
-        req: ChallengeSubmissionRequest = ChallengeSubmissionRequest(
-            address=miner_hotkey,
-            upload_endpoint_id=upload_endpoint_id,
-            tx_hash=tx_hash,
-            challenge_preparation_id=challenge_preparation_id,
-            validator_busy=validator_busy,
-            transfer_block_hash=transfer_block_hash,
-            transfer_from_ss58=transfer_from_ss58,
-            transfer_to_ss58=transfer_to_ss58,
-            transfer_amount_rao=transfer_amount_rao,
-            transfer_proof_message=transfer_proof_message,
-            transfer_proof_signature_hex=transfer_proof_signature_hex,
-        )
-
-        # Route through ChallengesClient for consistent typing and error handling
-        response = self.platform_client.submit_solution(milestone_id, req)
-
-        if response is None:
-            # submit_solution already logs the reason (202 or error)
-            return None
-
-        bt.logging.info("🚀 Successfully submitted challenge solution")
-        return response
 
     def _log_platform_submission_error(self, response: Response) -> None:
         """Parse and log platform submission errors using the standard error envelope."""

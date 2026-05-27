@@ -18,6 +18,7 @@
 # define enum for solution status
 from enum import Enum
 
+
 class SolutionStatus(Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"

@@ -16,14 +16,10 @@
 # DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING, Optional
-
+from typing import Optional
 from pydantic import BaseModel
 
 from qbittensor.database.miner.db_models import MinerSubmission
-
-
 
 
 class ChallengeResponse(BaseModel):
@@ -45,12 +41,14 @@ class ChallengeResponse(BaseModel):
     def __str__(self) -> str:
         return self.__repr__()
 
+
 class SolutionCandidate(BaseModel):
     """
     Data needed by the validator to process/run a solution.
     """
     challenge_milestone_id: str
     upload_endpoint_id: str
+    challenge_id: Optional[str] = None
     challenge_preparation_id: Optional[str] = None
 
     @staticmethod
@@ -66,18 +64,21 @@ class SolutionCandidate(BaseModel):
         return SolutionCandidate(
             challenge_milestone_id=miner_submission.challenge_milestone_id,
             upload_endpoint_id=miner_submission.upload_id,
+            challenge_id=miner_submission.challenge_id,
             challenge_preparation_id=None,
         )
 
     def __repr__(self) -> str:
-        return "SolutionCandidate(challenge_milestone_id: {}, upload_endpoint_id: {}, challenge_preparation_id: {})".format(
+        return "SolutionCandidate(challenge_milestone_id: {}, upload_endpoint_id: {}, challenge_id: {}, challenge_preparation_id: {})".format(
             self.challenge_milestone_id,
             self.upload_endpoint_id,
+            self.challenge_id,
             self.challenge_preparation_id,
         )
 
     def __str__(self) -> str:
         return self.__repr__()
+
 
 # Request to challenges/milestones/:milestone_id/submissions
 class ChallengeSubmissionRequest(BaseModel):
@@ -93,23 +94,23 @@ class ChallengeSubmissionRequest(BaseModel):
     transfer_proof_message: str
     transfer_proof_signature_hex: str
 
-# Response from challenges/milestones/:milestone_id/submissions
+
 class ChallengeSubmissionResponse(BaseModel):
     id: str
     challenge_milestone_id: str
     file_download_url: str
     tx_hash: str
 
+
 class ChallengeSubmissionVerifyUploadAddressResponse(BaseModel):
     id: str
     url: str
 
 
-# Response from GET /v1/submissions/next (and similar read paths)
-# This is the canonical model matching the cloud API's ChallengeSubmissionRead.
 class ChallengeSubmissionRead(BaseModel):
     id: str
     challenge_milestone_id: str
+    challenge_id: Optional[str] = None
     challenge_preparation_id: Optional[str] = None
     file_download_url: str
     upload_endpoint_id: str
@@ -135,10 +136,6 @@ class ChallengeSubmissionRead(BaseModel):
         return self.__repr__()
 
 
-# =============================================================================
-# Transfer Proof Verification
-# =============================================================================
-
 class SolutionCandidateProof(BaseModel):
     """
     Minimal subset of SolutionCandidate needed for transfer proof verification.
@@ -146,7 +143,7 @@ class SolutionCandidateProof(BaseModel):
     """
     challenge_milestone_id: str
     upload_endpoint_id: str
-    challenge_id: Optional[str] = None  # Top-level challenge id (used for efficient priceTao lookup)
+    challenge_id: Optional[str] = None
 
 
 class TransferProof(BaseModel):
