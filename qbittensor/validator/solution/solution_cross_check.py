@@ -23,7 +23,9 @@ from .run import execute_verified_solution
 from qbittensor.constants import CROSS_CHECK_TIMEOUT
 from qbittensor.utils.transfer_proof import verify_transfer_proof_for_synapse
 from qbittensor.utils.services.challenges import ChallengesClient
+from qbittensor.utils.services.telemetry import TelemetryService
 import bittensor as bt
+import time
 
 
 class SolutionCrossChecker:
@@ -35,6 +37,7 @@ class SolutionCrossChecker:
         solution_container_manager: SolutionContainerManager,
         database_connection: DBConnection,
         subtensor=None,  # Optional: needed for full tx proof verification on first-time cross-check items
+        telemetry_service: TelemetryService | None = None,
     ):
         self.platform_client: ChallengesClient = platform_client
         self.solution_container_manager = solution_container_manager
@@ -42,6 +45,7 @@ class SolutionCrossChecker:
         self.validator_label = validator_label
         self.database_connection: DBConnection = database_connection
         self.subtensor = subtensor
+        self.telemetry_service: TelemetryService | None = telemetry_service
 
     def run(self) -> None:
         """Poll for cross-check work when idle."""
@@ -55,6 +59,18 @@ class SolutionCrossChecker:
         if submission is None:
             bt.logging.info("🚫 Found no solutions to cross-check")
             return
+
+        if self.telemetry_service:
+            self.telemetry_service.record_event(
+                "cross_check_work_received",
+                value=1,
+                miner_hotkey=submission.address,
+                attributes={
+                    "submission_id": submission.id,
+                    "tx_hash": submission.tx_hash,
+                    "challenge_milestone_id": submission.challenge_milestone_id,
+                },
+            )
 
         # Verify proof ourselves on first sight for cross-check items.
         if not self.database_connection.db_query.has_seen_tx_hash(submission.tx_hash):
@@ -97,11 +113,12 @@ class SolutionCrossChecker:
         self.database_connection.db_query.insert_for_maintenance_incentive(
             miner_hotkey=submission.address,
             challenge_milestone_id=submission.challenge_milestone_id,
-            tx_hash=submission.tx_hash
+            tx_hash=submission.tx_hash,
         )
 
         bt.logging.info(f"Running solution cross-check on solution with miner hotkey {submission.address}")
 
+        start_time = time.time()
         image_name, container_id, folder_name = execute_verified_solution(
             db_conn=self.database_connection,
             platform_client=self.platform_client,
@@ -113,7 +130,22 @@ class SolutionCrossChecker:
             submission_id=submission.id,
             tx_hash=submission.tx_hash,
             miner_hotkey=submission.address,
+            telemetry_service=self.telemetry_service,
         )
+        duration = time.time() - start_time
+
+        if self.telemetry_service:
+            outcome = "success" if (image_name and container_id) else "failure"
+            self.telemetry_service.record_event(
+                "cross_check_execution_completed",
+                value=duration,
+                miner_hotkey=submission.address,
+                attributes={
+                    "submission_id": submission.id,
+                    "tx_hash": submission.tx_hash,
+                    "outcome": outcome,
+                },
+            )
 
         if image_name is None or container_id is None or folder_name is None:
             # execute_verified_solution already reported failure to platform when possible

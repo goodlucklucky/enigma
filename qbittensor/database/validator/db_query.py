@@ -167,10 +167,10 @@ class DBQuery(BaseDBQuery):
         """Prune old solutions from the database."""
         try:
             with self._managed_session() as session:
-                session.query(ChallengeSolution).filter(
+                deleted = session.query(ChallengeSolution).filter(
                     ChallengeSolution.updated_at < func.datetime('now', OLDEST_ALLOWED_TIMESTAMP)
                 ).delete()
-                bt.logging.info("Pruned old solutions from the database")
+                bt.logging.info(f"🗑️ Pruned {deleted} old solutions from the database (older than {OLDEST_ALLOWED_TIMESTAMP})")
                 return True
         except Exception as e:
             bt.logging.error(f"Error pruning old solutions: {e}")
@@ -339,8 +339,13 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"❌ Error retrieving challenge solution: {e}")
             return None
 
-    def insert_for_maintenance_incentive(self, miner_hotkey: str, challenge_milestone_id: str, tx_hash: str):
-        """Insert a new miner maintenance incentive record into the database."""
+    def insert_for_maintenance_incentive(
+        self,
+        miner_hotkey: str,
+        challenge_milestone_id: str,
+        tx_hash: str,
+    ):
+        """Insert a new miner maintenance incentive record."""
         try:
             with self._managed_session() as session:
                 stmt = insert(MinerMaintenanceIncentive).values(
@@ -409,7 +414,7 @@ class DBQuery(BaseDBQuery):
                 )
 
                 bt.logging.info(
-                    f"Pruned {deleted_count} old miner maintenance incentive rows "
+                    f"🗑️ Pruned {deleted_count} old miner maintenance incentive rows "
                     f"(older than {OLDEST_ALLOWED_TIMESTAMP})"
                 )
                 return True

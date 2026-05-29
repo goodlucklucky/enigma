@@ -31,7 +31,6 @@ def platform_client():
     client.get_next_cross_check_submission.return_value = None
     client.report_submission_status.return_value = True
     client.get_milestone_price_tao.return_value = 0.1
-    client.get_milestone_transfer_amount_rao.return_value = "100000"
     client.create_verification_upload_url.return_value = Mock(
         id="upload-123", url="https://example.com/upload"
     )

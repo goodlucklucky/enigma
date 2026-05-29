@@ -15,7 +15,7 @@ High-level flow:
 2. Query challenge data from the Engima Challenges API.
 3. Let the user pick a challenge/milestone and `.zip` file.
 4. Request an upload slot from `POST /v1/submissions/upload` (JWT-authenticated via `RequestManager`).
-5. Send the TAO fee transfer on-chain (Balances `transfer_keep_alive`).
+5. Send the TAO fee payment on-chain as a `Utility.batch_all` containing a `Balances.transfer_keep_alive` + a `System.remark_with_event` (signed by your fee coldkey). The remark contains the canonical binding between the payment and your specific submission.
 6. Upload the zip to the presigned upload URL returned by the API.
 7. Upsert a row into the local SQLite miner DB (`miner_submissions_<hotkey_prefix>.db`).
 
@@ -31,33 +31,21 @@ mine-enigma
 
 During interactive submission, the CLI asks for:
 
-- Miner hotkey SS58 (or `MINER_HOTKEY_SS58` from `.env`)
 - Path to `.zip` solution
-- Source coldkey SS58 to send transfer from (or `MINER_SOURCE_COLDKEY_SS58`)
-- Source mnemonic/seed phrase (or `MINER_SOURCE_COLDKEY_MNEMONIC`)
 
-## .env Configuration
+The miner hotkey is taken directly from `--wallet.hotkey` .
 
-Create a `.env` file in the repository root (never commit it). The miner CLI loads variables via `python-dotenv` (through `get_api_config()` at import time).
-
-### Challenges API Authentication (Signing Wallet)
-
-The CLI uses a Bittensor wallet to sign requests when obtaining upload slots and submitting solutions. This is typically a separate "buy" wallet from your mining hotkey:
-
-- `BUY_WALLET_COLDKEY`
-- `BUY_WALLET_HOTKEY`
-
-These can be overridden on the command line with `--wallet-name` and `--wallet-hotkey`.
-
-- `NETWORK` — Bittensor network label passed to `RequestManager` and the signing flow (default: `finney`).
+Fee payment uses the coldkey from the same primary wallet (`--wallet.name`).
 
 ### Non-interactive / Automation Helpers
 
-These variables allow `mine-enigma` to run without interactive prompts:
+The primary wallet is configured with standard Bittensor flags:
 
-- `MINER_HOTKEY_SS58` — The hotkey SS58 that will serve the solution on-chain.
-- `MINER_SOURCE_COLDKEY_SS58` — Coldkey that will pay the TAO submission fee.
-- `MINER_SOURCE_COLDKEY_MNEMONIC` — Mnemonic/seed for the source coldkey (used to sign the on-chain transfer).
+- `WALLET_NAME` / `--wallet.name` — Main wallet. Its **coldkey** is used to pay the TAO fee.
+- `WALLET_HOTKEY` / `--wallet.hotkey` — Hotkey used for platform API authentication (JWTs). Can be the same as your mining hotkey.
+- `WALLET_PATH` / `--wallet.path` — Custom wallets directory (optional).
+
+For most users, one wallet can handle both fee payment and platform API calls.
 
 ### Advanced
 
@@ -140,7 +128,7 @@ On validator side, `ResponseProcessor` verifies transfer proof data (message int
 4. Run the miner neuron:
 
 ```bash
-python neurons/miner.py
+python neurons/miner.py --netuid 63 --logging.info --wallet.name <your_wallet_name> --wallet.hotkey <your_hotkey>
 ```
 
 5. As validators query your miner, it serves DB-backed submissions over synapses.

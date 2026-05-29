@@ -152,7 +152,7 @@ class BaseValidatorNeuron(BaseNeuron):
 
                     self.step += 1
                 except Exception as err:
-                    bt.logging.error(f"Error during validation: {str(err)}")
+                    bt.logging.error(f"Error during validation step {self.step}: {str(err)}")
                     bt.logging.debug(
                         str(print_exception(type(err), err, err.__traceback__))
                     )

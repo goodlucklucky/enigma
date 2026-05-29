@@ -90,8 +90,8 @@ class TestDBQueryMiner:
     def test_insert_miner_submission_status_insert_and_update(self, miner_query, miner_db):
         self._insert(miner_query, "0xstatus", miner_db)
         assert miner_query.insert_miner_submission_status(
-            "m1", "Running", "5Validator", "0xstatus"
+            "m1", "RUNNING", "5Validator", "0xstatus"
         ) is True
         assert miner_query.insert_miner_submission_status(
-            "m1", "Success", "5Validator", "0xstatus"
+            "m1", "SUCCESS", "5Validator", "0xstatus"
         ) is True

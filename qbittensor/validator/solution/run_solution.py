@@ -85,7 +85,12 @@ def prepare_challenge_input_mount_dir(workspace: str) -> str:
     """
     mount_dir = os.path.join(os.path.abspath(workspace), CHALLENGE_INPUT_DIRNAME)
     if os.path.isdir(mount_dir):
-        shutil.rmtree(mount_dir)
+        bt.logging.info(f"🗑️ Removing previous challenge input mount dir: {mount_dir}")
+        try:
+            shutil.rmtree(mount_dir)
+            bt.logging.info(f"🗑️ Removed previous challenge input mount dir: {mount_dir}")
+        except Exception as e:
+            bt.logging.warning(f"⚠️ Failed to remove previous mount dir {mount_dir}: {e}")
     os.makedirs(mount_dir, mode=0o755)
     return mount_dir
 

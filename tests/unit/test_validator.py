@@ -401,6 +401,66 @@ class TestSetWeights:
 
         mock_super.assert_called_once()
 
+    def test_raw_uint_weights_sum_never_exceeds_u16_max(self, mock_validator):
+        """Regression test: emitted uint16 weights must sum to <= 65535.
+
+        The previous max-upscale + round logic in convert_weights_and_uids_for_emit
+        could produce sums like 65537 (treasury=65535 + dust=2). This violates the
+        documented contract and triggers on-chain warnings. The correction logic
+        must shave excess off the dominant weight while preserving all dust.
+        """
+        n = 256
+        treasury_uid = 87
+        private_uid = 171
+
+        hotkeys = [f"hk_{i:03d}" for i in range(n)]
+        hotkeys[treasury_uid] = TREASURY_HOTKEY
+        hotkeys[private_uid] = PRIVATE_MINER_HOTKEY
+
+        mock_validator.metagraph.hotkeys = hotkeys
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.uids = np.arange(n, dtype=np.int64)
+        # Only the private miner gets the floor (worst-case single dust scenario)
+        mock_validator.database_connection.db_query.get_active_miners.return_value = []
+
+        with patch("neurons.validator.BaseValidatorNeuron.set_weights") as mock_super:
+            mock_validator.set_weights()
+
+        scores = mock_validator.scores
+
+        # Replicate the exact pipeline that BaseValidatorNeuron.set_weights runs
+        norm = np.linalg.norm(scores, ord=1)
+        if norm == 0 or np.isnan(norm):
+            norm = 1.0
+        raw_weights = scores / norm
+
+        mock_st = mock_validator.subtensor
+        mock_st.min_allowed_weights.return_value = 1
+        mock_st.max_weight_limit.return_value = 1.0
+
+        processed_uids, processed_w = process_weights_for_netuid(
+            uids=mock_validator.metagraph.uids,
+            weights=raw_weights,
+            netuid=63,
+            subtensor=mock_st,
+            metagraph=mock_validator.metagraph,
+        )
+        uint_uids, uint_weights = convert_weights_and_uids_for_emit(
+            uids=processed_uids, weights=processed_w
+        )
+
+        total_raw = sum(uint_weights)
+        assert total_raw <= 65535, (
+            f"Total raw weight {total_raw} exceeds U16_MAX=65535. "
+            f"Emitted: {dict(zip([int(u) for u in uint_uids], uint_weights))}"
+        )
+
+        # The dust must still be present (keep-alive must not be broken by the correction)
+        emitted = dict(zip([int(u) for u in uint_uids], uint_weights))
+        assert emitted.get(private_uid, 0) > 0, "Private miner dust was zeroed"
+
+        mock_super.assert_called_once()
+
 
 class TestValidator:
     """Test cases for the Validator class."""
@@ -426,3 +486,153 @@ class TestValidator:
 
         mock_validator.telemetry_service.heartbeat_timer.check_timer.assert_called_once()
         mock_validator.telemetry_service.record_heartbeat.assert_not_called()
+
+
+class TestMinerQueryThrottling:
+    """
+    Tests for the throttled miner querying logic introduced to prevent
+    blasting every miner on every 5-second forward tick.
+
+    Covers:
+    - is_valid_miner_axon filtering (via the public helper)
+    - _select_miners_for_this_step batch sizing and staleness behavior
+    - Integration of the guard inside the query path
+    """
+
+    def _make_good_axon(self):
+        axon = Mock()
+        axon.is_serving = True
+        axon.ip = "203.0.113.10"
+        axon.port = 8091
+        return axon
+
+    def _make_bad_axon(self, ip="0.0.0.0", port=0, serving=False):
+        axon = Mock()
+        axon.is_serving = serving
+        axon.ip = ip
+        axon.port = port
+        return axon
+
+    def test_selects_small_batch_under_default_sweep_interval(self, mock_validator):
+        """With a 10-minute target sweep, we should only query a small fraction per forward."""
+        n = 100
+        mock_validator.metagraph.hotkeys = [f"hk_{i}" for i in range(n)]
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.axons = [self._make_good_axon() for _ in range(n)]
+
+        # Default sweep is 600s, forward is 5s in the fixture
+        selected = mock_validator._select_miners_for_this_step()
+
+        # Expect a small batch (roughly 100 * 5 / 600 ≈ 1, but at least 1)
+        assert 1 <= len(selected) <= 5
+        assert all(0 <= uid < n for uid in selected)
+
+    def test_very_aggressive_sweep_selects_more_miners(self, mock_validator):
+        """Setting a low-but-valid sweep interval should cause larger batches than the default."""
+        n = 120
+        mock_validator.metagraph.hotkeys = [f"hk_{i}" for i in range(n)]
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.axons = [self._make_good_axon() for _ in range(n)]
+
+        # The production code has a safety floor of ~30s for the sweep interval.
+        # Use a value just above it to get a meaningfully larger batch than the default 600s case.
+        mock_validator.config.neuron.miner_sweep_interval = 45
+        mock_validator.config.neuron.forward_sleep_interval = 5
+
+        selected = mock_validator._select_miners_for_this_step()
+        # With n=120 and sweep=45, we expect noticeably more than the default tiny batch.
+        assert len(selected) >= 5
+
+    def test_filters_out_invalid_axons(self, mock_validator):
+        """0.0.0.0 and non-serving axons must never be selected for querying."""
+        n = 10
+        mock_validator.metagraph.hotkeys = [f"hk_{i}" for i in range(n)]
+        mock_validator.metagraph.n = n
+
+        axons = [self._make_good_axon() for _ in range(6)]
+        axons += [self._make_bad_axon() for _ in range(4)]  # 4 bad ones
+        mock_validator.metagraph.axons = axons
+
+        mock_validator.config.neuron.miner_sweep_interval = 60
+        mock_validator.config.neuron.forward_sleep_interval = 5
+
+        selected = mock_validator._select_miners_for_this_step()
+
+        # We should only ever see the 6 good UIDs
+        assert all(uid < 6 for uid in selected)
+        assert len(selected) <= 6
+
+    def test_staleness_causes_progress_over_multiple_calls(self, mock_validator):
+        """Repeated calls should eventually cover different miners (staleness works)."""
+        n = 20
+        mock_validator.metagraph.hotkeys = [f"hk_{i}" for i in range(n)]
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.axons = [self._make_good_axon() for _ in range(n)]
+
+        mock_validator.config.neuron.miner_sweep_interval = 120
+        mock_validator.config.neuron.forward_sleep_interval = 5
+
+        first = set(mock_validator._select_miners_for_this_step())
+        second = set(mock_validator._select_miners_for_this_step())
+
+        # With only ~1 miner per call, the two sets are likely disjoint
+        # or have very small overlap. The important thing is we don't
+        # hammer the exact same miner every single call.
+        overlap = first & second
+        assert len(overlap) <= 2  # very loose; mainly checking we make progress
+
+    def test_last_queried_is_populated_as_side_effect(self, mock_validator):
+        """Calling the selector should update last_queried for the chosen UIDs."""
+        n = 15
+        mock_validator.metagraph.hotkeys = [f"hk_{i}" for i in range(n)]
+        mock_validator.metagraph.n = n
+        mock_validator.metagraph.axons = [self._make_good_axon() for _ in range(n)]
+
+        mock_validator.config.neuron.miner_sweep_interval = 300
+        mock_validator.config.neuron.forward_sleep_interval = 5
+
+        assert len(mock_validator.last_queried) == 0
+
+        selected = mock_validator._select_miners_for_this_step()
+
+        assert len(mock_validator.last_queried) == len(selected)
+        assert all(uid in mock_validator.last_queried for uid in selected)
+
+    def test_invalid_axons_are_skipped_in_gather_path(self, mock_validator):
+        """
+        When _gather_miner_synapses runs, UIDs with invalid axons should
+        produce empty sentinel responses without ever calling dendrite.forward.
+        """
+        # Small metagraph with one good, one bad axon
+        mock_validator.metagraph.hotkeys = ["good", "bad"]
+        mock_validator.metagraph.n = 2
+        good_axon = self._make_good_axon()
+        bad_axon = self._make_bad_axon()
+        mock_validator.metagraph.axons = [good_axon, bad_axon]
+
+        # Force the selector to consider both (by making the sweep extremely aggressive)
+        mock_validator.config.neuron.miner_sweep_interval = 1
+        mock_validator.config.neuron.forward_sleep_interval = 1
+
+        # Patch the actual dendrite call so we can count invocations
+        with patch.object(mock_validator.dendrite, "forward", new_callable=AsyncMock) as mock_forward:
+            responses = mock_validator._run_async(
+                mock_validator._gather_miner_synapses(validator_busy=False)
+            )
+
+        # We should have exactly 2 responses (full length list)
+        assert len(responses) == 2
+
+        # The bad axon (index 1) should have produced a sentinel (no solution_candidate)
+        assert responses[1].solution_candidate is None
+
+        # dendrite.forward should only have been called for the good axon
+        # (the selector may return 1 or 2, but never the bad UID)
+        called_uids = []
+        for call in mock_forward.call_args_list:
+            axon_arg = call.kwargs.get("axons") or call.args[0]
+            # In our code we pass the axon object directly in the throttled path
+            if hasattr(axon_arg, "ip"):
+                # We can't easily map back without the metagraph, but we can assert
+                # that we never passed the bad_axon object.
+                assert axon_arg is not bad_axon

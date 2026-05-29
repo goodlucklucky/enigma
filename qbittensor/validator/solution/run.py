@@ -18,6 +18,7 @@
 import bittensor as bt
 import os
 import subprocess
+import time
 from typing import Optional, Tuple
 
 from .exceptions.validation_errors import ValidationErrors
@@ -36,6 +37,7 @@ from .validate_docker_image import reject_dockerfile, validate_image
 from .run_solution import prepare_challenge_input_mount_dir, run_image_detached
 from qbittensor.utils.solution_status import SolutionStatus
 from qbittensor.utils.services.challenges import ChallengesClient
+from qbittensor.utils.services.telemetry import TelemetryService
 
 
 def run_solution_management(
@@ -49,6 +51,7 @@ def run_solution_management(
     submission_id: str | None,
     challenge_id: str | None = None,
     platform_client: ChallengesClient | None = None,
+    telemetry_service: TelemetryService | None = None,
 ) -> Tuple[str | None, str | None, str | None]:
 
     image_name: str | None = None
@@ -58,6 +61,20 @@ def run_solution_management(
     folder_name: str | None = None
     did_start_solution = False
     did_insert_solution = False
+
+    bt.logging.info(f"🔧 run_solution_management starting for {challenge_validation_solution_id} (tx={tx_hash})")
+
+    if telemetry_service:
+        telemetry_service.record_event(
+            "solution_execution_started",
+            value=1,
+            miner_hotkey=miner_hotkey,
+            attributes={
+                "submission_id": submission_id,
+                "tx_hash": tx_hash,
+                "challenge_milestone_id": challenge_milestone_id,
+            },
+        )
 
     try:
         # 0. insert challenge solution
@@ -155,6 +172,7 @@ def run_solution_management(
             bt.logging.error("Failed to update challenge solution.")
             raise InvalidSolutionError(message=ValidationErrors.DOCKER_RUN_FAILED.value)
         did_start_solution = True
+        bt.logging.info(f"✅ run_solution_management completed setup for {challenge_validation_solution_id}")
 
     except InvalidSolutionError as e:
         bt.logging.error(f"Invalid solution: {e.error_msg}")
@@ -180,34 +198,45 @@ def run_solution_management(
 
 
 def clean_up_failed_solution(image_name: str | None, container_id: str | None, folder_name: str | None) -> None:
-    bt.logging.info(f"Cleaning up failed solution with image name {image_name}, container id {container_id}, and folder name {folder_name}")
+    bt.logging.info(f"🧹 Starting cleanup of failed solution (image={image_name}, container={container_id}, folder={folder_name})")
+    cleaned = 0
+    total = sum(1 for x in (container_id, image_name, folder_name) if x)
+
     if container_id is not None:
         remove_container_result = subprocess.run(["docker", "rm", "-fv", container_id], check=False, capture_output=True, text=True)
         if remove_container_result.returncode == 0:
             bt.logging.info(f"🗑️ Removed container {container_id}")
+            cleaned += 1
         else:
             bt.logging.warning(
                 f"⚠️ Failed to remove container {container_id}: "
                 f"{(remove_container_result.stderr or remove_container_result.stdout).strip()}"
             )
+
     if image_name is not None:
         remove_image_result = subprocess.run(["docker", "rmi", "-f", image_name], check=False, capture_output=True, text=True)
         if remove_image_result.returncode == 0:
             bt.logging.info(f"🗑️ Removed image {image_name}")
+            cleaned += 1
         else:
             bt.logging.warning(
                 f"⚠️ Failed to remove image {image_name}: "
                 f"{(remove_image_result.stderr or remove_image_result.stdout).strip()}"
             )
+
     if folder_name is not None:
         remove_folder_result = subprocess.run(["rm", "-rf", folder_name], check=False, capture_output=True, text=True)
         if remove_folder_result.returncode == 0:
             bt.logging.info(f"🗑️ Removed folder {folder_name}")
+            cleaned += 1
         else:
             bt.logging.warning(
                 f"⚠️ Failed to remove folder {folder_name}: "
                 f"{(remove_folder_result.stderr or remove_folder_result.stdout).strip()}"
             )
+
+    if total > 0:
+        bt.logging.info(f"🧹 Failed solution cleanup complete: {cleaned}/{total} items removed")
 
 
 # =============================================================================
@@ -230,6 +259,7 @@ def execute_verified_solution(
     # so they can be reported together with the final status (as required by the platform).
     log_data_key: Optional[str] = None,
     output_data_key: Optional[str] = None,
+    telemetry_service: TelemetryService | None = None,
 ) -> Tuple[str | None, str | None, str | None]:
     """
     Common execution path for running a solution that has already been verified
@@ -242,6 +272,12 @@ def execute_verified_solution(
     On failure it reports via report_submission_status (including keys if provided).
     On success, the caller is responsible for any final Success report (with keys if applicable).
     """
+    bt.logging.info(
+        f"🧪 Beginning verified solution execution pipeline for submission={submission_id} "
+        f"(miner {miner_hotkey}, tx {tx_hash}, milestone {challenge_milestone_id})"
+    )
+    start_ts = time.time()
+
     image_name, container_id, folder_name = run_solution_management(
         db_conn=db_conn,
         validator_label=validator_label,
@@ -253,11 +289,55 @@ def execute_verified_solution(
         miner_hotkey=miner_hotkey,
         challenge_id=challenge_id,
         platform_client=platform_client,
+        telemetry_service=telemetry_service,
     )
+
+    elapsed = time.time() - start_ts
+    if image_name and container_id:
+        bt.logging.info(
+            f"🏁 Execution pipeline finished successfully in {elapsed:.1f}s "
+            f"(image={image_name}, container={container_id})"
+        )
+
+        if telemetry_service:
+            telemetry_service.record_event(
+                "solution_execution_completed",
+                value=elapsed,
+                miner_hotkey=miner_hotkey,
+                attributes={
+                    "submission_id": submission_id,
+                    "tx_hash": tx_hash,
+                    "outcome": "success",
+                    "image": image_name,
+                    "container": container_id,
+                },
+            )
+    else:
+        bt.logging.warning(
+            f"🏁 Execution pipeline finished (with failures) in {elapsed:.1f}s "
+            f"for tx {tx_hash}"
+        )
+
+        if telemetry_service:
+            telemetry_service.record_event(
+                "solution_execution_completed",
+                value=elapsed,
+                miner_hotkey=miner_hotkey,
+                attributes={
+                    "submission_id": submission_id,
+                    "tx_hash": tx_hash,
+                    "outcome": "failure",
+                },
+            )
 
     if image_name is None or container_id is None or folder_name is None:
         bt.logging.error(f"❌ Failed to execute verified solution for tx_hash {tx_hash}")
         if platform_client:
+            bt.logging.info(
+                f"📤 Reporting Failure to platform (submission_id={submission_id}) "
+                f"with log_data_key={'present' if log_data_key else 'None'} "
+                f"and output_data_key={'present' if output_data_key else 'None'}"
+            )
             platform_client.report_submission_status(
                 submission_id=submission_id,
                 status="Failure",

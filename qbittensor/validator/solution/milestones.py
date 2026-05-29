@@ -41,9 +41,11 @@ class MilestoneHandlers:
 # (challenge_setup_map and solution_map) that had to be kept in sync manually.
 # =============================================================================
 
+MOCK_MILESTONE_ID = "9c869f1e-66da-4ebe-9fe1-4f5a2b9c8228"
+
 MILESTONE_REGISTRY: dict[str, MilestoneHandlers] = {
     # Mock challenge used for testing private/public key (Ed25519) validation
-    "75358eeb-0345-4938-8ea6-7e7e657487c7": MilestoneHandlers(
+    MOCK_MILESTONE_ID: MilestoneHandlers(
         setup=mock_solution_setup,
         validate=run_mock_solution,
     ),

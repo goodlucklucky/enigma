@@ -17,7 +17,38 @@
 
 """Exceptions for the Challenges API client."""
 
-from typing import Optional
+from typing import Any, Optional
+import json
+
+
+def _parse_platform_error_body(body: Optional[str]) -> dict[str, Any]:
+    """Attempt to parse the platform's ErrorResponseDto from a response body.
+
+    Returns a dict with any of: 'status_code', 'message', 'error_code' when present.
+    Safe on any input (returns empty dict on failure).
+    """
+    if not body or not isinstance(body, str):
+        return {}
+    text = body.strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, Any] = {}
+    if "status_code" in data:
+        try:
+            result["status_code"] = int(data["status_code"])
+        except Exception:
+            pass
+    if "message" in data:
+        result["message"] = data["message"]
+    if "error_code" in data and data["error_code"]:
+        result["error_code"] = str(data["error_code"])
+    return result
 
 
 class ChallengesApiError(Exception):
@@ -28,15 +59,21 @@ class ChallengesApiError(Exception):
         message: str,
         status_code: Optional[int] = None,
         response_text: Optional[str] = None,
+        error_code: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response_text = response_text
+        self.error_code = error_code
 
     def __str__(self) -> str:
-        if self.status_code:
-            return f"{super().__str__()} (status={self.status_code})"
-        return super().__str__()
+        parts: list[str] = []
+        if self.status_code is not None:
+            parts.append(f"status={self.status_code}")
+        if self.error_code:
+            parts.append(f"error_code={self.error_code}")
+        suffix = f" ({', '.join(parts)})" if parts else ""
+        return f"{super().__str__()}{suffix}"
 
 
 class ChallengesAuthError(ChallengesApiError):

@@ -54,7 +54,9 @@ def setup(validator_label: str, challenge_validation_solution_id: str) -> tuple[
 
 def cleanup(folder_name: str) -> None:
     """Remove generated folders"""
-
-    bt.logging.info("🗑️ Cleaning up folders.")
-    bt.logging.info("\tCleaning up folders")
-    shutil.rmtree(folder_name, ignore_errors=True)
+    bt.logging.info(f"🗑️ Cleaning up solution folder: {folder_name}")
+    try:
+        shutil.rmtree(folder_name, ignore_errors=False)
+        bt.logging.info(f"🗑️ Successfully removed folder {folder_name}")
+    except Exception as e:
+        bt.logging.warning(f"⚠️ Failed to remove folder {folder_name}: {e} (ignored)")

@@ -33,6 +33,7 @@ from qbittensor.database.db_connection import DBConnection
 from qbittensor.utils.services.challenges import ChallengesClient
 
 from qbittensor.utils.transfer_proof import verify_transfer_proof_for_synapse
+from qbittensor.utils.services.telemetry import TelemetryService
 
 
 class ResponseProcessor:
@@ -46,6 +47,7 @@ class ResponseProcessor:
         database_connection: DBConnection,
         subtensor: bt.Subtensor,
         platform_client: ChallengesClient,
+        telemetry_service: TelemetryService | None = None,
     ):
 
         # Setup object references
@@ -56,6 +58,7 @@ class ResponseProcessor:
         self.database_connection: DBConnection = database_connection
         self.subtensor: bt.Subtensor = subtensor
         self.platform_client: ChallengesClient = platform_client
+        self.telemetry_service: TelemetryService | None = telemetry_service
 
     def process_synapses(self, synapses: List[SolutionSynapse] | None, validator_busy: bool) -> None:
         """Process inbound synapses from miners"""
@@ -80,6 +83,24 @@ class ResponseProcessor:
             # Guard: some synapses may arrive without a solution candidate
             if synapse.solution_candidate is None:
                 continue
+
+            bt.logging.info(
+                f"📥 Received SolutionSynapse WITH DATA from miner {miner_hotkey} | "
+                f"tx={synapse.tx_hash} | milestone={synapse.solution_candidate.challenge_milestone_id} | "
+                f"upload_id={synapse.solution_candidate.upload_endpoint_id}"
+            )
+
+            if self.telemetry_service:
+                self.telemetry_service.record_event(
+                    "solution_received",
+                    value=1,
+                    miner_hotkey=miner_hotkey,
+                    attributes={
+                        "tx_hash": synapse.tx_hash,
+                        "challenge_milestone_id": synapse.solution_candidate.challenge_milestone_id,
+                        "upload_endpoint_id": synapse.solution_candidate.upload_endpoint_id,
+                    },
+                )
 
             transfer_proof = TransferProof(
                 tx_hash=synapse.tx_hash or "",
@@ -125,11 +146,22 @@ class ResponseProcessor:
             if proof_ok:
                 bt.logging.info("✅ Transfer proof verification passed, continuing with solution processing...")
 
+                if self.telemetry_service:
+                    self.telemetry_service.record_event(
+                        "transfer_proof_verified",
+                        value=1,
+                        miner_hotkey=miner_hotkey,
+                        attributes={
+                            "tx_hash": synapse.tx_hash,
+                            "result": "success",
+                        },
+                    )
+
                 bt.logging.info("📸 Recording maintenance incentive for valid payment")
                 ok = self.database_connection.db_query.insert_for_maintenance_incentive(
                     miner_hotkey=miner_hotkey,
                     challenge_milestone_id=synapse.solution_candidate.challenge_milestone_id,
-                    tx_hash=synapse.tx_hash
+                    tx_hash=synapse.tx_hash,
                 )
                 if not ok:
                     bt.logging.warning(
@@ -138,6 +170,18 @@ class ResponseProcessor:
                     )
             elif synapse.solution_candidate is not None and not proof_ok:
                 bt.logging.error(f"❌ Transfer proof verification failed for tx hash {synapse.tx_hash}: {proof_err}")
+
+                if self.telemetry_service:
+                    self.telemetry_service.record_event(
+                        "transfer_proof_verified",
+                        value=0,
+                        miner_hotkey=miner_hotkey,
+                        attributes={
+                            "tx_hash": synapse.tx_hash,
+                            "result": "failure",
+                            "error": str(proof_err)[:200] if proof_err else None,
+                        },
+                    )
                 continue
             else:
                 continue
@@ -164,40 +208,96 @@ class ResponseProcessor:
                 transfer_proof_signature_hex=getattr(synapse, "transfer_proof_signature_hex", None),
             )
 
-            response = self.platform_client.submit_solution(
-                milestone_id=solution_candidate.challenge_milestone_id,
-                payload=payload,
-            )
-
-            if response is None:
-                # 202 (normal duplicate or busy claim) or other non-success
-                continue
-
-            if validator_busy:
+            try:
                 bt.logging.info(
-                    f"⏸️  Validator busy — successfully claimed tx_hash {synapse.tx_hash} on platform "
-                    "(will not execute this cycle). Platform will re-offer via /next when capacity exists."
+                    f"🚀 Submitting solution to platform (cloud) for tx={synapse.tx_hash} "
+                    f"miner={miner_hotkey} milestone={solution_candidate.challenge_milestone_id}"
                 )
+
+                if self.telemetry_service:
+                    self.telemetry_service.record_event(
+                        "platform_submission",
+                        value=1,
+                        miner_hotkey=miner_hotkey,
+                        attributes={
+                            "tx_hash": synapse.tx_hash,
+                            "milestone_id": solution_candidate.challenge_milestone_id,
+                            "upload_endpoint_id": solution_candidate.upload_endpoint_id,
+                            "stage": "request",
+                        },
+                    )
+
+                response = self.platform_client.submit_solution(
+                    milestone_id=solution_candidate.challenge_milestone_id,
+                    payload=payload,
+                )
+
+                if response is None:
+                    # 202 (already exists / busy claim) or auth/4xx/5xx handled inside client
+                    bt.logging.info(
+                        f"ℹ️  Platform returned no response object for tx={synapse.tx_hash} "
+                        "(202 duplicate/busy or error — see prior logs). Continuing."
+                    )
+
+                    if self.telemetry_service:
+                        self.telemetry_service.record_event(
+                            "platform_submission",
+                            value=0,
+                            miner_hotkey=miner_hotkey,
+                            attributes={
+                                "tx_hash": synapse.tx_hash,
+                                "outcome": "202_or_error",
+                            },
+                        )
+                    continue
+
+                if self.telemetry_service:
+                    self.telemetry_service.record_event(
+                        "platform_submission",
+                        value=1,
+                        miner_hotkey=miner_hotkey,
+                        attributes={
+                            "tx_hash": synapse.tx_hash,
+                            "submission_id": getattr(response, "id", None),
+                            "outcome": "claimed",
+                        },
+                    )
+
+                if validator_busy:
+                    bt.logging.info(
+                        f"⏸️  Validator busy — successfully claimed tx_hash {synapse.tx_hash} on platform "
+                        "(will not execute this cycle). Platform will re-offer via /next when capacity exists."
+                    )
+                    continue
+
+                # Extract the download url and run the solution
+                download_url: str = response.file_download_url
+
+                image_name, container_id, folder_name = execute_verified_solution(
+                    db_conn=self.database_connection,
+                    platform_client=self.platform_client,
+                    validator_label=self.validator_label,
+                    download_url=download_url,
+                    challenge_id=challenge_id,
+                    challenge_milestone_id=solution_candidate.challenge_milestone_id,
+                    challenge_validation_solution_id=solution_candidate.upload_endpoint_id,
+                    submission_id=response.id,
+                    tx_hash=synapse.tx_hash,
+                    miner_hotkey=miner_hotkey,
+                    telemetry_service=self.telemetry_service,
+                )
+
+                bt.logging.info(f"Started solution with image name {image_name} and container id {container_id}. Solution files are located in {folder_name}")
+                solution_started = True
+
+            except Exception as exc:
+                bt.logging.error(
+                    f"❌ Unexpected error while processing synapse from UID {uid} "
+                    f"(miner {miner_hotkey}, tx={synapse.tx_hash}): {type(exc).__name__}: {exc}",
+                    exc_info=True,
+                )
+                # Do not let one bad synapse kill the rest of the round
                 continue
-
-            # Extract the download url and run the solution
-            download_url: str = response.file_download_url
-
-            image_name, container_id, folder_name = execute_verified_solution(
-                db_conn=self.database_connection,
-                platform_client=self.platform_client,
-                validator_label=self.validator_label,
-                download_url=download_url,
-                challenge_id=challenge_id,
-                challenge_milestone_id=solution_candidate.challenge_milestone_id,
-                challenge_validation_solution_id=solution_candidate.upload_endpoint_id,
-                submission_id=response.id,
-                tx_hash=synapse.tx_hash,
-                miner_hotkey=miner_hotkey,
-            )
-
-            bt.logging.info(f"Started solution with image name {image_name} and container id {container_id}. Solution files are located in {folder_name}")
-            solution_started = True
 
     def _log_platform_submission_error(self, response: Response) -> None:
         """Parse and log platform submission errors using the standard error envelope."""

@@ -77,3 +77,28 @@ def get_random_uids(self, k: int, exclude: List[int] = None) -> np.ndarray:
         )
     uids = np.array(random.sample(available_uids, k))
     return uids
+
+
+def is_valid_miner_axon(axon: "bt.AxonInfo") -> bool:
+    """
+    Returns True only for axons we should actually attempt to connect to.
+
+    Rejects:
+    - Axons that are not currently serving
+    - 0.0.0.0 (and empty) IPs — these are placeholders and will never succeed
+    - port 0 or None (unannounced)
+    """
+    if axon is None:
+        return False
+    if not getattr(axon, "is_serving", False):
+        return False
+
+    ip = (getattr(axon, "ip", "") or "").strip()
+    if ip in ("0.0.0.0", "0.0.0.0.0", "", "0.0.0"):
+        return False
+
+    port = getattr(axon, "port", 0)
+    if not port or port == 0:
+        return False
+
+    return True

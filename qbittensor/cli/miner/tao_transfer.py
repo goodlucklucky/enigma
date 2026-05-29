@@ -28,6 +28,9 @@ from rich.text import Text
 
 from qbittensor.utils.transfer_proof import TRANSFER_DEST_SS58
 
+# Version string embedded in the on-chain remark for this proof format.
+FEE_BINDING_REMARK_VERSION = "enigma/fee-binding/v1"
+
 
 @dataclass(frozen=True)
 class TransferProofTx:
@@ -51,50 +54,106 @@ def transfer_proof_tx_from_receipt(response: Any) -> TransferProofTx:
     return TransferProofTx(extrinsic_hash=str(ex_hash), block_hash=str(block_hash))
 
 
+def build_fee_binding_remark(
+    *,
+    miner_hotkey: str,
+    milestone_id: str,
+    upload_endpoint_id: str,
+    amount_rao: str,
+) -> bytes:
+    """
+    Build the canonical remark payload that will be included in the on-chain
+    Utility.batch_all transaction.
+
+    This data is signed by the fee-paying coldkey at payment time and becomes
+    the authoritative on-chain binding between the payment and the specific
+    submission.
+    """
+    lines = [
+        FEE_BINDING_REMARK_VERSION,
+        f"miner_hotkey:{miner_hotkey}",
+        f"milestone_id:{milestone_id}",
+        f"upload_endpoint_id:{upload_endpoint_id}",
+        f"amount_rao:{amount_rao}",
+    ]
+    return "\n".join(lines).encode("utf-8")
+
+
 def transfer_fee_extrinsic_subtensor(
     *,
     subtensor: bt.Subtensor,
     source_ss58: str,
-    source_mnemonic: str,
+    keypair: Keypair,
     fee_tao: float,
+    miner_hotkey: str,
+    milestone_id: str,
+    upload_endpoint_id: str,
 ) -> TransferProofTx:
     """
-    Submit Balances.transfer_keep_alive for the explicitly supplied fee_tao (RAO value)
-    to TRANSFER_DEST_SS58. fee_tao MUST come from a successful call to
-    ChallengesClient.get_milestone_price_tao(challenge_id=..., milestone_id=...)
-    (or the convenience get_milestone_transfer_amount_rao()). No internal fallback is permitted.
-    Raises ValueError on any failure.
+    Submit the fee payment as a Utility.batch_all containing:
+      - Balances.transfer_keep_alive
+      - System.remark_with_event (the canonical binding data)
+
+    The provided Keypair (from the fee coldkey) signs the entire batch.
+
+    fee_tao MUST come from the Challenges API.
     """
-    if fee_tao is None:
+    if fee_tao is None or fee_tao <= 0:
         raise ValueError("fee_tao is required and must be obtained from the Challenges API")
-    phrase = (source_mnemonic or "").strip()
-    if not phrase:
-        raise ValueError("A mnemonic/seed phrase is required to sign the transfer.")
-    try:
-        keypair = Keypair.create_from_mnemonic(phrase)
-    except Exception as e:
-        raise ValueError(f"Invalid mnemonic/seed phrase: {e}") from e
+
     if keypair.ss58_address != source_ss58:
-        raise ValueError("Source SS58 does not match the provided mnemonic's address.")
+        raise ValueError("Source SS58 does not match the provided keypair's address.")
+
+    amount_rao = str(int(bt.Balance.from_tao(fee_tao).rao))
+
+    # Build the two calls
     transfer_call = subtensor.substrate.compose_call(
         call_module="Balances",
         call_function="transfer_keep_alive",
         call_params={
             "dest": TRANSFER_DEST_SS58,
-            "value": bt.Balance.from_tao(fee_tao).rao,
+            "value": int(amount_rao),
         },
     )
+
+    remark_data = build_fee_binding_remark(
+        miner_hotkey=miner_hotkey,
+        milestone_id=milestone_id,
+        upload_endpoint_id=upload_endpoint_id,
+        amount_rao=amount_rao,
+    )
+
+    remark_call = subtensor.substrate.compose_call(
+        call_module="System",
+        call_function="remark_with_event",
+        call_params={
+            "remark": remark_data,
+        },
+    )
+
+    # Batch them atomically. The coldkey signs the whole batch.
+    batch_call = subtensor.substrate.compose_call(
+        call_module="Utility",
+        call_function="batch_all",
+        call_params={
+            "calls": [transfer_call, remark_call],
+        },
+    )
+
     extrinsic = subtensor.substrate.create_signed_extrinsic(
-        call=transfer_call,
+        call=batch_call,
         keypair=keypair,
     )
+
     response = subtensor.substrate.submit_extrinsic(
         extrinsic,
         wait_for_inclusion=True,
         wait_for_finalization=False,
     )
+
     if not response.is_success:
-        raise ValueError(f"Transfer extrinsic failed: {response.error_message}")
+        raise ValueError(f"Fee payment batch failed: {response.error_message}")
+
     return transfer_proof_tx_from_receipt(response)
 
 
@@ -102,20 +161,27 @@ def transfer_tao_for_submission(
     *,
     console: Console,
     source_ss58: str,
-    source_mnemonic: str,
+    keypair: Keypair,
     network: str,
     fee_tao: float,
-    milestone_id: str | None = None,
-    challenge_id: str | None = None,
+    miner_hotkey: str,
+    milestone_id: str,
+    upload_endpoint_id: str,
 ) -> TransferProofTx:
-    """Submit TAO transfer and return extrinsic + inclusion block hash for verification.
+    """
+    High-level helper used by the miner CLI.
 
-    fee_tao MUST be provided by the caller (obtained via
-    ChallengesClient.get_milestone_price_tao(challenge_id=..., milestone_id=...)
-    or get_milestone_transfer_amount_rao()). This function does not perform any Challenges API calls itself.
+    Performs the on-chain fee payment:
+    - Batch containing transfer + remark
+    - Signed by the fee coldkey (via the provided Keypair)
+
+    All binding data is embedded in the on-chain remark at payment time.
     """
     if not milestone_id:
         raise click.ClickException("milestone_id is required")
+
+    if not upload_endpoint_id:
+        raise click.ClickException("upload_endpoint_id is required for the new proof format")
 
     if fee_tao is None or fee_tao <= 0:
         raise click.ClickException("fee_tao is required and must be greater than 0")
@@ -132,13 +198,16 @@ def transfer_tao_for_submission(
             proof_tx = transfer_fee_extrinsic_subtensor(
                 subtensor=subtensor,
                 source_ss58=source_ss58,
-                source_mnemonic=source_mnemonic,
+                keypair=keypair,
                 fee_tao=fee_tao,
+                miner_hotkey=miner_hotkey,
+                milestone_id=milestone_id,
+                upload_endpoint_id=upload_endpoint_id,
             )
     except ValueError as e:
-        raise click.ClickException(f"Transfer transaction failed: {e}") from e
+        raise click.ClickException(f"Fee payment transaction failed: {e}") from e
     except Exception as e:
-        raise click.ClickException(f"Transfer transaction failed: {e}") from e
+        raise click.ClickException(f"Fee payment transaction failed: {e}") from e
 
     console.print(
         Text(

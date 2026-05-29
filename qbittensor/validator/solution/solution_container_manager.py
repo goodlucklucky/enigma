@@ -37,16 +37,19 @@ class SolutionContainerManager:
         self.LABEL = validator_label
 
     def run(self) -> None:
-        bt.logging.info("🐳 Checking on solution containers")
+        bt.logging.info("🐳 Starting periodic solution container check (pruning, completed, overdue)")
 
         self.handle_completed_solutions()
 
         number_of_running_solutions: int = self._get_number_of_running_solutions()
-        bt.logging.info(f"🏗️ Found {number_of_running_solutions} containers running")
+        bt.logging.info(f"🏗️ Found {number_of_running_solutions} containers still running")
 
         overdue_containers: List[str] = self._get_overdue_containers()
         if len(overdue_containers) > 0:
+            bt.logging.info(f"⏰ Found {len(overdue_containers)} overdue containers to terminate")
             self._terminate_overdue_containers(overdue_containers)
+        else:
+            bt.logging.debug("No overdue containers found this check")
 
         self.database_connection.db_query.prune_old_solutions()
 
@@ -58,6 +61,16 @@ class SolutionContainerManager:
         bt.logging.info(f"✅ Found {len(completed_containers)} completed containers")
         if len(completed_containers) == 0:
             return
+
+        # Log per-container exit details for visibility
+        for name in completed_containers:
+            details = self._get_container_exit_details(name)
+            exit_msg = f"exit_code={details['exit_code']}"
+            if details.get("error"):
+                exit_msg += f", error='{details['error']}'"
+            if details.get("finished_at"):
+                exit_msg += f", finished_at={details['finished_at']}"
+            bt.logging.info(f"📦 Container '{name}' has exited ({exit_msg})")
 
         # Pull each completed container's stdout via ``docker logs`` and split it into
         # the run's log file and the run's solution-output zip before validation reads
@@ -101,6 +114,7 @@ class SolutionContainerManager:
         self._clean_up_solutions(solution_locations)
 
     def _clean_up_solutions(self, solution_locations: List[str]) -> None:
+        cleaned = 0
         for location in solution_locations:
             bt.logging.info(f"🧹 Cleaning up solution at {location}")
 
@@ -115,9 +129,19 @@ class SolutionContainerManager:
                         )
                         continue
                     bt.logging.info(f"🛑 Stopping container {container_name}")
-                    subprocess.run(["docker", "stop", container_name], check=False)
+                    stop_res = subprocess.run(["docker", "stop", container_name], check=False, capture_output=True, text=True)
+                    if stop_res.returncode == 0:
+                        bt.logging.info(f"🛑 Stopped container {container_name}")
+                    else:
+                        bt.logging.warning(f"⚠️ Stop may have failed for {container_name}")
+
                     bt.logging.info(f"🗑️ Removing container {container_name}")
-                    subprocess.run(["docker", "rm", "-v", container_name], check=False)
+                    rm_res = subprocess.run(["docker", "rm", "-v", container_name], check=False, capture_output=True, text=True)
+                    if rm_res.returncode == 0:
+                        bt.logging.info(f"🗑️ Removed container {container_name}")
+                    else:
+                        bt.logging.warning(f"⚠️ Failed to remove container {container_name}: {(rm_res.stderr or rm_res.stdout).strip()}")
+
                 if image_id:
                     if not self._image_ref_owned_by_validator(image_id):
                         bt.logging.warning(
@@ -125,13 +149,25 @@ class SolutionContainerManager:
                         )
                     else:
                         bt.logging.info(f"🗑️ Removing image {image_id}")
-                        subprocess.run(["docker", "rmi", "-f", image_id], check=False)
+                        rmi_res = subprocess.run(["docker", "rmi", "-f", image_id], check=False, capture_output=True, text=True)
+                        if rmi_res.returncode == 0:
+                            bt.logging.info(f"🗑️ Removed image {image_id}")
+                        else:
+                            bt.logging.warning(f"⚠️ Failed to remove image {image_id}: {(rmi_res.stderr or rmi_res.stdout).strip()}")
 
                 bt.logging.info(f"🗑️ Removing solution folder {location}")
-                subprocess.run(["rm", "-rf", location], check=False)
+                rmf_res = subprocess.run(["rm", "-rf", location], check=False, capture_output=True, text=True)
+                if rmf_res.returncode == 0:
+                    bt.logging.info(f"🗑️ Removed solution folder {location}")
+                    cleaned += 1
+                else:
+                    bt.logging.warning(f"⚠️ Failed to remove folder {location}")
 
             except Exception as e:
                 bt.logging.error(f"❌ Failed to clean up solution at {location}: {e}")
+
+        if solution_locations:
+            bt.logging.info(f"🧹 Cleaned up {cleaned}/{len(solution_locations)} solution locations")
 
     def _find_completed_solutions(self) -> List[str]:
         """Find containers that have completed their run and are ready for output validation"""
@@ -148,6 +184,23 @@ class SolutionContainerManager:
         except Exception as e:
             bt.logging.error(f"❌ Failed to list completed containers: {e}")
             return []
+
+    def _get_container_exit_details(self, container_name: str) -> dict:
+        """Inspect a container to get exit code and error reason (best effort)."""
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.ExitCode}}|{{.State.Error}}|{{.State.FinishedAt}}", container_name],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parts = result.stdout.strip().split("|", 2)
+            exit_code = int(parts[0]) if parts[0].isdigit() else -1
+            error = parts[1] if len(parts) > 1 else ""
+            finished_at = parts[2] if len(parts) > 2 else ""
+            return {"exit_code": exit_code, "error": error, "finished_at": finished_at}
+        except Exception:
+            return {"exit_code": -1, "error": "", "finished_at": ""}
 
     def _find_location_of_completed_solutions(self, container_names: List[str]) -> List[str]:
         """Find the host folder locations of completed solutions"""
@@ -290,7 +343,9 @@ class SolutionContainerManager:
 
     def _terminate_overdue_containers(self, overdue_containers: List[str]) -> None:
         """Terminate all overdue containers"""
-        bt.logging.info(f"Terminating {len(overdue_containers)} overdue solutions")
+        bt.logging.info(f"🛑 Starting termination of {len(overdue_containers)} overdue solutions (runtime exceeded MAX_SOLUTION_RUNTIME)")
+        terminated = 0
+        images_removed = 0
         for cid in overdue_containers:
             if not self._container_has_validator_label(cid):
                 bt.logging.warning(
@@ -310,22 +365,41 @@ class SolutionContainerManager:
                     f"no image reference matched validator-owned naming (config={config_image!r}, db={db_image!r})"
                 )
             try:
-                bt.logging.info(f"🛑 Stopping container {cid}")
-                subprocess.run(["docker", "stop", cid], check=False)
+                bt.logging.info(f"🛑 Stopping overdue container {cid}")
+                stop_result = subprocess.run(["docker", "stop", cid], check=False, capture_output=True, text=True)
+                if stop_result.returncode == 0:
+                    bt.logging.info(f"🛑 Stopped overdue container {cid}")
+                else:
+                    bt.logging.warning(f"⚠️ Stop may have failed for {cid}: {(stop_result.stderr or stop_result.stdout).strip()}")
             except Exception as e:
                 bt.logging.error(f"❌ Error stopping container {cid}: {e}")
             try:
-                bt.logging.info(f"🗑️ Removing container {cid}")
-                subprocess.run(["docker", "rm", "-v", cid], check=False)
+                bt.logging.info(f"🗑️ Removing overdue container {cid}")
+                rm_result = subprocess.run(["docker", "rm", "-v", cid], check=False, capture_output=True, text=True)
+                if rm_result.returncode == 0:
+                    bt.logging.info(f"🗑️ Removed overdue container {cid}")
+                    terminated += 1
+                else:
+                    bt.logging.warning(f"⚠️ Failed to remove container {cid}: {(rm_result.stderr or rm_result.stdout).strip()}")
             except Exception as e:
                 bt.logging.error(f"❌ Error removing container {cid}: {e}")
             if image_to_remove:
-                bt.logging.info(f"🗑️ Removing overdue solution image {image_to_remove}")
-                subprocess.run(["docker", "rmi", "-f", image_to_remove], check=False)
+                try:
+                    bt.logging.info(f"🗑️ Removing overdue solution image {image_to_remove}")
+                    rmi_result = subprocess.run(["docker", "rmi", "-f", image_to_remove], check=False, capture_output=True, text=True)
+                    if rmi_result.returncode == 0:
+                        bt.logging.info(f"🗑️ Removed overdue image {image_to_remove}")
+                        images_removed += 1
+                    else:
+                        bt.logging.info(f"❌ Failed to remove image {image_to_remove}: {(rmi_result.stderr or rmi_result.stdout).strip()}")
+                except Exception as e:
+                    bt.logging.error(f"❌ Error removing image {image_to_remove}: {e}")
+
+        bt.logging.info(f"🛑 Overdue termination complete: {terminated} containers terminated, {images_removed} images removed")
 
     def _prune_containers(self) -> None:
         """Remove exited containers with our label and their images when image names match this validator."""
-        bt.logging.info("🗑️ Pruning exited solution containers and validator-owned images")
+        bt.logging.info("🗑️ Starting prune of exited solution containers and validator-owned images")
         try:
             cmd = [
                 "docker",
@@ -345,6 +419,10 @@ class SolutionContainerManager:
                 check=True,
             )
             exited = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+            bt.logging.info(f"🗑️ Found {len(exited)} exited containers to consider for pruning")
+
+            pruned_containers = 0
+            pruned_images = 0
             for cid in exited:
                 if not self._container_has_validator_label(cid):
                     bt.logging.warning(
@@ -353,9 +431,15 @@ class SolutionContainerManager:
                     continue
                 config_image = self._inspect_container_config_image(cid)
                 try:
-                    subprocess.run(["docker", "rm", "-v", cid], check=False)
+                    rm_result = subprocess.run(["docker", "rm", "-v", cid], check=False, capture_output=True, text=True)
+                    if rm_result.returncode == 0:
+                        bt.logging.info(f"🗑️ Pruned container {cid}")
+                        pruned_containers += 1
+                    else:
+                        bt.logging.warning(f"⚠️ Failed to prune container {cid}: {(rm_result.stderr or rm_result.stdout).strip()}")
                 except Exception as e:
                     bt.logging.error(f"❌ Failed to remove container {cid}: {e}")
+
                 if not config_image or not self._image_ref_owned_by_validator(config_image):
                     bt.logging.warning(
                         f"⚠️ Skipping image removal for pruned container {cid}; "
@@ -363,15 +447,22 @@ class SolutionContainerManager:
                     )
                     continue
                 try:
-                    subprocess.run(["docker", "rmi", "-f", config_image], check=False)
+                    rmi_result = subprocess.run(["docker", "rmi", "-f", config_image], check=False, capture_output=True, text=True)
+                    if rmi_result.returncode == 0:
+                        bt.logging.info(f"🗑️ Pruned image {config_image}")
+                        pruned_images += 1
+                    else:
+                        bt.logging.info(f"❌ Failed to prune image {config_image}: {(rmi_result.stderr or rmi_result.stdout).strip()}")
                 except Exception as e:
                     bt.logging.info(f"❌ Failed to remove image {config_image}: {e}")
+
+            bt.logging.info(f"🗑️ Prune complete: {pruned_containers} containers, {pruned_images} images removed")
         except Exception as e:
             bt.logging.error(f"❌ Failed to prune containers/images: {e}")
 
     def _clean_up_orphaned_solutions(self, container_name: str) -> None:
         """If we find a container that has no associated solution location, we should remove it to free up resources"""
-        bt.logging.info(f"🧹 Cleaning up orphaned container {container_name}")
+        bt.logging.info(f"🧹 Cleaning up orphaned container {container_name} (no DB location)")
         try:
             if not self._container_has_validator_label(container_name):
                 bt.logging.warning(
@@ -379,16 +470,29 @@ class SolutionContainerManager:
                     f"validator label {self.LABEL} not found"
                 )
                 return
-            bt.logging.info(f"🛑 Stopping container {container_name}")
-            subprocess.run(["docker", "stop", container_name], check=False)
-            bt.logging.info(f"🗑️ Removing container {container_name}")
-            subprocess.run(["docker", "rm", "-v", container_name], check=False)
+            bt.logging.info(f"🛑 Stopping orphaned container {container_name}")
+            stop_res = subprocess.run(["docker", "stop", container_name], check=False, capture_output=True, text=True)
+            if stop_res.returncode == 0:
+                bt.logging.info(f"🛑 Stopped orphaned container {container_name}")
+            else:
+                bt.logging.warning(f"⚠️ Stop may have failed for orphaned {container_name}")
+
+            bt.logging.info(f"🗑️ Removing orphaned container {container_name}")
+            rm_res = subprocess.run(["docker", "rm", "-v", container_name], check=False, capture_output=True, text=True)
+            if rm_res.returncode == 0:
+                bt.logging.info(f"🗑️ Removed orphaned container {container_name}")
+            else:
+                bt.logging.warning(f"⚠️ Failed to remove orphaned container {container_name}")
 
             # clean up image as well, if we can find it in the db
             image_id = self.database_connection.db_query.get_image_id_by_container_name(container_name)
             if image_id and self._image_ref_owned_by_validator(image_id):
-                bt.logging.info(f"🗑️ Removing image {image_id}")
-                subprocess.run(["docker", "rmi", "-f", image_id], check=False)
+                bt.logging.info(f"🗑️ Removing orphan image {image_id}")
+                rmi_res = subprocess.run(["docker", "rmi", "-f", image_id], check=False, capture_output=True, text=True)
+                if rmi_res.returncode == 0:
+                    bt.logging.info(f"🗑️ Removed orphan image {image_id}")
+                else:
+                    bt.logging.warning(f"⚠️ Failed to remove orphan image {image_id}")
             elif image_id:
                 bt.logging.warning(
                     f"⚠️ Refusing to remove orphan image {image_id}; name does not match validator label prefix"

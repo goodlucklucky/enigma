@@ -34,6 +34,9 @@ except ImportError:  # pragma: no cover
 
 TRANSFER_PROOF_VERSION = "quantum-innovate/transfer-proof/v1"
 
+# Remark version (must match what the CLI puts in the remark)
+FEE_BINDING_REMARK_VERSION = "enigma/fee-binding/v1"
+
 
 def build_transfer_proof_message(
     *,
@@ -143,23 +146,114 @@ def _get_call_dict_from_extrinsic(extrinsic: Any) -> dict[str, Any] | None:
     return cv or None
 
 
-def _parse_balances_transfer_keep_alive(extrinsic: Any) -> tuple[Any, int] | None:
+def _get_calls_from_batch(extrinsic: Any) -> list[dict]:
+    """
+    Return the list of inner calls if this extrinsic is a Utility.batch_all / batch.
+
+    Handles both:
+    - substrate-interface decoded objects (have .value)
+    - plain dicts (useful for testing)
+    """
+    # Try the standard path first (works for real decoded extrinsics)
     cv = _get_call_dict_from_extrinsic(extrinsic)
     if not cv:
-        return None
-    if cv.get("call_module") != "Balances":
-        return None
-    if cv.get("call_function") != "transfer_keep_alive":
-        return None
+        # Fallback: the caller might have passed the raw dict already
+        if isinstance(extrinsic, dict):
+            cv = _call_value_as_dict(extrinsic.get("call"))
+        else:
+            return []
+
+    if not cv:
+        return []
+
+    if cv.get("call_module") not in ("Utility",):
+        return []
+    if cv.get("call_function") not in ("batch_all", "batch"):
+        return []
+
     args = _args_as_dict(cv.get("call_args"))
-    dest = args.get("dest")
-    raw_val = args.get("value")
-    if raw_val is None:
-        return None
-    return dest, _coerce_int_rao(raw_val)
+    calls = args.get("calls") or []
+    if isinstance(calls, list):
+        return calls
+    return []
 
 
-def _verify_transfer_extrinsic_on_chain(
+def _find_transfer_in_calls(calls: list[dict]) -> tuple[Any, int] | None:
+    """Look for a Balances.transfer_keep_alive inside a list of calls."""
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        module = call.get("call_module") or call.get("module")
+        func = call.get("call_function") or call.get("function")
+        if module != "Balances" or func != "transfer_keep_alive":
+            continue
+        args = _args_as_dict(call.get("call_args") or call.get("args"))
+        dest = args.get("dest")
+        raw_val = args.get("value")
+        if raw_val is None:
+            continue
+        return dest, _coerce_int_rao(raw_val)
+    return None
+
+
+def _find_remark_data_in_calls(calls: list[dict]) -> bytes | None:
+    """Look for a System.remark or System.remark_with_event and return its data as bytes."""
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        module = call.get("call_module") or call.get("module")
+        func = call.get("call_function") or call.get("function")
+        if module != "System" or func not in ("remark", "remark_with_event"):
+            continue
+        args = _args_as_dict(call.get("call_args") or call.get("args"))
+        remark = args.get("remark") or args.get("data")
+        if remark is None:
+            continue
+        if isinstance(remark, (bytes, bytearray)):
+            return bytes(remark)
+        if isinstance(remark, str):
+            return remark.encode("utf-8")
+        # Sometimes substrate returns a list of ints
+        if isinstance(remark, (list, tuple)):
+            try:
+                return bytes(remark)
+            except Exception:
+                pass
+    return None
+
+
+def parse_fee_binding_remark(remark_bytes: bytes) -> dict[str, str]:
+    """
+    Parse the canonical remark produced by the CLI.
+
+    Expected format (utf-8 lines):
+        enigma/fee-binding/v1
+        miner_hotkey:<ss58>
+        milestone_id:<id>
+        upload_endpoint_id:<id>
+        amount_rao:<int>
+
+    Returns a dict with the parsed fields (only known keys).
+    """
+    try:
+        text = remark_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key in ("miner_hotkey", "milestone_id", "upload_endpoint_id", "amount_rao"):
+            result[key] = value
+    return result
+
+
+def _verify_batch_fee_payment_on_chain(
     *,
     substrate: Any,
     block_hash: str,
@@ -167,7 +261,13 @@ def _verify_transfer_extrinsic_on_chain(
     expected_signer_ss58: str,
     expected_dest_ss58: str,
     expected_value_rao: int,
+    expected_remark_prefix: str = FEE_BINDING_REMARK_VERSION,
 ) -> tuple[bool, str]:
+    """
+    Verify that the extrinsic is a successful Utility.batch_all containing:
+      - A Balances.transfer_keep_alive to the correct destination and amount
+      - A System.remark* whose data starts with the expected version and contains the binding
+    """
     try:
         receipt = substrate.retrieve_extrinsic_by_hash(
             _normalize_0x_hash(block_hash),
@@ -175,18 +275,14 @@ def _verify_transfer_extrinsic_on_chain(
         )
         receipt.retrieve_extrinsic()
     except ExtrinsicNotFound:
-        return False, "transfer extrinsic not found for block_hash + extrinsic_hash"
+        return False, "fee payment extrinsic not found"
     except Exception as e:
         return False, f"on-chain extrinsic lookup failed: {e}"
 
     if not receipt.is_success:
-        return False, f"transfer extrinsic did not succeed: {receipt.error_message}"
+        return False, f"fee payment extrinsic did not succeed: {receipt.error_message}"
 
-    # Compatibility: some substrate-interface versions expose `.extrinsic`,
-    # others only populate a private field after `retrieve_extrinsic()`.
-    ex = getattr(receipt, "extrinsic", None)
-    if ex is None:
-        ex = getattr(receipt, "_ExtrinsicReceipt__extrinsic", None)
+    ex = getattr(receipt, "extrinsic", None) or getattr(receipt, "_ExtrinsicReceipt__extrinsic", None)
     if ex is None:
         try:
             idx = getattr(receipt, "extrinsic_idx", None)
@@ -196,32 +292,54 @@ def _verify_transfer_extrinsic_on_chain(
                 ex = extrinsics[idx]
         except Exception:
             ex = None
+
     if ex is None:
-        return False, "could not decode transfer extrinsic from receipt"
+        return False, "could not decode fee payment extrinsic"
+
     signer = _signer_ss58(ex, substrate)
     if not signer:
         return False, "could not decode extrinsic signer"
     if signer != expected_signer_ss58:
-        return (
-            False,
-            f"extrinsic signer ({signer}) does not match transfer_from_ss58 ({expected_signer_ss58})",
-        )
+        return False, f"extrinsic signer ({signer}) does not match expected ({expected_signer_ss58})"
 
-    parsed = _parse_balances_transfer_keep_alive(ex)
-    if parsed is None:
-        return False, "extrinsic call is not Balances.transfer_keep_alive"
-    dest_raw, value_rao = parsed
+    calls = _get_calls_from_batch(ex)
+    if not calls:
+        return False, "extrinsic is not a Utility.batch_all / batch (required for fee payments)"
+
+    transfer = _find_transfer_in_calls(calls)
+    if transfer is None:
+        return False, "batch did not contain a Balances.transfer_keep_alive"
+
+    dest_raw, value_rao = transfer
     dest_ss58 = _dest_to_ss58(dest_raw, substrate)
     if dest_ss58 != expected_dest_ss58:
-        return (
-            False,
-            f"on-chain transfer dest ({dest_ss58}) != expected ({expected_dest_ss58})",
-        )
+        return False, f"transfer destination ({dest_ss58}) != expected ({expected_dest_ss58})"
     if value_rao != expected_value_rao:
-        return (
-            False,
-            f"on-chain transfer amount ({value_rao} rao) != expected fee ({expected_value_rao} rao)",
-        )
+        return False, f"transfer amount ({value_rao}) != expected ({expected_value_rao})"
+
+    remark_data = _find_remark_data_in_calls(calls)
+    if remark_data is None:
+        return False, "batch did not contain a System.remark / remark_with_event"
+
+    remark_str = remark_data.decode("utf-8", errors="replace")
+    if not remark_str.startswith(expected_remark_prefix):
+        return False, f"remark does not start with expected version {expected_remark_prefix}"
+
+    # Full remark parsing and validation
+    parsed = parse_fee_binding_remark(remark_data)
+
+    # Amount consistency (on-chain transfer vs remark)
+    try:
+        remark_amount = int(parsed.get("amount_rao", "-1"))
+    except Exception:
+        remark_amount = -1
+    if remark_amount != expected_value_rao:
+        return False, f"remark amount_rao ({remark_amount}) does not match on-chain value ({expected_value_rao})"
+
+    # We do not enforce miner_hotkey / milestone / upload here because those are validated
+    # at a higher level against the `TransferProof` / `SolutionCandidate` by the caller.
+    # The on-chain check's job is to prove the coldkey signed a well-formed binding for *some*
+    # submission; the higher-level verifier ties it to the specific claim.
 
     return True, ""
 
@@ -331,7 +449,8 @@ def verify_transfer_proof_for_synapse(
     if substrate is None:
         return False, "subtensor.substrate is not available for on-chain verification"
 
-    ok, err = _verify_transfer_extrinsic_on_chain(
+    # The payment must be a Utility.batch_all containing transfer + remark
+    ok, err = _verify_batch_fee_payment_on_chain(
         substrate=substrate,
         block_hash=block_hash,
         extrinsic_hash=tx_hash,

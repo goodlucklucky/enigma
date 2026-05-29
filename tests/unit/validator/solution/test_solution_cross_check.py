@@ -108,4 +108,5 @@ class TestSolutionCrossChecker:
             submission_id=submission.id,
             tx_hash=submission.tx_hash,
             miner_hotkey=submission.address,
+            telemetry_service=None,  # telemetry is optional and None in this test setup
         )

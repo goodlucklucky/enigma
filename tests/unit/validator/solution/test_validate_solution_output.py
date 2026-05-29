@@ -85,6 +85,7 @@ class TestPerformSolutionOutputValidation:
             platform_data,  # solution_output_data (same mock is fine for test)
             platform_client,
             db,
+            logs_uploaded=True,
         )
         assert status == SolutionStatus.SUCCESS.value
 
@@ -102,6 +103,7 @@ class TestPerformSolutionOutputValidation:
             platform_data,  # solution_output_data
             platform_client,
             db,
+            logs_uploaded=True,
         )
         assert status == SolutionStatus.FAILED.value
 
@@ -148,7 +150,11 @@ class TestValidateSolutionCorePaths:
         output_path = os.path.join(ws, "output")
         os.makedirs(output_path)
 
-        platform_client.create_verification_upload_url.return_value = Mock(id="log_id", url="log_url")
+        # First call for logs, second for solution_output
+        platform_client.create_verification_upload_url.side_effect = [
+            Mock(id="log_id", url="log_url"),
+            Mock(id="out-id", url="out_url"),
+        ]
         platform_client.report_submission_status.return_value = True
 
         db = Mock()
@@ -156,13 +162,13 @@ class TestValidateSolutionCorePaths:
         db.db_query.get_submission_id_by_solution_location.return_value = "sub1"
 
         with patch("qbittensor.validator.solution.validate_solution_output.verify_upload_locations", return_value=True), \
-                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform"), \
+                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=True):
 
             status = validate_solution(ws, platform_client, db)
             assert status.upper() == "SUCCESS"
             platform_client.report_submission_status.assert_called_with(
-                "sub1", "Success", log_data_key="log_id", output_data_key=ANY
+                "sub1", "Success", log_data_key="log_id", output_data_key="out-id"
             )
 
     def test_perform_validation_failure_reports_failure_with_keys(self, tmp_path, platform_client):
@@ -170,7 +176,11 @@ class TestValidateSolutionCorePaths:
         output_path = os.path.join(ws, "output")
         os.makedirs(output_path)
 
-        platform_client.create_verification_upload_url.return_value = Mock(id="log_id", url="log_url")
+        # First call for logs, second for solution_output
+        platform_client.create_verification_upload_url.side_effect = [
+            Mock(id="log_id", url="log_url"),
+            Mock(id="out-id", url="out_url"),
+        ]
         platform_client.report_submission_status.return_value = True
 
         db = Mock()
@@ -178,11 +188,13 @@ class TestValidateSolutionCorePaths:
         db.db_query.get_submission_id_by_solution_location.return_value = "sub1"
 
         with patch("qbittensor.validator.solution.validate_solution_output.verify_upload_locations", return_value=True), \
-                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform"), \
+                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=False):
 
             status = validate_solution(ws, platform_client, db)
             assert status.upper() == "FAILED"
+            # In this minimal test (no artifacts dir created), the new logic skips output upload
+            # and therefore omits the output_data_key (safer / more accurate)
             platform_client.report_submission_status.assert_called_with(
-                "sub1", "Failure", log_data_key="log_id", output_data_key=ANY
+                "sub1", "Failure", log_data_key="log_id", output_data_key=None
             )

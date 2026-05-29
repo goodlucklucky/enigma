@@ -249,8 +249,15 @@ def add_validator_args(cls, parser):
     parser.add_argument(
         "--neuron.forward_sleep_interval",
         type=int,
-        help="Sleep interval in seconds between forward() calls to rate limit CPU usage.",
+        help="Sleep interval in seconds between forward() calls (lightweight timers + response processing cadence).",
         default=5,
+    )
+
+    parser.add_argument(
+        "--neuron.miner_sweep_interval",
+        type=int,
+        help="Target seconds to attempt contacting every miner at least once (throttles the full round instead of blasting as fast as possible). Default 600s = ~10 minutes per full pass.",
+        default=600,
     )
 
 

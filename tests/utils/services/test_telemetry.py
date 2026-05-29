@@ -26,9 +26,11 @@ from qbittensor.utils.services.telemetry import TelemetryService
 
 @pytest.fixture
 def telemetry_service():
-    request_manager = Mock()
-    with patch.object(TelemetryService, "_start_background_worker"):
-        service = TelemetryService(request_manager=request_manager)
+    mock_rm = Mock()
+    with patch("qbittensor.utils.services.telemetry.RequestManager", return_value=mock_rm):
+        with patch.object(TelemetryService, "_start_background_worker"):
+            service = TelemetryService(keypair=Mock(), base_url="https://example.com")
+    # The service now owns the mock_rm as its request_manager
     return service
 
 

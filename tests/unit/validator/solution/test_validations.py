@@ -24,12 +24,11 @@ from qbittensor.validator.solution.challenge_inputs.challenge_setups import (
     run_challenge_setup,
 )
 from qbittensor.validator.solution.challenge_inputs.mock_solution_setup import mock_solution_setup
+from qbittensor.validator.solution.milestones import MOCK_MILESTONE_ID
 from qbittensor.validator.solution.solution_validations.mock_solution import run as run_mock
 from qbittensor.validator.solution.solution_validations.solution_validator import (
     validate_output,
 )
-
-MOCK_MILESTONE_ID = "75358eeb-0345-4938-8ea6-7e7e657487c7"
 
 
 class TestChallengeSetups:

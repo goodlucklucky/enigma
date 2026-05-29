@@ -39,7 +39,7 @@ class TestMinerModels:
     def test_miner_submission_status_repr(self):
         status = MinerSubmissionStatus(
             challenge_milestone_id="m1",
-            solution_status="Running",
+            solution_status="RUNNING",
             validator_hotkey="5Val",
             tx_hash="0xabc",
         )
@@ -58,7 +58,7 @@ class TestValidatorModels:
             challenge_milestone_id="m1",
             absolute_path_to_solution="/tmp/sol",
             submission_id="sub1",
-            solution_status="Running",
+            solution_status="RUNNING",
             tx_hash="0xabc",
             miner_hotkey="5Miner",
         )
@@ -74,7 +74,7 @@ class TestValidatorModels:
             challenge_milestone_id="m1",
             absolute_path_to_solution="/tmp/sol",
             submission_id="sub1",
-            solution_status="Running",
+            solution_status="RUNNING",
             tx_hash="0xabc",
             miner_hotkey="5Miner",
         )

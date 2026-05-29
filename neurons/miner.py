@@ -57,7 +57,9 @@ class Miner(BaseMinerNeuron):
         )
 
         # Build solution poller
-        self.db_query: DBQueryMiner = DBConnection(database_name_prefix=MINER_DB_TABLE_PREFIX, hotkey=self.wallet.hotkey.ss58_address).db_query_miner
+        db_conn = DBConnection(database_name_prefix=MINER_DB_TABLE_PREFIX, hotkey=self.wallet.hotkey.ss58_address)
+        self.db_query: DBQueryMiner = db_conn.db_query_miner
+        bt.logging.info(f"🗄️  Miner using DB: {db_conn.DB_PATH}")
         self.solution_poller: SolutionPoller = SolutionPoller(db_query=self.db_query)
 
     async def forward(self, synapse: SolutionSynapse) -> SolutionSynapse:
@@ -75,7 +77,10 @@ class Miner(BaseMinerNeuron):
             bt.logging.warning("⛔ Received synapse without a valid dendrite hotkey. Skipping processing.")
             return synapse
 
-        bt.logging.info(f"🔄 Processing synapse from validator {validator_hotkey}")
+        bt.logging.info(
+            f"🔄 Processing synapse from validator {validator_hotkey} "
+            f"(busy={synapse.validator_busy}, has_candidate={synapse.solution_candidate is not None})"
+        )
 
         if synapse.submission_statuses:
             for submission_status in synapse.submission_statuses:
@@ -91,11 +96,10 @@ class Miner(BaseMinerNeuron):
             bt.logging.info("⚠️ Validator is currently busy, not checking for a new solution")
             return synapse
 
-        # Get the data from the local database
-        miner_submission: MinerSubmission | None = self.solution_poller.poll()
+        miner_submission: MinerSubmission | None = self.solution_poller.poll_for_validator(validator_hotkey)
 
         if miner_submission is None:
-            bt.logging.warning("🌿 No miner submission found, skipping synapse")
+            bt.logging.warning("🌿 No miner submission found (or already offered to this validator), skipping synapse")
             return synapse
 
         # If we got a solution from the challenge API
@@ -140,6 +144,17 @@ class Miner(BaseMinerNeuron):
         synapse.transfer_proof_signature_hex = signature.hex()
 
         self.db_query.record_solution_served_to_validator(miner_submission.tx_hash)
+
+        self.db_query.record_submission_offered_to_validator(
+            tx_hash=miner_submission.tx_hash,
+            validator_hotkey=validator_hotkey,
+            challenge_milestone_id=miner_submission.challenge_milestone_id,
+        )
+
+        bt.logging.info(
+            f"✍️  Attached signed transfer proof for tx={miner_submission.tx_hash} "
+            f"and returning enriched synapse to validator"
+        )
 
         # Return the synapse
         return synapse

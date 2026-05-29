@@ -27,7 +27,10 @@ from qbittensor.dto.challenge import (
     ChallengeSubmissionVerifyUploadAddressResponse,
 )
 from qbittensor.utils.request.request_manager import RequestManager
-from qbittensor.utils.services.exceptions import ChallengesApiError
+from qbittensor.utils.services.exceptions import (
+    ChallengesApiError,
+    _parse_platform_error_body,
+)
 
 
 class ChallengesClient:
@@ -42,28 +45,22 @@ class ChallengesClient:
             netuid=netuid,
         )
 
-    Alternative / advanced modes:
-    - Pass a pre-built RequestManager (for tests, custom sessions, etc.).
-    - Pass only base_url for unauthenticated/public reads (no auth/JWT).
+    Public / unauthenticated mode (for read-only queries that don't require JWT):
+        ChallengesClient(base_url=challenges_api_url)
 
-    A fresh RequestManager is created per client instance when using the
-    keypair-based constructor.
+    The client creates and owns its own RequestManager when using the
+    keypair-based constructor. Direct injection of a RequestManager is not supported.
     """
 
     def __init__(
         self,
-        request_manager: Optional[RequestManager] = None,
         base_url: Optional[str] = None,
         *,
         keypair: Optional[bt.Keypair] = None,
         tensorauth_url: Optional[str] = None,
         netuid: Optional[int] = None,
     ):
-        if request_manager is not None:
-            # Advanced / test path: caller supplies a fully configured RM
-            self.request_manager = request_manager
-            self._base_url = base_url
-        elif keypair is not None and base_url is not None:
+        if keypair is not None and base_url is not None:
             # Preferred authenticated path: client owns its RequestManager
             self.request_manager = RequestManager(
                 keypair,
@@ -73,20 +70,18 @@ class ChallengesClient:
             )
             self._base_url = base_url
         elif base_url is not None:
-            # Public / unauthenticated path
+            # Public / unauthenticated path (no RequestManager)
             self.request_manager = None
             self._base_url = base_url
         else:
             raise ValueError(
-                "ChallengesClient requires one of: request_manager, (keypair + base_url), or base_url"
+                "ChallengesClient requires either (keypair + base_url) for authenticated use, or base_url for public reads"
             )
 
     @property
     def base_url(self) -> str:
         if self._base_url:
             return self._base_url
-        # Fallback: try to get from request_manager if available (less ideal)
-        # For now we expect callers to provide it when using public mode.
         raise RuntimeError("base_url was not provided to ChallengesClient")
 
     # ------------------------------------------------------------------
@@ -116,17 +111,38 @@ class ChallengesClient:
                     raise ValueError(f"Unsupported method: {method}")
 
                 if resp.status_code in (401, 403):
+                    details = _parse_platform_error_body(resp.text)
                     raise ChallengesApiError(
                         f"Authentication error during {operation}",
                         status_code=resp.status_code,
                         response_text=resp.text,
+                        error_code=details.get("error_code"),
+                    )
+                if resp.status_code < 200 or resp.status_code > 299:
+                    details = _parse_platform_error_body(resp.text)
+                    msg = details.get("message") or resp.text or f"HTTP {resp.status_code}"
+                    if isinstance(msg, list):
+                        msg = "; ".join(str(m) for m in msg)
+                    raise ChallengesApiError(
+                        f"Error during {operation}: {msg}",
+                        status_code=resp.status_code,
+                        response_text=resp.text,
+                        error_code=details.get("error_code"),
                     )
                 return resp
 
             except ChallengesApiError:
                 raise
             except Exception as e:
-                raise ChallengesApiError(f"Unexpected error during {operation}: {e}") from e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                resp_text = getattr(getattr(e, "response", None), "text", None)
+                details = _parse_platform_error_body(resp_text) if resp_text else {}
+                raise ChallengesApiError(
+                    f"Unexpected error during {operation}: {e}",
+                    status_code=status,
+                    response_text=resp_text,
+                    error_code=details.get("error_code"),
+                ) from e
 
         else:
             # Public / unauthenticated path
@@ -142,13 +158,25 @@ class ChallengesClient:
                 resp.raise_for_status()
                 return resp
             except requests.HTTPError as e:
+                resp_text = e.response.text if e.response else None
+                details = _parse_platform_error_body(resp_text)
+                status = e.response.status_code if e.response else None
                 raise ChallengesApiError(
                     f"HTTP error during {operation}",
-                    status_code=e.response.status_code if e.response else None,
-                    response_text=e.response.text if e.response else str(e),
+                    status_code=status,
+                    response_text=resp_text,
+                    error_code=details.get("error_code"),
                 ) from e
             except Exception as e:
-                raise ChallengesApiError(f"Unexpected error during {operation}: {e}") from e
+                resp_text = getattr(getattr(e, "response", None), "text", None)
+                details = _parse_platform_error_body(resp_text) if resp_text else {}
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                raise ChallengesApiError(
+                    f"Unexpected error during {operation}: {e}",
+                    status_code=status,
+                    response_text=resp_text,
+                    error_code=details.get("error_code"),
+                ) from e
 
     # ------------------------------------------------------------------
     # Public endpoints (no auth required)
@@ -184,18 +212,6 @@ class ChallengesClient:
             f"milestone_id {milestone_id} not found under challenge {challenge_id}"
         )
 
-    def get_milestone_transfer_amount_rao(
-        self, challenge_id: str, milestone_id: str
-    ) -> str:
-        """
-        Convenience helper that returns the expected on-chain transfer amount
-        as a string (in RAO) for a given milestone.
-
-        This is the value that should be used when verifying transfer proofs.
-        """
-        price_tao = self.get_milestone_price_tao(challenge_id, milestone_id)
-        return str(int(bt.Balance.from_tao(price_tao).rao))
-
     # ------------------------------------------------------------------
     # Authenticated endpoints (require RequestManager)
     # ------------------------------------------------------------------
@@ -209,6 +225,13 @@ class ChallengesClient:
             raise RuntimeError("submit_solution requires an authenticated ChallengesClient")
 
         endpoint = f"v1/challenges/milestones/{milestone_id}/submissions"
+
+        upload_id = getattr(payload, "upload_endpoint_id", None)
+        tx = getattr(payload, "tx_hash", None)
+        bt.logging.info(
+            f"📤 POST submit_solution milestone={milestone_id} upload_id={upload_id} tx={tx}"
+        )
+
         try:
             resp = self._request(
                 "post",

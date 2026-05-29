@@ -60,7 +60,13 @@ def validate_solution(solution_workspace_path: str, challenges_client: Challenge
         bt.logging.info("❌ Could not resolve submission for upload locations.")
         return SolutionStatus.FAILED_UPLOAD.value
 
-    upload_zip_to_platform(container_output_path, logs_data, "stdout.log")
+    bt.logging.info("📤 Uploading container stdout logs to platform")
+    logs_uploaded = upload_zip_to_platform(container_output_path, logs_data, "stdout.log")
+    if logs_uploaded:
+        bt.logging.info("✅ Logs upload completed successfully")
+    else:
+        bt.logging.warning("⚠️ Logs upload did not succeed (will still attempt to report status)")
+
     solution_status = perform_solution_output_validation(
         solution_workspace_path,
         container_output_path,
@@ -68,6 +74,7 @@ def validate_solution(solution_workspace_path: str, challenges_client: Challenge
         solution_output_data,
         challenges_client,
         database_connection,
+        logs_uploaded=logs_uploaded,
     )
     return solution_status
 
@@ -114,13 +121,15 @@ def perform_solution_output_validation(
     solution_output_data: ChallengeSubmissionVerifyUploadAddressResponse,
     challenges_client: ChallengesClient,
     database_connection: DBConnection,
+    *,
+    logs_uploaded: bool = True,
 ) -> str:
-    """Perform the actual validation of the solution output
+    """
+    Perform the actual validation of the solution output.
 
-    Args:
-        solution_workspace_path: Extracted solution root (matches DB ``absolute_path_to_solution``).
-        container_output_path: Local directory where the validator wrote stdout logs and
-            extracted artifacts (populated from ``docker logs`` after the container exits).
+    Attempts to upload solution artifacts on both success and failure paths
+    (best effort). Only includes the corresponding data keys in the final
+    report if the upload actually succeeded.
     """
     challenge_milestone_id = database_connection.db_query.get_challenge_milestone_id_by_file_path(solution_workspace_path)
     submission_id = database_connection.db_query.get_submission_id_by_solution_location(solution_workspace_path)
@@ -133,29 +142,53 @@ def perform_solution_output_validation(
     solution_folder_path = os.path.join(container_output_path, CONTAINER_SOLUTION_DIRNAME)
     success: bool = validate_output(solution_folder_path, challenge_milestone_id)
 
+    output_uploaded = False
+
     if success:
         bt.logging.info("\t✅ Solution output valid")
-        upload_zip_to_platform(
+        bt.logging.info("📤 Attempting upload of solution output artifacts (validation passed)...")
+        output_uploaded = upload_zip_to_platform(
             solution_folder_path, solution_output_data, "solution_output", zip_entire_directory=True
         )
-        # Report final status together with the data keys
+
+        report_payload = {
+            "status": "Success",
+            "log_data_key": logs_data.id if logs_uploaded else None,
+            "output_data_key": solution_output_data.id if output_uploaded else None,
+        }
         if challenges_client.report_submission_status(
             submission_id,
-            "Success",
-            log_data_key=logs_data.id,
-            output_data_key=solution_output_data.id,
+            report_payload["status"],
+            log_data_key=report_payload["log_data_key"],
+            output_data_key=report_payload["output_data_key"],
         ):
             bt.logging.info("\t✅ Successfully updated platform with successful validation status")
             return SolutionStatus.SUCCESS.value
         else:
             return SolutionStatus.FAILED_UPLOAD.value
+
     else:
         bt.logging.info("\t❌ Solution output invalid")
+
+        # Best effort: still try to upload whatever artifacts exist so the platform has them
+        bt.logging.info("📤 Attempting upload of solution output artifacts (validation failed) for diagnostics...")
+        if os.path.isdir(solution_folder_path) and any(os.scandir(solution_folder_path)):
+            output_uploaded = upload_zip_to_platform(
+                solution_folder_path, solution_output_data, "solution_output", zip_entire_directory=True
+            )
+        else:
+            bt.logging.info("\tℹ️ No solution artifacts directory found or it is empty — skipping output upload on failure")
+
+        report_payload = {
+            "status": "Failure",
+            "log_data_key": logs_data.id if logs_uploaded else None,
+            "output_data_key": solution_output_data.id if output_uploaded else None,
+        }
         if challenges_client.report_submission_status(
             submission_id,
-            "Failure",
-            log_data_key=logs_data.id,
-            output_data_key=solution_output_data.id,
+            report_payload["status"],
+            log_data_key=report_payload["log_data_key"],
+            output_data_key=report_payload["output_data_key"],
         ):
             bt.logging.info("\t✅ Successfully updated platform with failed validation status")
             return SolutionStatus.FAILED.value
@@ -169,16 +202,22 @@ def upload_zip_to_platform(
     file_name: str,
     *,
     zip_entire_directory: bool = False,
-) -> None:
-    """Zip either a single file under output_file_path or the whole output directory, then PUT to platform_data.url."""
+) -> bool:
+    """
+    Zip either a single file under output_file_path or the whole output directory,
+    then PUT it to the platform using the provided presigned URL.
+
+    Returns True if the upload succeeded (2xx response), False otherwise.
+    """
     base_name = os.path.splitext(file_name)[0]
+    bt.logging.info(f"📤 Attempting upload of '{file_name}' ({'directory' if zip_entire_directory else 'file'}) to platform...")
 
     if zip_entire_directory:
         if not os.path.isdir(output_file_path):
             bt.logging.error(
                 f"❌ Unable to upload directory: output path is not a directory '{output_file_path}'"
             )
-            return
+            return False
         zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix=f"{base_name}_")
         os.close(zip_fd)
         try:
@@ -194,14 +233,14 @@ def upload_zip_to_platform(
                 os.unlink(zip_path)
             except OSError:
                 pass
-            return
+            return False
     else:
         output_txt_path = os.path.join(output_file_path, file_name)
         if not os.path.isfile(output_txt_path):
             bt.logging.error(
                 f"❌ Unable to upload {file_name}: output file not found at '{output_txt_path}'"
             )
-            return
+            return False
 
         zip_path = os.path.join(output_file_path, f"{base_name}.zip")
         try:
@@ -209,7 +248,7 @@ def upload_zip_to_platform(
                 zip_file.write(output_txt_path, arcname=file_name)
         except Exception as e:
             bt.logging.error(f"❌ Failed to zip {file_name}: {e}")
-            return
+            return False
 
     try:
         with open(zip_path, "rb") as zip_file_obj:
@@ -222,13 +261,15 @@ def upload_zip_to_platform(
 
         if response.status_code < 200 or response.status_code > 299:
             bt.logging.error(
-                f"❌ Failed to upload zip. Status code: {response.status_code}, Response: {response.text}"
+                f"❌ Failed to upload '{file_name}'. Status code: {response.status_code}, Response: {response.text}"
             )
-            return
+            return False
 
-        bt.logging.info(f"✅ Uploaded {base_name} zip to platform from '{zip_path}'")
+        bt.logging.info(f"✅ Successfully uploaded '{file_name}' to platform (id={platform_data.id})")
+        return True
     except Exception as e:
-        bt.logging.error(f"❌ Failed to zip and upload {base_name}: {e}")
+        bt.logging.error(f"❌ Exception during upload of '{file_name}': {e}")
+        return False
     finally:
         if zip_entire_directory and os.path.isfile(zip_path):
             try:

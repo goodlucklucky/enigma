@@ -41,7 +41,6 @@ except ImportError:
 class TelemetryService:
     def __init__(
         self,
-        request_manager: Optional[RequestManager] = None,
         device: str = "cpu",
         export_interval_millis=5000,
         max_queue_size=1000,
@@ -59,14 +58,10 @@ class TelemetryService:
         """
         Telemetry / metrics service for validators and miners.
 
-        Recommended: pass keypair + base_url (telemetry) + tensorauth_url + netuid
+        Pass keypair + base_url (telemetry) + tensorauth_url + netuid
         and the service will create its own RequestManager (one RM per client).
-
-        Alternatively, pass a pre-configured request_manager (advanced / testing).
         """
-        if request_manager is not None:
-            self.request_manager = request_manager
-        elif keypair is not None and base_url is not None:
+        if keypair is not None and base_url is not None:
             self.request_manager = RequestManager(
                 keypair,
                 base_url=base_url,
@@ -74,9 +69,7 @@ class TelemetryService:
                 netuid=netuid,
             )
         else:
-            raise ValueError(
-                "TelemetryService requires either request_manager or (keypair + base_url)"
-            )
+            raise ValueError("TelemetryService requires keypair + base_url")
         self.max_queue_size = max_queue_size
         self.batch_size = batch_size
         self.retry_attempts = retry_attempts
@@ -135,7 +128,7 @@ class TelemetryService:
         self._worker_thread.start()
 
     def _flush_batch(self, batch: list[Dict[str, Any]]) -> None:
-        """Flush a batch of datapoints via the RequestManager (single POST to /v1/datapoints)."""
+        """Flush a batch of datapoints via the internal RequestManager (single POST to /v1/datapoints)."""
         # Build the payload once
         datapoints = []
         for item in batch:
@@ -161,7 +154,7 @@ class TelemetryService:
         if self._network:
             additional_headers.append(("X-Network", self._network))
 
-        # Retry loop around the RequestManager call
+        # Retry loop around the internal RequestManager call
         for attempt in range(self.retry_attempts):
             try:
                 response = self.request_manager.post(
@@ -317,10 +310,31 @@ class TelemetryService:
         except Exception as e:
             bt.logging.warning(f"System metrics recording failed: {e}")
 
+    def record_event(
+        self,
+        event_type: str,
+        value: float | str = 1,
+        miner_hotkey: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Record a business/operational event (e.g. solution_received, platform_submission, etc.).
+
+        This is the recommended public API for custom telemetry.
+        Always try to include useful identifiers in attributes, especially submission_id when available.
+        """
+        timestamp = datetime.now(timezone.utc).isoformat()
+        return self._enqueue_datapoint(
+            type=event_type,
+            timestamp=timestamp,
+            value=value,
+            miner_hotkey=miner_hotkey,
+            attributes=attributes,
+        )
+
     def shutdown(self):
         """
         Stop the background worker, flush any remaining datapoints, and shut down.
-        Note: We do not close the RequestManager's session (it may be shared).
         """
         try:
             bt.logging.info("Shutting down metrics service...")

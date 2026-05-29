@@ -141,6 +141,24 @@ def convert_weights_and_uids_for_emit(
         if uint16_val != 0:  # Filter zeros
             weight_vals.append(uint16_val)
             weight_uids.append(uid_i)
+
+    # Guarantee the emitted raw weights sum to at most U16_MAX (65535).
+    # The max-upscale + round path above can produce sums like 65537 when a
+    # near-1.0 treasury weight coexists with tiny dust weights (e.g. 65535 + 2).
+    # We correct by shaving the excess off the single largest entry. This
+    # preserves all dust weights (critical for keep-alive of maintenance miners)
+    # while only affecting the dominant treasury allocation by a negligible amount.
+    if weight_vals:
+        total = sum(weight_vals)
+        if total > U16_MAX:
+            excess = total - U16_MAX
+            max_idx = int(np.argmax(weight_vals))
+            weight_vals[max_idx] = max(0, weight_vals[max_idx] - excess)
+            bittensor.logging.debug(
+                f"Adjusted uint weights down by {excess} to respect U16_MAX; "
+                f"new total={sum(weight_vals)}"
+            )
+
     bittensor.logging.debug(f"final params: {weight_uids} : {weight_vals}")
     return weight_uids, weight_vals
 

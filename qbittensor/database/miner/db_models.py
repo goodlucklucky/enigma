@@ -17,7 +17,7 @@
 
 import logging
 import uuid
-from sqlalchemy import Column, String, DateTime, ForeignKey, func
+from sqlalchemy import Column, String, DateTime, ForeignKey, func, UniqueConstraint
 from ..base import Base
 
 
@@ -67,6 +67,15 @@ class MinerSubmissionStatus(Base):
     )
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "validator_hotkey",
+            "tx_hash",
+            "challenge_milestone_id",
+            name="uq_miner_submission_status_per_validator_tx_milestone",
+        ),
+    )
 
     def __repr__(self):
         return (

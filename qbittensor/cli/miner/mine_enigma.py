@@ -29,6 +29,7 @@ import os
 import sys
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ _api_cfg = get_api_config()
 import bittensor as bt
 import click
 import requests
+from bittensor_wallet import Keypair
 
 from qbittensor.database.db_connection import DBConnection
 from rich import box
@@ -54,7 +56,12 @@ from rich.table import Table
 from rich.text import Text
 
 from qbittensor.cli.miner.utils.constants import MINER_DB_TABLE_PREFIX
+from qbittensor.cli.miner.fee_wallet import (
+    load_fee_keypair_from_keyfile,
+    load_fee_keypair_from_wallet,
+)
 from qbittensor.cli.miner.tao_transfer import transfer_tao_for_submission
+from qbittensor.utils.time import timestamp
 from qbittensor.utils.transfer_proof import TRANSFER_DEST_SS58
 
 from qbittensor.cli.miner.utils.color import c
@@ -85,6 +92,7 @@ class CliApiAuth:
     wallet_hotkey: str
     network: str
     netuid: int
+    wallet_path: str | None = None  # optional custom wallets directory
 
 
 def _resolve_cli_netuid(netuid: int | None) -> int:
@@ -100,17 +108,38 @@ def _resolve_cli_netuid(netuid: int | None) -> int:
 def _resolve_cli_api_auth(
     wallet_name: str | None,
     wallet_hotkey: str | None,
-    network: str | None,
-    netuid: int | None,
+    network: str | None = None,
+    netuid: int | None = None,
+    wallet_path: str | None = None,
 ) -> CliApiAuth:
-    cold = (wallet_name or os.getenv("BUY_WALLET_COLDKEY") or "default").strip() or "default"
-    hot = (wallet_hotkey or os.getenv("BUY_WALLET_HOTKEY") or "default").strip() or "default"
+    """
+    Resolve the wallet used for:
+      - Platform API authentication (JWT signing via TensorAuth)
+      - Fee payment coldkey (by default)
+      - Miner hotkey identity (derived from the hotkey in this wallet)
+    """
+    cold = (
+        wallet_name
+        or os.getenv("WALLET_NAME")
+        or os.getenv("BUY_WALLET_COLDKEY")
+        or "default"
+    ).strip() or "default"
+
+    hot = (
+        wallet_hotkey
+        or os.getenv("WALLET_HOTKEY")
+        or os.getenv("BUY_WALLET_HOTKEY")
+        or "default"
+    ).strip() or "default"
+
     net = (network or os.getenv("NETWORK") or "finney").strip() or "finney"
+
     return CliApiAuth(
         wallet_name=cold,
         wallet_hotkey=hot,
         network=net,
         netuid=_resolve_cli_netuid(netuid),
+        wallet_path=wallet_path,
     )
 
 
@@ -168,7 +197,7 @@ def _load_signing_keypair(console: Console, auth: CliApiAuth) -> bt.Keypair:
                 )
             )
 
-    wallet = bt.Wallet(name=auth.wallet_name, hotkey=auth.wallet_hotkey)
+    wallet = bt.Wallet(name=auth.wallet_name, hotkey=auth.wallet_hotkey, path=auth.wallet_path)
     if wallet.hotkey_file.exists_on_device():
         return wallet.hotkey
     while True:
@@ -218,6 +247,191 @@ def _challenges_client_for_api(
     )
 
 
+def _parse_api_datetime(raw: Any) -> datetime:
+    """Parse ``start_date`` / ``end_date`` values from the challenges API."""
+    if raw is None:
+        raise ValueError("missing datetime")
+    text = str(raw).strip()
+    if not text:
+        raise ValueError("empty datetime")
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_api_datetime_display(raw: Any) -> str:
+    if not raw:
+        return "—"
+    try:
+        return _parse_api_datetime(raw).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(raw).replace("T", " ")
+
+
+def _milestone_status(milestone: dict[str, Any]) -> str:
+    raw = milestone.get("status")
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
+def _format_milestone_status_display(milestone: dict[str, Any]) -> str:
+    status = _milestone_status(milestone)
+    if not status or status.lower() == "incomplete":
+        return "Incomplete"
+    return status
+
+
+def _assert_milestone_status_incomplete(milestone: dict[str, Any]) -> None:
+    """Reject submission unless the milestone status is ``Incomplete``."""
+    milestone_id = milestone.get("id", "?")
+    status = _milestone_status(milestone)
+    if status.lower() == "incomplete":
+        return
+    if status.lower() == "validating":
+        raise click.ClickException(
+            f"Milestone {milestone_id} is not open for submissions (status: {status!r}). "
+            "A potential solution is currently being validated. You may be able to try again later."
+        )
+    if status.lower() == "complete":
+        raise click.ClickException(
+            f"Milestone {milestone_id} is not open for submissions (status: {status!r}). "
+            "This milestone has been successfully solved."
+        )
+    if status:
+        raise click.ClickException(
+            f"Milestone {milestone_id} is not open for submissions (status: {status!r}). "
+            "Only milestones with status 'Incomplete' accept submissions."
+        )
+    raise click.ClickException(
+        f"Milestone {milestone_id} is missing a status; "
+        "only milestones with status 'Incomplete' accept submissions."
+    )
+
+
+def _assert_submission_window_open(milestone: dict[str, Any]) -> None:
+    """Reject submission when the current time is outside the milestone window.
+
+    Null or empty ``start_date`` / ``end_date`` are treated as unbounded:
+    - missing start_date means submissions are allowed from any time in the past
+    - missing end_date means the submission window never closes
+    """
+    milestone_id = milestone.get("id", "?")
+    start_raw = milestone.get("start_date")
+    end_raw = milestone.get("end_date")
+
+    start: datetime | None = None
+    if start_raw is not None:
+        text = str(start_raw).strip()
+        if text:
+            try:
+                start = _parse_api_datetime(text)
+            except ValueError as e:
+                raise click.ClickException(
+                    f"Milestone {milestone_id} has an invalid start_date."
+                ) from e
+
+    end: datetime | None = None
+    if end_raw is not None:
+        text = str(end_raw).strip()
+        if text:
+            try:
+                end = _parse_api_datetime(text)
+            except ValueError as e:
+                raise click.ClickException(
+                    f"Milestone {milestone_id} has an invalid end_date."
+                ) from e
+
+    now = timestamp()
+
+    if start is not None and now < start:
+        raise click.ClickException(
+            "Submissions are not open yet for this milestone. "
+            f"Opens at {start.isoformat()} (current time: {now.isoformat()})."
+        )
+    if end is not None and now > end:
+        raise click.ClickException(
+            "The submission window for this milestone has closed. "
+            f"Ended at {end.isoformat()} (current time: {now.isoformat()})."
+        )
+
+
+def _assert_milestone_allows_submission(milestone: dict[str, Any]) -> None:
+    """Reject submission when milestone status or submission window is invalid."""
+    _assert_milestone_status_incomplete(milestone)
+    _assert_submission_window_open(milestone)
+
+
+def _confirm_fee_amount_before_unlock(
+    console: Console,
+    challenges_client: "ChallengesClient",
+    milestone_id: str,
+    challenge_id: str,
+) -> float | None:
+    """
+    Fetch the current submission fee (priceTao) for the milestone and ask the
+    user for explicit confirmation before we attempt to load the fee-paying
+    coldkey.
+
+    This ensures the password prompt (for encrypted coldkeys) only happens
+    after the operator has seen and approved the exact amount that will be
+    transferred on-chain.
+
+    Returns:
+        The fee amount in TAO if the user confirms.
+        None if the user declines (caller should treat this as cancellation).
+    """
+    try:
+        price_tao = challenges_client.get_milestone_price_tao(
+            challenge_id=challenge_id, milestone_id=milestone_id
+        )
+    except Exception as e:
+        raise click.ClickException(f"Failed to fetch fee amount for milestone: {e}") from e
+
+    dest = TRANSFER_DEST_SS58
+    console.print(
+        _styled_panel(
+            "Confirm fee transfer",
+            Text.assemble(
+                ("You are about to pay a submission fee of ", f"dim {c(3)}"),
+                (f"{price_tao} TAO", f"bold {c(0)}"),
+                ("\n", ""),
+                ("to the Enigma fee destination:", f"dim {c(3)}"),
+                ("\n", ""),
+                (dest, f"bold {c(2)}"),
+                ("\n\n", ""),
+                ("This fee is non-refundable. Continue?", f"bold {c(3)}"),
+            ),
+            border=f"bold {c(1)}",
+        )
+    )
+
+    if _HAVE_TERMIOS and sys.stdin.isatty():
+        try:
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        except OSError:
+            pass
+
+    confirm = (
+        Prompt.ask(
+            Text.assemble(("Proceed?", f"dim {c(3)}")),
+            console=console,
+            default="n",
+            show_default=True,
+        )
+        or ""
+    ).strip().lower()
+
+    if confirm not in ("y", "yes"):
+        console.print(_styled_panel("Cancelled", "Transfer not confirmed by user.", border=f"dim {c(3)}"))
+        return None
+
+    return price_tao
+
+
 def _styled_panel(
     title: str,
     body: str | Text | RenderableType,
@@ -261,39 +475,42 @@ def run_milestone_solution_upload(
             border=f"bold {c(1)}",
         )
     )
-    miner_hotkey = (os.getenv("MINER_HOTKEY_SS58") or "").strip()
-    if miner_hotkey:
-        console.print("Loading miner hotkey from .env file")
-    else:
-        console.print(
-            _styled_panel(
-                "Miner hotkey",
-                Text.assemble(
-                    ("Enter your ", f"dim {c(3)}"),
-                    ("miner hotkey", f"bold {c(0)}"),
-                    (" for database submission tracking.", f"dim {c(3)}"),
-                    ("\n", ""),
-                    ("Leave empty to cancel.", f"dim {c(3)}"),
-                ),
-            )
+
+    # Validate that the milestone's submission window is currently open (from main)
+    try:
+        challenges_client = _challenges_client_for_api(api_auth, console)
+        challenge_detail = challenges_client.get_challenge(challenge_id)
+        milestone_detail = _find_milestone(challenge_detail, milestone_id)
+        _assert_milestone_allows_submission(milestone_detail)
+    except click.exceptions.Exit:
+        raise
+    except click.ClickException:
+        raise
+    except Exception as e:
+        err_code = getattr(e, "error_code", None)
+        if err_code:
+            # Surface the platform error_code prominently for support / bug reports
+            raise click.ClickException(
+                f"Failed to verify milestone submission window (error_code: {err_code}):\n{e}"
+            ) from e
+        raise click.ClickException(f"Failed to verify milestone submission window: {e}") from e
+
+    # Derive the miner hotkey SS58 from the configured wallet (no MINER_HOTKEY_SS58).
+    # The hotkey from --wallet.name / --wallet.hotkey is used as the registered miner identity.
+    try:
+        wallet = bt.Wallet(
+            name=api_auth.wallet_name,
+            hotkey=api_auth.wallet_hotkey,
+            path=api_auth.wallet_path,
         )
-        if _HAVE_TERMIOS and sys.stdin.isatty():
-            try:
-                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-            except OSError:
-                pass
-        miner_hotkey = (
-            Prompt.ask(
-                Text.assemble(("Miner hotkey", f"dim {c(3)}")),
-                console=console,
-                default="",
-                show_default=False,
-            )
-            or ""
-        ).strip()
-    if not miner_hotkey:
-        console.print(_styled_panel("Cancelled", "No miner hotkey entered.", border=f"dim {c(3)}"))
-        return
+        miner_hotkey = wallet.hotkey.ss58_address
+        console.print(f"Using miner hotkey from wallet: {miner_hotkey}")
+    except Exception as e:
+        raise click.ClickException(
+            f"Failed to load hotkey from wallet '{api_auth.wallet_name}' / '{api_auth.wallet_hotkey}'.\n"
+            f"Error: {e}\n\n"
+            "Make sure the wallet and hotkey exist and are unlocked if password-protected."
+        ) from e
     console.print(
         _styled_panel(
             "Solution file",
@@ -345,75 +562,59 @@ def run_milestone_solution_upload(
             )
         )
         return
-    source_ss58 = (os.getenv("MINER_SOURCE_COLDKEY_SS58") or "").strip()
-    if source_ss58:
-        console.print("Using source ss58 from .env")
-    else:
-        console.print(
-            _styled_panel(
-                "Source wallet",
-                Text.assemble(
-                    ("Enter your ", f"dim {c(3)}"),
-                    ("source SS58 address", f"bold {c(0)}"),
-                    (" that will send TAO.", f"dim {c(3)}"),
-                    ("\n", ""),
-                    ("Leave empty to cancel.", f"dim {c(3)}"),
-                ),
-            )
-        )
-        if _HAVE_TERMIOS and sys.stdin.isatty():
-            try:
-                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-            except OSError:
-                pass
-        source_ss58 = (
-            Prompt.ask(
-                Text.assemble(("Source SS58", f"dim {c(3)}")),
-                console=console,
-                default="",
-                show_default=False,
-            )
-            or ""
-        ).strip()
-    if not source_ss58:
-        console.print(_styled_panel("Cancelled", "No source SS58 entered.", border=f"dim {c(3)}"))
+
+    price_tao = _confirm_fee_amount_before_unlock(
+        console=console,
+        challenges_client=challenges_client,
+        milestone_id=milestone_id,
+        challenge_id=challenge_id,
+    )
+    if price_tao is None:
+        # User declined the transfer
         return
-    source_mnemonic = (os.getenv("MINER_SOURCE_COLDKEY_MNEMONIC") or "").strip()
-    if source_mnemonic:
-        console.print("Using mnemonic from env")
+
+    # By default we use the main wallet's coldkey (from --wallet.name / --wallet.path)
+    # for the fee payment. This is the simplest and most intuitive model.
+    # Advanced users can still override the payment coldkey using the legacy
+    # MINER_FEE_WALLET_NAME or MINER_FEE_COLDKEY_PATH environment variables.
+    fee_keypair = None
+
+    # Legacy / power-user override for a completely different fee coldkey
+    legacy_fee_keyfile = (
+        os.getenv("MINER_FEE_COLDKEY_PATH") or os.getenv("FEE_WALLET_PATH") or ""
+    ).strip()
+    legacy_fee_wallet = (
+        os.getenv("MINER_FEE_WALLET_NAME") or os.getenv("FEE_WALLET_NAME") or ""
+    ).strip()
+
+    if legacy_fee_keyfile:
+        console.print("Loading fee coldkey from legacy path override")
+        fee_keypair = load_fee_keypair_from_keyfile(legacy_fee_keyfile)
+    elif legacy_fee_wallet:
+        console.print("Loading fee coldkey from legacy wallet name override")
+        fee_keypair = load_fee_keypair_from_wallet(legacy_fee_wallet)
     else:
-        console.print(
-            _styled_panel(
-                "Signer mnemonic",
-                Text.assemble(
-                    ("Enter the mnemonic/seed phrase for that source wallet.", f"dim {c(3)}"),
-                    ("\n", ""),
-                    ("Input is hidden.", f"dim {c(3)}"),
-                    ("\n", ""),
-                    ("Leave empty to cancel.", f"dim {c(3)}"),
-                ),
-            )
+        # Normal path: use the primary wallet (from --wallet.name / --wallet.path) for fee payment
+        fee_keypair = load_fee_keypair_from_wallet(
+            api_auth.wallet_name, wallet_path=api_auth.wallet_path
         )
-        if _HAVE_TERMIOS and sys.stdin.isatty():
-            try:
-                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-            except OSError:
-                pass
-        source_mnemonic = (
-            Prompt.ask(
-                Text.assemble(("Source mnemonic", f"dim {c(3)}")),
-                console=console,
-                default="",
-                show_default=False,
-                password=True,
-            )
-            or ""
-        ).strip()
-    if not source_mnemonic:
-        console.print(_styled_panel("Cancelled", "No source mnemonic entered.", border=f"dim {c(3)}"))
+
+    if fee_keypair is None:
+        console.print(_styled_panel("Cancelled", "No fee coldkey provided.", border=f"dim {c(3)}"))
         return
+
+    source_ss58 = fee_keypair.ss58_address
+    console.print(f"Fee coldkey loaded: {source_ss58}")
+
+    # Old mnemonic env var is now a hard error
+    if os.getenv("MINER_SOURCE_COLDKEY_MNEMONIC"):
+        raise click.ClickException(
+            "MINER_SOURCE_COLDKEY_MNEMONIC is no longer supported.\n"
+            "Configure your wallet with --wallet.name / --wallet.path (or FEE_WALLET_NAME).\n"
+            "The miner hotkey is now taken from --wallet.hotkey."
+        )
+
     try:
-        challenges_client = _challenges_client_for_api(api_auth, console)
         submit_solution(
             console,
             milestone_id,
@@ -421,9 +622,10 @@ def run_milestone_solution_upload(
             challenges_client=challenges_client,
             miner_hotkey=miner_hotkey,
             source_ss58=source_ss58,
-            source_mnemonic=source_mnemonic,
+            fee_keypair=fee_keypair,
             network=api_auth.network,
             challenge_id=challenge_id,
+            fee_tao=price_tao,
         )
     except click.exceptions.Exit:
         raise
@@ -441,13 +643,14 @@ def submit_solution(
     challenges_client: "ChallengesClient",
     miner_hotkey: str,
     source_ss58: str,
-    source_mnemonic: str,
+    fee_keypair: "Keypair",
     network: str,
     challenge_id: str,
+    fee_tao: float | None = None,
 ) -> dict[str, Any]:
 
     # store solution in the database for the miner_hotkey
-    """Request slot, transfer, upload zip, then persist DB row for the miner."""
+    """Request slot, transfer (as batch + remark), upload zip, then persist DB row for the miner."""
     if not challenge_id:
         raise click.ClickException("challenge_id is required to submit a solution.")
     zip_path = Path(solution_path)
@@ -468,11 +671,28 @@ def submit_solution(
     auth_client = challenges_client
 
     try:
+        challenge_detail = auth_client.get_challenge(challenge_id)
+    except Exception as e:
+        err_code = getattr(e, "error_code", None)
+        if err_code:
+            raise click.ClickException(
+                f"Failed to fetch challenge details (error_code: {err_code}):\n{e}"
+            ) from e
+        raise click.ClickException(f"Failed to fetch challenge details: {e}") from e
+    milestone_detail = _find_milestone(challenge_detail, milestone_id)
+    _assert_milestone_allows_submission(milestone_detail)
+
+    try:
         slot = auth_client.get_submission_upload_slot(
             filename=zip_path.name,
             size=size,
         )
     except Exception as e:
+        err_code = getattr(e, "error_code", None)
+        if err_code:
+            raise click.ClickException(
+                f"Upload URL request failed (error_code: {err_code}):\n{e}"
+            ) from e
         raise click.ClickException(f"Upload URL request failed: {e}") from e
 
     # The response contains the presigned upload_url + fields.
@@ -494,17 +714,22 @@ def submit_solution(
         # Still proceed — the upload helper may not strictly need the id
         bt.logging.warning("Upload slot response did not include an 'id'")
 
-    # Use the same authenticated client for fee lookup
-    price_tao = auth_client.get_milestone_price_tao(challenge_id=challenge_id, milestone_id=milestone_id)
+    # Use pre-fetched amount if provided (from the confirmation step), otherwise fetch.
+    # This also avoids a second round-trip after the user has already confirmed the amount.
+    if fee_tao is not None:
+        price_tao = fee_tao
+    else:
+        price_tao = auth_client.get_milestone_price_tao(challenge_id=challenge_id, milestone_id=milestone_id)
 
     proof_tx = transfer_tao_for_submission(
         console=console,
         source_ss58=source_ss58,
-        source_mnemonic=source_mnemonic,
+        keypair=fee_keypair,
         network=network,
         fee_tao=price_tao,
+        miner_hotkey=miner_hotkey,
         milestone_id=milestone_id,
-        challenge_id=challenge_id,
+        upload_endpoint_id=str(upload_id) if upload_id else "",
     )
     tx_hash = proof_tx.extrinsic_hash
     transfer_block_hash = proof_tx.block_hash
@@ -553,7 +778,7 @@ def submit_solution(
         challenge_id=challenge_id,
         transfer_block_hash=transfer_block_hash,
         transfer_to_ss58=TRANSFER_DEST_SS58,
-        transfer_amount_rao=auth_client.get_milestone_transfer_amount_rao(challenge_id=challenge_id, milestone_id=milestone_id),
+        transfer_amount_rao=str(int(bt.Balance.from_tao(price_tao).rao)),
     )
 
     return spec
@@ -707,6 +932,15 @@ def _milestones_from_detail(detail: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _find_milestone(challenge_detail: dict[str, Any], milestone_id: str) -> dict[str, Any]:
+    for ms in _milestones_from_detail(challenge_detail):
+        if str(ms.get("id")) == str(milestone_id):
+            return ms
+    raise click.ClickException(
+        f"Milestone {milestone_id} not found under challenge {challenge_detail.get('id', '?')}."
+    )
+
+
 def _format_milestone_prize(ms: dict[str, Any]) -> str:
     """Format milestone prize/fee for the CLI table from API fields."""
     price_tao = ms.get("priceTao")
@@ -735,30 +969,31 @@ def _milestone_table(
         border_style=f"dim {c(4)}",
         header_style=f"bold {c(1)}",
         expand=True,
+        padding=(0, 1),
     )
-    table.add_column("", width=3, justify="center")
-    table.add_column("Name", ratio=2)
-    table.add_column("Prize", justify="right")
-    table.add_column("Done", justify="center", width=6)
-    table.add_column("Submissions", justify="right", width=12)
-    table.add_column("Completed at", width=20)
+    table.add_column("", width=3, min_width=3, justify="center", no_wrap=True)
+    table.add_column("Name", ratio=3, min_width=10, overflow="ellipsis")
+    table.add_column("Prize", width=9, min_width=7, justify="left", no_wrap=True)
+    table.add_column("Submissions", width=12, min_width=11, justify="right", no_wrap=True)
+    table.add_column("Start", width=23, min_width=23, no_wrap=True, overflow="crop")
+    table.add_column("End", width=23, min_width=23, no_wrap=True, overflow="crop")
+    table.add_column("Status", width=12, min_width=12, justify="center", no_wrap=True)
     n = len(milestones)
     if n == 0:
-        table.add_row("—", f"[dim {c(3)}]No milestones[/dim {c(3)}]", "", "", "", "")
+        table.add_row("—", f"[dim {c(3)}]No milestones[/dim {c(3)}]", "", "", "", "", "")
         return table
     sel = max(0, min(selected, n - 1))
     for i, ms in enumerate(milestones):
         marker = "▶" if i == sel else " "
         row_style: str | None = "reverse bold" if i == sel else None
-        ca = ms.get("completed_at")
-        ca_s = str(ca)[:19] if ca else "—"
         table.add_row(
             marker,
             str(ms.get("name", "—")),
             _format_milestone_prize(ms),
-            "yes" if ms.get("completed") else "no",
             str(ms.get("submission_count", "—")),
-            ca_s,
+            _format_api_datetime_display(ms.get("start_date")),
+            _format_api_datetime_display(ms.get("end_date")),
+            _format_milestone_status_display(ms),
             style=row_style,
         )
     return table
@@ -829,10 +1064,18 @@ def format_milestones(
         if pending_id is None:
             continue
 
+        selected_milestone = next(
+            (ms for ms in milestones if str(ms.get("id")) == pending_id),
+            None,
+        )
+        if selected_milestone is None:
+            continue
+
         try:
             challenge_id = detail.get("id")
             if not challenge_id:
                 raise click.ClickException("Challenge detail did not include an id.")
+            _assert_milestone_allows_submission(selected_milestone)
             run_milestone_solution_upload(
                 console,
                 pending_id,
@@ -874,7 +1117,7 @@ def _goodbye_panel() -> Panel:
         Padding(body, (1, 6)),
         box=box.ROUNDED,
         border_style=f"bold {c(0)}",
-        subtitle=f"[dim {c(3)}]quantum miner[/dim {c(3)}]",
+        subtitle=f"[dim {c(3)}]enigma miner[/dim {c(3)}]",
         subtitle_align="center",
     )
 
@@ -922,7 +1165,7 @@ def _welcome_panel(network: str) -> Panel:
         ),
         box=box.DOUBLE,
         border_style=f"bold {c(1)}",
-        subtitle=f"[dim {c(3)}]quantum miner[/dim {c(3)}]",
+        subtitle=f"[dim {c(3)}]enigma miner[/dim {c(3)}]",
         subtitle_align="center",
     )
 
@@ -945,12 +1188,9 @@ def _view_summary(payload: dict[str, Any], selected_row: int) -> RenderableType:
     )
     table.add_column("", justify="center", width=3)
     table.add_column("Name", ratio=2)
-    table.add_column("Price", justify="right")
     table.add_column("Completed", justify="center")
-    table.add_column("Start", width=20)
-    table.add_column("End", width=20)
     if not rows:
-        table.add_row("—", f"[dim {c(3)}]No challenges[/dim {c(3)}]", "", "", "", "")
+        table.add_row("—", f"[dim {c(3)}]No challenges[/dim {c(3)}]", "")
         return table
     n = len(rows)
     sel = max(0, min(selected_row, n - 1))
@@ -960,10 +1200,7 @@ def _view_summary(payload: dict[str, Any], selected_row: int) -> RenderableType:
         table.add_row(
             marker,
             str(ch.get("name", "—")),
-            str(ch.get("price", "—")),
             "yes" if ch.get("completed") else "no",
-            str(ch.get("start_date", "—"))[:19],
-            str(ch.get("end_date", "—"))[:19],
             style=row_style,
         )
     return table
@@ -1116,14 +1353,36 @@ def query_and_format_challenges(
     help="Challenges API base URL (overrides the configured default).",
 )
 @click.option(
-    "--wallet-name",
+    "--wallet.name",
+    "wallet_name",
     default=None,
-    help="Wallet (coldkey) name for JWT-signed uploads (default: BUY_WALLET_COLDKEY or 'default').",
+    help="Wallet name for platform API authentication (JWT). Can be the same as your mining wallet.",
+)
+@click.option(
+    "--wallet.hotkey",
+    "wallet_hotkey",
+    default=None,
+    help="Hotkey for platform API authentication (JWT). Can be the same as your mining hotkey.",
+)
+@click.option(
+    "--wallet.path",
+    "wallet_path",
+    default=None,
+    help="Custom path to the wallets directory.",
+)
+@click.option(
+    "--wallet-name",
+    "wallet_name_legacy",
+    default=None,
+    hidden=True,
+    help="(Deprecated) Use --wallet.name instead.",
 )
 @click.option(
     "--wallet-hotkey",
+    "wallet_hotkey_legacy",
     default=None,
-    help="Hotkey name for signed API calls (default: BUY_WALLET_HOTKEY or 'default').",
+    hidden=True,
+    help="(Deprecated) Use --wallet.hotkey instead.",
 )
 @click.option(
     "--network",
@@ -1141,40 +1400,131 @@ def main(
     base_url: str | None,
     wallet_name: str | None,
     wallet_hotkey: str | None,
+    wallet_path: str | None,
+    wallet_name_legacy: str | None,
+    wallet_hotkey_legacy: str | None,
     network: str | None,
     netuid: int | None,
 ) -> None:
     """Welcome banner, then browse challenges response views."""
     # Environment is already loaded at module import time via get_api_config()
     # (which calls load_dotenv()). _resolve_cli_api_auth reads directly from os.getenv.
-    api_auth = _resolve_cli_api_auth(wallet_name, wallet_hotkey, network, netuid)
+    # Support both new dotted style and old flat style for backward compat
+    effective_wallet_name = wallet_name or wallet_name_legacy
+    effective_wallet_hotkey = wallet_hotkey or wallet_hotkey_legacy
+
+    api_auth = _resolve_cli_api_auth(
+        wallet_name=effective_wallet_name,
+        wallet_hotkey=effective_wallet_hotkey,
+        wallet_path=wallet_path,
+        network=network,
+        netuid=netuid,
+    )
     console = Console()
     console.print()
     console.print(Align.center(_welcome_panel(api_auth.network)))
     console.print()
 
-    try:
-        query_and_format_challenges(
-            console,
-            base_url=base_url,
-            api_auth=api_auth,
-        )
-    except requests.HTTPError as e:
-        body = ""
-        if e.response is not None:
-            try:
-                body = e.response.text[:400]
-            except Exception:
-                body = ""
-        raise click.ClickException(
-            f"Challenges API HTTP error: {e}\n{body}".strip()
-        ) from e
-    except requests.RequestException as e:
-        raise click.ClickException(f"Challenges API request failed: {e}") from e
-    except ValueError as e:
-        raise click.ClickException(str(e)) from e
+    run_miner_main_menu(console, base_url=base_url, api_auth=api_auth)
 
+
+def run_miner_main_menu(console: Console, base_url: str | None, api_auth: CliApiAuth) -> None:
+    """Top-level interactive menu for the miner operator."""
+    while True:
+        console.print()
+        console.print(Panel.fit(
+            "[bold]What would you like to do?[/]",
+            border_style="blue",
+            title="Enigma Miner",
+        ))
+
+        options = [
+            ("1", "Submit a new solution"),
+            ("2", "List my submissions (with status)"),
+            ("q", "Quit"),
+        ]
+
+        for key, label in options:
+            console.print(f"  [{c(2)}]{key}[/]  {label}")
+
+        choice = Prompt.ask(
+            "\nChoice",
+            choices=["1", "2", "q", "Q"],
+            show_choices=False,
+            default="1",
+        ).strip().lower()
+
+        if choice in ("q", "quit"):
+            console.print("Goodbye!")
+            break
+
+        if choice == "1":
+            try:
+                query_and_format_challenges(
+                    console,
+                    base_url=base_url,
+                    api_auth=api_auth,
+                )
+            except Exception as e:
+                console.print(f"[red]Error during submission flow:[/] {e}")
+            continue
+
+        if choice == "2":
+            _list_my_submissions(console, api_auth)
+            continue
+
+
+def _list_my_submissions(console: Console, api_auth: CliApiAuth) -> None:
+    """Show the operator their local submissions and received validator statuses."""
+    miner_hotkey = (os.getenv("MINER_HOTKEY_SS58") or "").strip()
+    if not miner_hotkey:
+        miner_hotkey = Prompt.ask(
+            Text.assemble(("Enter your miner hotkey (SS58)", f"dim {c(3)}"))
+        ).strip()
+
+    if not miner_hotkey:
+        console.print("[yellow]No hotkey provided.[/]")
+        return
+
+    db_connection = DBConnection(
+        database_name_prefix=MINER_DB_TABLE_PREFIX,
+        hotkey=miner_hotkey,
+    )
+
+    submissions = db_connection.db_query_miner.list_my_submissions_with_status(limit=100)
+
+    if not submissions:
+        console.print("[yellow]No submissions found in your local database.[/]")
+        return
+
+    table = Table(title=f"Your Submissions ({miner_hotkey[:8]}...)", box=box.ROUNDED)
+    table.add_column("TX Hash (short)", style="dim")
+    table.add_column("Milestone", style="cyan")
+    table.add_column("Submitted At", style="green")
+    table.add_column("Validator Statuses", style="white")
+
+    for sub in submissions:
+        tx_short = sub["tx_hash"][:12] + "..." if sub["tx_hash"] else "?"
+        submitted = sub["submitted_at"].strftime("%Y-%m-%d %H:%M") if sub["submitted_at"] else "[dim]never[/]"
+
+        status_lines = []
+        for vhotkey, info in sub.get("validator_statuses", {}).items():
+            status = info.get("status", "?")
+            color = "green" if status.lower() in ("success", "offered") else "red"
+            status_lines.append(f"[{color}]{status}[/] ({vhotkey[:8]}...)")
+
+        status_display = "\n".join(status_lines) if status_lines else "[dim]No status yet[/]"
+
+        table.add_row(
+            tx_short,
+            sub["challenge_milestone_id"][:8] + "...",
+            submitted,
+            status_display,
+        )
+
+    console.print(table)
     console.print()
+    Prompt.ask("Press Enter to return to menu", default="")
 
 
 if __name__ == "__main__":

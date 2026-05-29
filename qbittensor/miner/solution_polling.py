@@ -26,6 +26,14 @@ class SolutionPoller:
         self.db_query: DBQueryMiner = db_query
 
     def poll(self) -> MinerSubmission | None:
-        """Return the current submission from the local miner_submissions table."""
+        """Return the current submission from the local miner_submissions table (global next)."""
         bt.logging.info("🔊 Polling for a solution candidate")
         return self.db_query.get_next_miner_submission()
+
+    def poll_for_validator(self, validator_hotkey: str) -> MinerSubmission | None:
+        """
+        Return the next submission that has not yet been offered to this specific validator.
+        This enables proper per-validator deduplication.
+        """
+        bt.logging.info(f"🔊 Polling for a solution candidate not yet offered to {validator_hotkey[:8]}...")
+        return self.db_query.get_next_miner_submission_for_validator(validator_hotkey)

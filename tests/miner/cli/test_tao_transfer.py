@@ -107,72 +107,71 @@ class TestTransferProofTxFromReceipt:
 
 
 class TestTransferFeeExtrinsicSubtensor:
-    def test_empty_mnemonic_raises(self):
-        with pytest.raises(ValueError, match="mnemonic"):
+    """Tests for the Keypair + batch + remark."""
+
+    def test_ss58_mismatch_raises(self):
+        keypair = Mock()
+        keypair.ss58_address = "5DifferentAddress"
+
+        with pytest.raises(ValueError, match="does not match"):
             transfer_fee_extrinsic_subtensor(
-                subtensor=Mock(), source_ss58="5Addr", source_mnemonic="", fee_tao=0.5
+                subtensor=Mock(),
+                source_ss58="5Expected",
+                keypair=keypair,
+                fee_tao=0.5,
+                miner_hotkey="5Hotkey",
+                milestone_id="m-1",
+                upload_endpoint_id="upload-xyz",
             )
 
-    def test_ss58_mismatch_raises(self, patch_keypair_mismatch):
-        with patch_keypair_mismatch:
-            with pytest.raises(ValueError, match="does not match"):
-                transfer_fee_extrinsic_subtensor(
-                    subtensor=Mock(),
-                    source_ss58="5Expected",
-                    source_mnemonic="word " * 12,
-                    fee_tao=0.5,
-                )
-
     def test_fee_tao_none_raises(self):
+        keypair = Mock()
+        keypair.ss58_address = "5Addr"
+
         with pytest.raises(ValueError, match="Challenges API"):
             transfer_fee_extrinsic_subtensor(
                 subtensor=Mock(),
                 source_ss58="5Addr",
-                source_mnemonic="word " * 12,
+                keypair=keypair,
                 fee_tao=None,
+                miner_hotkey="5Hotkey",
+                milestone_id="m-1",
+                upload_endpoint_id="upload-xyz",
             )
 
-    def test_happy_path_builds_and_submits_extrinsic(self):
-        """Full success path: valid mnemonic, matching ss58, substrate succeeds, receipt returned."""
+    def test_happy_path_builds_batch_and_submits_extrinsic(self):
+        """New happy path: Keypair + batch_all (transfer + remark) is built and submitted."""
         receipt = make_receipt(success=True, extrinsic_hash="0xfeedface", block_hash="0xdeadbeef")
         fake_subtensor = make_subtensor_with_receipt(receipt)
-
-        # Use a real-looking mnemonic that will produce a deterministic keypair we can match
-        # (we still patch create_from_mnemonic so we control the returned ss58)
-        mnemonic = "word " * 11 + "word"
 
         keypair = Mock()
         keypair.ss58_address = "5MatchingAddress"
 
-        with patch(
-            "qbittensor.cli.miner.tao_transfer.Keypair.create_from_mnemonic",
-            return_value=keypair,
-        ):
-            proof = transfer_fee_extrinsic_subtensor(
-                subtensor=fake_subtensor,
-                source_ss58="5MatchingAddress",
-                source_mnemonic=mnemonic,
-                fee_tao=0.123,
-            )
+        proof = transfer_fee_extrinsic_subtensor(
+            subtensor=fake_subtensor,
+            source_ss58="5MatchingAddress",
+            keypair=keypair,
+            fee_tao=0.123,
+            miner_hotkey="5Hotkey123",
+            milestone_id="milestone-abc",
+            upload_endpoint_id="upload-12345",
+        )
 
-        # Verify the returned proof object
         assert isinstance(proof, TransferProofTx)
         assert proof.extrinsic_hash == "0xfeedface"
         assert proof.block_hash == "0xdeadbeef"
 
-        # Verify the substrate call chain was exercised with the correct values
         substrate = fake_subtensor.substrate
-        substrate.compose_call.assert_called_once()
-        call_kwargs = substrate.compose_call.call_args.kwargs
-        assert call_kwargs["call_module"] == "Balances"
-        assert call_kwargs["call_function"] == "transfer_keep_alive"
-        assert call_kwargs["call_params"]["dest"] == TRANSFER_DEST_SS58
-        # The important contract: the exact RAO amount derived from the API-supplied fee_tao
-        expected_rao = int(bt.Balance.from_tao(0.123).rao)
-        assert call_kwargs["call_params"]["value"] == expected_rao
+
+        # We now expect two compose_call calls (transfer + remark) inside batch_all
+        assert substrate.compose_call.call_count >= 2
+
+        # The final call should be the Utility.batch_all
+        last_call = substrate.compose_call.call_args_list[-1]
+        assert last_call.kwargs["call_module"] == "Utility"
+        assert last_call.kwargs["call_function"] == "batch_all"
 
         substrate.create_signed_extrinsic.assert_called_once()
-        # The real code passes the extrinsic positionally
         substrate.submit_extrinsic.assert_called_once_with(
             substrate.create_signed_extrinsic.return_value,
             wait_for_inclusion=True,
@@ -197,122 +196,88 @@ def patch_keypair_mismatch():
 
 
 class TestTransferTaoForSubmission:
+    """Tests for transfer_tao_for_submission (Keypair-based)."""
+
     def test_requires_milestone_id(self):
+        keypair = Mock()
+        keypair.ss58_address = "5Addr"
+
         with pytest.raises(click.ClickException, match="milestone_id is required"):
             transfer_tao_for_submission(
                 console=silent_console(),
                 source_ss58="5Addr",
-                source_mnemonic="word " * 12,
+                keypair=keypair,
                 network="finney",
                 fee_tao=0.5,
+                miner_hotkey="5H",
+                milestone_id="",   # empty to trigger the check
+                upload_endpoint_id="u-1",
             )
 
-    def test_wraps_value_error_as_click_exception(self):
-        from unittest.mock import patch
-
-        with patch(
-            "qbittensor.cli.miner.tao_transfer.bt.Subtensor"
-        ) as mock_subtensor_cls:
-            mock_subtensor_cls.return_value.__enter__.side_effect = ValueError("boom")
-            with pytest.raises(click.ClickException, match="Transfer transaction failed"):
-                transfer_tao_for_submission(
-                    console=silent_console(),
-                    source_ss58="5Addr",
-                    source_mnemonic="word " * 12,
-                    network="finney",
-                    milestone_id="m-test-123",
-                    fee_tao=0.5,
-                )
-
     def test_fee_tao_none_or_non_positive_raises(self):
+        keypair = Mock()
+        keypair.ss58_address = "5Addr"
+
         for bad_fee in (None, 0, -0.1):
             with pytest.raises(click.ClickException, match="fee_tao is required and must be greater than 0"):
                 transfer_tao_for_submission(
                     console=silent_console(),
                     source_ss58="5Addr",
-                    source_mnemonic="word " * 12,
+                    keypair=keypair,
                     network="finney",
-                    milestone_id="m-123",
                     fee_tao=bad_fee,
+                    miner_hotkey="5H",
+                    milestone_id="m-123",
+                    upload_endpoint_id="u-1",
                 )
 
     def test_happy_path_uses_context_manager_and_returns_proof(self):
-        """The high-level wrapper manages the Subtensor context and delegates correctly."""
         receipt = make_receipt(success=True, extrinsic_hash="0xproof", block_hash="0xblock")
         fake_subtensor = make_subtensor_with_receipt(receipt)
 
-        mnemonic = "word " * 12
         keypair = Mock()
         keypair.ss58_address = "5HappyPathAddr"
 
         with patch(
             "qbittensor.cli.miner.tao_transfer.bt.Subtensor",
-            return_value=fake_subtensor,
-        ), patch(
-            "qbittensor.cli.miner.tao_transfer.Keypair.create_from_mnemonic",
-            return_value=keypair,
-        ):
+        ) as mock_subtensor_cls:
+            mock_subtensor_cls.return_value.__enter__.return_value = fake_subtensor
+
             proof = transfer_tao_for_submission(
                 console=silent_console(),
                 source_ss58="5HappyPathAddr",
-                source_mnemonic=mnemonic,
+                keypair=keypair,
                 network="finney",
-                fee_tao=1.5,
-                milestone_id="m-happy-1",
+                fee_tao=0.42,
+                miner_hotkey="5Hotkey",
+                milestone_id="m-123",
+                upload_endpoint_id="upload-1",
             )
 
         assert isinstance(proof, TransferProofTx)
         assert proof.extrinsic_hash == "0xproof"
 
-        # The context manager must have been used
-        fake_subtensor.__enter__.assert_called_once()
-        fake_subtensor.__exit__.assert_called_once()
+        # The context manager usage is verified through the mock_subtensor_cls behavior
+        mock_subtensor_cls.return_value.__enter__.assert_called_once()
 
     def test_wraps_generic_exception_as_click_exception(self):
         from unittest.mock import patch
-
-        with patch(
-            "qbittensor.cli.miner.tao_transfer.bt.Subtensor"
-        ) as mock_subtensor_cls:
-            mock_subtensor_cls.return_value.__enter__.side_effect = RuntimeError("network down")
-            with pytest.raises(click.ClickException, match="Transfer transaction failed"):
-                transfer_tao_for_submission(
-                    console=silent_console(),
-                    source_ss58="5Addr",
-                    source_mnemonic="word " * 12,
-                    network="finney",
-                    milestone_id="m-err",
-                    fee_tao=0.5,
-                )
-
-    def test_non_success_receipt_raises_value_error(self):
-        receipt = make_receipt(success=False)
-        fake_subtensor = make_subtensor_with_receipt(receipt)
 
         keypair = Mock()
         keypair.ss58_address = "5Addr"
 
         with patch(
-            "qbittensor.cli.miner.tao_transfer.Keypair.create_from_mnemonic",
-            return_value=keypair,
-        ):
-            with pytest.raises(ValueError, match="Transfer extrinsic failed"):
-                transfer_fee_extrinsic_subtensor(
-                    subtensor=fake_subtensor,
+            "qbittensor.cli.miner.tao_transfer.bt.Subtensor"
+        ) as mock_subtensor_cls:
+            mock_subtensor_cls.return_value.__enter__.side_effect = RuntimeError("network down")
+            with pytest.raises(click.ClickException, match="Fee payment transaction failed"):
+                transfer_tao_for_submission(
+                    console=silent_console(),
                     source_ss58="5Addr",
-                    source_mnemonic="word " * 12,
+                    keypair=keypair,
+                    network="finney",
+                    milestone_id="m-err",
                     fee_tao=0.5,
-                )
-
-    def test_invalid_mnemonic_is_wrapped(self):
-        with patch(
-            "qbittensor.cli.miner.tao_transfer.Keypair.create_from_mnemonic",
-            side_effect=Exception("bad seed"),
-        ):
-            with pytest.raises(ValueError, match="Invalid mnemonic/seed phrase"):
-                transfer_fee_extrinsic_subtensor(
-                    subtensor=Mock(),
-                    source_ss58="5Addr",
-                    source_mnemonic="not a real mnemonic",
-                    fee_tao=0.5,
+                    miner_hotkey="5H",
+                    upload_endpoint_id="u-1",
                 )

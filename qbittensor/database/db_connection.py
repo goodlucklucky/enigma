@@ -18,13 +18,16 @@
 import os
 import sys
 from pathlib import Path
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.orm import sessionmaker
 from .base import Base
 import bittensor as bt
 
 from .validator.db_query import DBQuery
 from .miner.db_query import DBQueryMiner
+
+# Generic migration runner
+from .migrations.runner import run_migrations_for_db
 
 
 def _package_fallback_project_root() -> Path:
@@ -165,10 +168,12 @@ class DBConnection:
                 "'challenge_solutions' or 'miner_submissions'."
             )
 
+        self._verify_and_log_table_state()
+
         # self.db_query = DBQuery(self.get_db_session)
 
     def create_database(self):
-        """Create the database file and tables."""
+        """Create the database file, run any pending migrations, then ensure tables exist."""
         bt.logging.info(f"📂 Creating database at '{self.DB_PATH}'")
         DATABASE_URL = f"sqlite:///{self.DB_PATH}"
         engine = create_engine(DATABASE_URL, echo=False)
@@ -176,12 +181,19 @@ class DBConnection:
         _enable_sqlite_wal_mode(engine)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+        expected_tables = []
         try:
+            # Run the generic migration system first.
+            # This is the new standard path for all schema evolution.
+            # For validator DBs this will apply any pending migrations.
+            run_migrations_for_db(engine, self.database_name_prefix)
+
             # Only create tables for this DB — shared Base.metadata includes every
             # imported model (miner + challenge), which would otherwise create all of them.
             if self.database_name_prefix == "miner_submissions":
                 from .miner.db_models import MinerSubmission, MinerSubmissionStatus
 
+                expected_tables = ["miner_submissions", "miner_submission_statuses"]
                 tables = [
                     MinerSubmission.__table__,
                     MinerSubmissionStatus.__table__,
@@ -189,19 +201,101 @@ class DBConnection:
             elif self.database_name_prefix == "challenge_solutions":
                 from .validator.db_models import ChallengeSolution, MinerMaintenanceIncentive
 
+                expected_tables = ["challenge_solutions", "miner_maintenance_incentives"]
                 tables = [
                     ChallengeSolution.__table__,
                     MinerMaintenanceIncentive.__table__,
                 ]
             else:
                 tables = list(Base.metadata.tables.values())
+                expected_tables = list(Base.metadata.tables.keys())
 
             Base.metadata.create_all(bind=engine, tables=tables)
-            bt.logging.info(f"✅ Database created successfully at '{self.DB_PATH}'")
+
+            inspector = inspect(engine)
+            existing = set(inspector.get_table_names())
+            missing = [t for t in expected_tables if t not in existing]
+
+            if missing:
+                bt.logging.error(
+                    "══════════════════════════════════════════════════════════════\n"
+                    f"🚨 DATABASE TABLES MISSING after create_all for prefix '{self.database_name_prefix}'\n"
+                    f"   DB file   : {self.DB_PATH}\n"
+                    f"   Expected  : {expected_tables}\n"
+                    f"   Missing   : {missing}\n"
+                    "   This file previously existed with only sqlite_master.\n"
+                    "   Attempting recovery create_all (no table filter)...\n"
+                    "══════════════════════════════════════════════════════════════"
+                )
+                # Recovery attempt — create whatever is registered on the metadata
+                Base.metadata.create_all(bind=engine)
+                inspector = inspect(engine)  # re-inspect
+                existing = set(inspector.get_table_names())
+                still_missing = [t for t in expected_tables if t not in existing]
+                if still_missing:
+                    bt.logging.error(
+                        f"❌ RECOVERY ALSO FAILED. Still missing {still_missing} in {self.DB_PATH}. "
+                        "Delete the .db file and restart the neuron so it can be created cleanly."
+                    )
+                    return False
+                else:
+                    bt.logging.warning(f"✅ Recovery succeeded for {self.DB_PATH}")
+            else:
+                bt.logging.info(f"✅ Database tables verified at '{self.DB_PATH}'")
+
             return True
+
         except Exception as e:
-            bt.logging.error(f" ❌ Error creating database: {e}")
+            import traceback
+            bt.logging.error(
+                "══════════════════════════════════════════════════════════════\n"
+                f"🚨 FATAL: Exception while creating/ensuring DB for prefix '{self.database_name_prefix}'\n"
+                f"   DB file : {self.DB_PATH}\n"
+                f"   Error   : {e}\n"
+                "   Full traceback:\n" + traceback.format_exc() +
+                "══════════════════════════════════════════════════════════════"
+            )
             return False
+
+    def _verify_and_log_table_state(self):
+        """Unconditional post-construction verification.
+
+        This always runs and logs the *actual* state of the DB file the process
+        is using right now. Extremely valuable when create_database logged success
+        but the user later discovers only sqlite_master exists.
+        """
+        try:
+            # We need a temporary engine bound to the same file to inspect it.
+            # We cannot reliably reuse self.SessionLocal here without side effects.
+            from sqlalchemy import create_engine as _ce, inspect as _insp
+
+            eng = _ce(self.DATABASE_URL, echo=False)
+            insp = _insp(eng)
+            actual_tables = sorted(insp.get_table_names())
+
+            # Define what we expect for this prefix
+            if self.database_name_prefix == "challenge_solutions":
+                expected = {"challenge_solutions", "miner_maintenance_incentives"}
+            elif self.database_name_prefix == "miner_submissions":
+                expected = {"miner_submissions", "miner_submission_statuses"}
+            else:
+                expected = set()
+
+            present = set(actual_tables)
+            missing = sorted(expected - present)
+            extra = sorted(present - expected)
+
+            status = "✅ HEALTHY" if not missing else "🚨 BROKEN / MISSING TABLES"
+            bt.logging.info(
+                f"🔍 DB STATE CHECK | prefix={self.database_name_prefix} | file={self.DB_PATH}\n"
+                f"    Status          : {status}\n"
+                f"    Tables found    : {actual_tables}\n"
+                f"    Expected        : {sorted(expected)}\n"
+                f"    Missing         : {missing}\n"
+                f"    Unexpected extra: {extra}"
+            )
+        except Exception as e:
+            bt.logging.error(f"🔍 DB STATE CHECK failed for {self.DB_PATH}: {e}")
 
     def get_db_session(self):
         """Get a SQLAlchemy database session."""

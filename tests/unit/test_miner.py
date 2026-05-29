@@ -16,6 +16,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
@@ -109,6 +110,7 @@ def mock_miner(mock_config):
         # SolutionPoller
         mock_poller = Mock()
         mock_poller.poll.return_value = None
+        mock_poller.poll_for_validator.return_value = None
         mock_solution_poller_cls.return_value = mock_poller
 
         # Proof builder
@@ -126,6 +128,8 @@ def mock_miner(mock_config):
         # only affect names at import time).
         miner.db_query = mock_db_query
         miner.solution_poller = mock_poller
+        # Ensure the method used by forward() is also available on the live instance
+        miner.solution_poller.poll_for_validator = mock_poller.poll_for_validator
 
         # Expose easy access for tests
         miner._mock_wallet = mock_wallet
@@ -349,6 +353,7 @@ class TestMinerForward:
         object.__setattr__(synapse, "dendrite", dendrite)
 
         mock_miner._mock_poller.poll.return_value = None
+        mock_miner._mock_poller.poll_for_validator.return_value = None
 
         result = self._run_forward(mock_miner, synapse)
         assert result is synapse
@@ -362,6 +367,7 @@ class TestMinerForward:
         submission = Mock()
         submission.tx_hash = None  # missing proof data
         mock_miner._mock_poller.poll.return_value = submission
+        mock_miner._mock_poller.poll_for_validator.return_value = submission
 
         result = self._run_forward(mock_miner, synapse)
         assert result is synapse
@@ -373,19 +379,22 @@ class TestMinerForward:
         object.__setattr__(synapse, "dendrite", dendrite)
 
         # Realistic attributes so SolutionCandidate.from_miner_submission succeeds
-        submission = Mock()
-        submission.tx_hash = "0xdeadbeef"
-        submission.transfer_block_hash = "0xblock"
-        submission.transfer_from_ss58 = "5From"
-        submission.transfer_to_ss58 = "5To"
-        submission.transfer_amount_rao = "1000000"
-        submission.upload_endpoint_id = "upload123"
-        submission.challenge_milestone_id = "milestone-42"
-        submission.challenge_id = "challenge-99"
-        submission.upload_id = "upload123"          # used by from_miner_submission
-        submission.miner_hotkey = "5MinerHotkey123"
+        # Use SimpleNamespace (not Mock) so Pydantic v2 accepts the values as real strings.
+        submission = SimpleNamespace(
+            tx_hash="0xdeadbeef",
+            transfer_block_hash="0xblock",
+            transfer_from_ss58="5From",
+            transfer_to_ss58="5To",
+            transfer_amount_rao="1000000",
+            upload_endpoint_id="upload123",
+            challenge_milestone_id="milestone-42",
+            challenge_id="challenge-99",
+            upload_id="upload123",  # used by from_miner_submission
+            miner_hotkey="5MinerHotkey123",
+        )
 
         mock_miner._mock_poller.poll.return_value = submission
+        mock_miner._mock_poller.poll_for_validator.return_value = submission
 
         # Ensure the build function returns a real string (the construction-time patch
         # sometimes doesn't fully intercept because of how the name is bound in neurons/miner).

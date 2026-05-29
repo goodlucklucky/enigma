@@ -60,5 +60,11 @@ def _flatten_single_top_level_dir(destination: str) -> None:
         else:
             shutil.copy2(source, target)
 
-    shutil.rmtree(root_dir_path)
+    bt.logging.info(f"🗑️ Removing temporary extraction dir: {root_dir_path}")
+    try:
+        shutil.rmtree(root_dir_path)
+        bt.logging.info(f"🗑️ Removed temporary extraction dir: {root_dir_path}")
+    except Exception as e:
+        bt.logging.warning(f"⚠️ Failed to remove temporary extraction dir {root_dir_path}: {e}")
+
     bt.logging.info(f"📂 Flattened top-level extracted directory: {root_dir_name}")

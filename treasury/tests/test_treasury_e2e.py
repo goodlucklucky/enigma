@@ -154,7 +154,7 @@ class TreasuryTest:
 
         try:
             sub_bal = float(self.subtensor.get_balance(ss58_addr)) if ss58_addr else 0.0
-        except:
+        except Exception:
             sub_bal = 0.0
 
         stake = 0.0
@@ -265,12 +265,13 @@ class TreasuryTest:
             time.sleep(2)
 
     def check_proposal_state(self, proposal_id: int) -> int:
-        if proposal_id is None: return -1
+        if proposal_id is None:
+            return -1
         cmd = ["cast", "call", self.contract, "state(uint256)(uint8)", str(proposal_id), "--rpc-url", self.rpc_url]
         res = subprocess.run(cmd, capture_output=True, text=True)
         try:
             return int(res.stdout.strip())
-        except:
+        except Exception:
             return -1
 
     def debug_validator(self):
@@ -318,7 +319,7 @@ class TreasuryTest:
         res = subprocess.run(cmd, capture_output=True, text=True)
         try:
             return int(res.stdout.strip())
-        except:
+        except Exception:
             return 0
 
     def get_alpha_balance(self, coldkey_ss58: str, hotkey_ss58: str) -> float:
