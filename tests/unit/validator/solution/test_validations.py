@@ -18,6 +18,7 @@
 import json
 import time
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from qbittensor.validator.solution.challenge_inputs.challenge_setups import (
@@ -43,7 +44,8 @@ class TestChallengeSetups:
         assert isinstance(result, str)
 
     def test_run_challenge_setup_unknown_milestone(self, tmp_path):
-        assert run_challenge_setup("unknown-id", str(tmp_path)) is False
+        with pytest.raises(RuntimeError, match="No challenge setup handler found"):
+            run_challenge_setup("unknown-id", str(tmp_path))
 
 
 class TestMockSolutionValidation:
@@ -63,7 +65,9 @@ class TestMockSolutionValidation:
 
         solution = self._signed_solution(private_key)
         (tmp_path / "result.json").write_text(json.dumps(solution))
-        assert run_mock(str(tmp_path)) is True
+        success, reason = run_mock(str(tmp_path))
+        assert success is True
+        assert reason is None
 
     def test_rejects_expired_timestamp(self, tmp_path, monkeypatch):
         private_key = Ed25519PrivateKey.generate()
@@ -75,12 +79,16 @@ class TestMockSolutionValidation:
         signature = private_key.sign(payload.encode("utf-8"))
         solution = {"status": "success", "signature": signature.hex(), "payload": payload}
         (tmp_path / "result.json").write_text(json.dumps(solution))
-        assert run_mock(str(tmp_path)) is False
+        success, reason = run_mock(str(tmp_path))
+        assert success is False
+        assert reason is not None
+        assert "older than one hour" in reason
 
 
 class TestSolutionValidator:
-    def test_unknown_milestone_returns_false(self, tmp_path):
-        assert validate_output(str(tmp_path), "not-a-real-milestone") is False
+    def test_unknown_milestone_raises(self, tmp_path):
+        with pytest.raises(RuntimeError, match="No output validation handler found"):
+            validate_output(str(tmp_path), "not-a-real-milestone")
 
     def test_known_milestone_dispatches(self, tmp_path, monkeypatch):
         private_key = Ed25519PrivateKey.generate()
@@ -95,4 +103,6 @@ class TestSolutionValidator:
             "payload": payload,
         }
         (tmp_path / "result.json").write_text(json.dumps(solution))
-        assert validate_output(str(tmp_path), MOCK_MILESTONE_ID) is True
+        success, reason = validate_output(str(tmp_path), MOCK_MILESTONE_ID)
+        assert success is True
+        assert reason is None

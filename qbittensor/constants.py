@@ -22,6 +22,13 @@ CROSS_CHECK_TIMEOUT: timedelta = timedelta(seconds=30)
 CROSS_CHECK_MAX_BATCH_SIZE: int = 3
 
 # --- Solutions Container Management ---
-SOLUTION_CONTAINER_MANAGER_TIMEOUT: timedelta = timedelta(minutes=30)
+# How often the SolutionContainerManager runs its periodic check.
+# This controls how quickly we detect completed solutions, prune exited
+# containers/images, and kill overdue ones.
+SOLUTION_CONTAINER_MANAGER_TIMEOUT: timedelta = timedelta(minutes=5)
+
+# Maximum allowed runtime for a single solution container before it is
+# forcibly terminated. The container manager will catch these on its next tick.
 MAX_SOLUTION_RUNTIME: timedelta = timedelta(minutes=30)
+
 MAX_SOLUTIONS: int = 1

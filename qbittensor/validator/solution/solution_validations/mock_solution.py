@@ -45,66 +45,64 @@ def _read_solution_payload(file_path: str) -> dict:
         return json.load(file)
 
 
-def run(file_path: str) -> bool:
+def run(file_path: str) -> tuple[bool, str | None]:
     """
     Validate mock challenge output by checking signature + timestamp freshness.
 
-    Loads JSON from ``file_path`` if it is a file; otherwise from ``result.json``
-    or ``output.txt`` inside the directory ``file_path``. Verifies an Ed25519
-    signature using ``ENIGMA_MOCK_PUBLIC_KEY`` (or the default dev key if unset),
-    and requires ``ts`` to be at most one hour in the past (and not far in the future).
-
-    Expected output format:
-    {
-      "status": "success",
-      "signature": "<hex>",
-      "payload": "{\"ts\": 1710000000, \"challenge\": \"mock\"}"
-    }
+    Returns (success, failure_reason).
+    The failure_reason (when present) is a human-readable explanation suitable
+    for reporting to the platform.
     """
     try:
         solution = _read_solution_payload(file_path)
     except Exception as e:
-        bt.logging.error(f"❌ Failed to read mock solution output: {e}")
-        return False
+        msg = f"Failed to read mock solution output: {e}"
+        bt.logging.error(f"❌ {msg}")
+        return False, msg
 
     status = solution.get("status")
     signature_hex = solution.get("signature")
     payload = solution.get("payload")
     if status != "success" or not signature_hex or not payload:
-        bt.logging.error("❌ Invalid mock solution fields (status/signature/payload)")
-        return False
+        msg = "Invalid mock solution fields (status/signature/payload)"
+        bt.logging.error(f"❌ {msg}")
+        return False, msg
 
     try:
         payload_data = json.loads(payload)
         ts = int(payload_data["ts"])
     except Exception as e:
-        bt.logging.error(f"❌ Invalid mock payload JSON: {e}")
-        return False
+        msg = f"Invalid mock payload JSON: {e}"
+        bt.logging.error(f"❌ {msg}")
+        return False, msg
 
     now = time.time()
     skew_seconds = ts - now
     if skew_seconds > MOCK_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS:
-        bt.logging.error(
-            "❌ Mock payload timestamp is too far in the future "
+        msg = (
+            f"Mock payload timestamp is too far in the future "
             f"({skew_seconds:.0f}s > {MOCK_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS}s skew allowed)"
         )
-        return False
+        bt.logging.error(f"❌ {msg}")
+        return False, msg
 
     age_seconds = now - ts
     if age_seconds > MOCK_TIMESTAMP_MAX_AGE_SECONDS:
-        bt.logging.error(
-            "❌ Mock payload timestamp older than one hour "
+        msg = (
+            f"Mock payload timestamp older than one hour "
             f"({age_seconds:.0f}s > {MOCK_TIMESTAMP_MAX_AGE_SECONDS}s)"
         )
-        return False
+        bt.logging.error(f"❌ {msg}")
+        return False, msg
 
     public_key_hex = os.getenv("ENIGMA_MOCK_PUBLIC_KEY") or ENIGMA_MOCK_PUBLIC_KEY
     try:
         public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
         public_key.verify(bytes.fromhex(signature_hex), payload.encode("utf-8"))
     except Exception as e:
-        bt.logging.error(f"❌ Invalid mock signature verification: {e}")
-        return False
+        msg = f"Invalid mock signature verification: {e}"
+        bt.logging.error(f"❌ {msg}")
+        return False, msg
 
     bt.logging.info("✅ Mock challenge output is valid")
-    return True
+    return True, None

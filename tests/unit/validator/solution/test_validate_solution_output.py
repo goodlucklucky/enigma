@@ -65,7 +65,7 @@ class TestVerifyUploadLocations:
 
 class TestPerformSolutionOutputValidation:
     @patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform")
-    @patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=True)
+    @patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(True, None))
     def test_success_path(self, _validate, _upload, platform_client):
         db = Mock()
         db.db_query.get_challenge_milestone_id_by_file_path.return_value = (
@@ -163,7 +163,7 @@ class TestValidateSolutionCorePaths:
 
         with patch("qbittensor.validator.solution.validate_solution_output.verify_upload_locations", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
-                patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=True):
+                patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(True, None)):
 
             status = validate_solution(ws, platform_client, db)
             assert status.upper() == "SUCCESS"
@@ -189,12 +189,13 @@ class TestValidateSolutionCorePaths:
 
         with patch("qbittensor.validator.solution.validate_solution_output.verify_upload_locations", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
-                patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=False):
+                patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(False, "Output validation failed")):
 
             status = validate_solution(ws, platform_client, db)
             assert status.upper() == "FAILED"
-            # In this minimal test (no artifacts dir created), the new logic skips output upload
-            # and therefore omits the output_data_key (safer / more accurate)
             platform_client.report_submission_status.assert_called_with(
-                "sub1", "Failure", log_data_key="log_id", output_data_key=None
+                "sub1", "Failure",
+                reason="Milestone m1: Output validation failed",
+                log_data_key="log_id",
+                output_data_key="out-id"
             )

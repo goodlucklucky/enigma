@@ -24,6 +24,7 @@ from typing import Optional, Tuple
 from .exceptions.validation_errors import ValidationErrors
 
 from qbittensor.validator.solution.challenge_inputs.challenge_setups import run_challenge_setup
+from .milestones import assert_milestone_supported
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.database.db_connection import DBConnection
 
@@ -176,6 +177,12 @@ def run_solution_management(
 
     except InvalidSolutionError as e:
         bt.logging.error(f"Invalid solution: {e.error_msg}")
+        import traceback
+        rich_reason = f"Invalid solution during processing: {e.error_msg}"
+        tb = traceback.format_exc()
+        if tb and "NoneType: None" not in tb:
+            rich_reason += f"\n\nTraceback:\n{tb}"
+
         if did_insert_solution and not did_start_solution:
             db_conn.db_query.update_challenge_solution_status(
                 tx_hash=tx_hash,
@@ -185,7 +192,7 @@ def run_solution_management(
             platform_client.report_submission_status(
                 submission_id=submission_id or "",
                 status="Failure",
-                reason="Invalid solution during processing",
+                reason=rich_reason[:2000],  # keep platform messages reasonable length
             )
         else:
             bt.logging.warning("No platform_client provided — could not report failure status to platform")
@@ -276,6 +283,11 @@ def execute_verified_solution(
         f"🧪 Beginning verified solution execution pipeline for submission={submission_id} "
         f"(miner {miner_hotkey}, tx {tx_hash}, milestone {challenge_milestone_id})"
     )
+
+    # Fail fast if this milestone does not have registered setup + validation handlers.
+    # Per design, we cannot execute solutions for unsupported milestones.
+    assert_milestone_supported(challenge_milestone_id)
+
     start_ts = time.time()
 
     image_name, container_id, folder_name = run_solution_management(
@@ -341,7 +353,7 @@ def execute_verified_solution(
             platform_client.report_submission_status(
                 submission_id=submission_id,
                 status="Failure",
-                reason="RunFailed",
+                reason="Execution pipeline failed before container could produce output. Check validator logs around the submission timestamp for details (download/build/start phase).",
                 log_data_key=log_data_key,
                 output_data_key=output_data_key,
             )

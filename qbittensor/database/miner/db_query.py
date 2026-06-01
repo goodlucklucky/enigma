@@ -133,9 +133,27 @@ class DBQueryMiner(BaseDBQuery):
         (validator_hotkey, tx_hash, challenge_milestone_id) tuple (e.g. we previously
         recorded "OFFERED"), we atomically update the status instead of attempting
         a duplicate INSERT (which can fail the tx_hash FK or create duplicates).
+
+        If no MinerSubmission row exists for the tx_hash (e.g. stale status update
+        from a validator that retains historical ChallengeSolution rows after the
+        miner reset its local DB, or cross-check discovered submissions), we skip
+        gracefully with a warning to avoid FK constraint errors.
         """
         try:
             with self._managed_session() as session:
+                tx_exists = (
+                    session.query(MinerSubmission.tx_hash)
+                    .filter_by(tx_hash=tx_hash)
+                    .first()
+                    is not None
+                )
+                if not tx_exists:
+                    bt.logging.warning(
+                        f"⚠️ Ignoring submission status '{solution_status}' for unknown tx_hash: {tx_hash} "
+                        f"(no matching row in miner_submissions; likely stale validator history)"
+                    )
+                    return False
+
                 now = datetime.now(timezone.utc)
                 stmt = sqlite_insert(MinerSubmissionStatus).values(
                     id=str(uuid.uuid4()),

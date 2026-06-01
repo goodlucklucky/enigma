@@ -100,7 +100,7 @@ class SolutionCrossChecker:
                 self.platform_client.report_submission_status(
                     submission_id=submission.id,
                     status="Failure",
-                    reason=proof_err or "VerificationFailed",
+                    reason=proof_err or "Transfer proof verification failed for cross-check submission",
                 )
                 return
             else:

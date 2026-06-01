@@ -20,6 +20,8 @@ from typing import Callable, Optional
 
 from qbittensor.validator.solution.challenge_inputs.mock_solution_setup import mock_solution_setup
 from qbittensor.validator.solution.solution_validations.mock_solution import run as run_mock_solution
+from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
+from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
 
 
 @dataclass(frozen=True)
@@ -55,3 +57,32 @@ MILESTONE_REGISTRY: dict[str, MilestoneHandlers] = {
 def get_milestone_handlers(milestone_id: str) -> MilestoneHandlers | None:
     """Return the handlers for a milestone, or None if the milestone is unknown."""
     return MILESTONE_REGISTRY.get(milestone_id)
+
+
+def assert_milestone_supported(challenge_milestone_id: str) -> None:
+    """
+    Enforce that a milestone has registered handlers for both setup and validation.
+
+    Per design, every runnable milestone must have these handlers.
+    If not present, the solution cannot be executed.
+    This check should be performed very early (before downloading or building images).
+    """
+    handlers = get_milestone_handlers(challenge_milestone_id)
+    if not handlers:
+        raise InvalidSolutionError(
+            message=ValidationErrors.INVALID_PROGRAM.value,
+            details=f"No handlers registered for milestone '{challenge_milestone_id}'. "
+                    "This milestone is not supported for execution.",
+        )
+
+    if not handlers.setup:
+        raise InvalidSolutionError(
+            message=ValidationErrors.INVALID_PROGRAM.value,
+            details=f"Milestone '{challenge_milestone_id}' is missing a challenge setup handler.",
+        )
+
+    if not handlers.validate:
+        raise InvalidSolutionError(
+            message=ValidationErrors.INVALID_PROGRAM.value,
+            details=f"Milestone '{challenge_milestone_id}' is missing an output validation handler.",
+        )

@@ -143,89 +143,54 @@ def _resolve_cli_api_auth(
     )
 
 
-def _prompt_for_keyfile_path(console: Console) -> Path | None:
-    """Ask the user for a keyfile path on disk; returns the expanded ``Path`` or ``None`` to cancel."""
-    console.print(
-        _styled_panel(
-            "Hotkey keyfile not found",
-            Text.assemble(
-                ("Enter the full path to your ", f"dim {c(3)}"),
-                ("hotkey keyfile", f"bold {c(0)}"),
-                (" used to sign challenges API requests.", f"dim {c(3)}"),
-                ("\n", ""),
-                ("Leave empty to cancel.", f"dim {c(3)}"),
-            ),
-            border=f"bold {c(4)}",
-        )
-    )
-    if _HAVE_TERMIOS and sys.stdin.isatty():
-        try:
-            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-        except OSError:
-            pass
-    raw = (
-        Prompt.ask(
-            Text.assemble(("Path to keyfile", f"dim {c(3)}")),
-            console=console,
-            default="",
-            show_default=False,
-        )
-        or ""
-    ).strip()
-    if not raw:
-        return None
-    return Path(raw).expanduser()
-
-
 def _load_signing_keypair(console: Console, auth: CliApiAuth) -> bt.Keypair:
     """Return the keypair ``RequestManager`` uses to sign API requests.
 
-    Prefers ``MINER_KEYFILE_PATH`` from the environment (e.g. from ``.env``)
-    when that path exists. Otherwise falls back to the on-disk wallet.
+    The only supported ways to configure the signing key are:
+    - The standard bittensor wallet via --wallet.name / --wallet.hotkey / --wallet.path
+    - The MINER_KEYFILE_PATH environment variable (power-user escape hatch)
+
+    Interactive prompting for a raw keyfile path is intentionally not supported.
+    Users must configure their wallet properly.
     """
+    # Power-user override via environment variable
     env_key = (os.getenv("MINER_KEYFILE_PATH") or "").strip()
-    env_path = Path(env_key).expanduser() if env_key else None
-    if env_path is not None and env_path.is_file():
+    if env_key:
+        env_path = Path(env_key).expanduser()
+        if not env_path.is_file():
+            raise click.ClickException(
+                f"MINER_KEYFILE_PATH is set but the file does not exist: {env_path}"
+            )
         try:
             return bt.Keyfile(path=str(env_path)).keypair
         except Exception as e:
-            console.print(
-                _styled_panel(
-                    "Failed to load keyfile",
-                    f"MINER_KEYFILE_PATH={env_path}\n{e}",
-                    border=f"bold {c(4)}",
-                )
-            )
-
-    wallet = bt.Wallet(name=auth.wallet_name, hotkey=auth.wallet_hotkey, path=auth.wallet_path)
-    if wallet.hotkey_file.exists_on_device():
-        return wallet.hotkey
-    while True:
-        path = _prompt_for_keyfile_path(console)
-        if path is None:
             raise click.ClickException(
-                "No hotkey keyfile provided; cannot sign challenges API requests."
-            )
-        if not path.is_file():
-            console.print(
-                _styled_panel(
-                    "Invalid keyfile path",
-                    f"Not a file: {path}",
-                    border=f"bold {c(4)}",
-                )
-            )
-            continue
-        try:
-            return bt.Keyfile(path=str(path)).keypair
-        except Exception as e:
-            console.print(
-                _styled_panel(
-                    "Failed to load keyfile",
-                    str(e),
-                    border=f"bold {c(4)}",
-                )
-            )
-            continue
+                f"Failed to load signing key from MINER_KEYFILE_PATH={env_path}\n{e}"
+            ) from e
+
+    # Normal path: use the bittensor wallet configuration
+    try:
+        wallet = bt.Wallet(
+            name=auth.wallet_name,
+            hotkey=auth.wallet_hotkey,
+            path=auth.wallet_path,
+        )
+        return wallet.hotkey
+    except Exception as e:
+        wallet_desc = (
+            f"'{auth.wallet_name}' / '{auth.wallet_hotkey}'"
+            + (f" (path={auth.wallet_path})" if auth.wallet_path else "")
+        )
+        raise click.ClickException(
+            f"Failed to load hotkey for platform API authentication from wallet {wallet_desc}.\n\n"
+            f"Error: {e}\n\n"
+            "Please configure your wallet using the standard flags:\n"
+            "  --wallet.name NAME\n"
+            "  --wallet.hotkey HOTKEY\n"
+            "  --wallet.path PATH     (optional, for custom wallets directory)\n\n"
+            "Or set the MINER_KEYFILE_PATH environment variable to point directly\n"
+            "at a hotkey keyfile (advanced use only)."
+        ) from e
 
 
 def _challenges_client_for_api(
@@ -495,21 +460,16 @@ def run_milestone_solution_upload(
             ) from e
         raise click.ClickException(f"Failed to verify milestone submission window: {e}") from e
 
-    # Derive the miner hotkey SS58 from the configured wallet (no MINER_HOTKEY_SS58).
+    # Derive the miner hotkey SS58 from the configured wallet.
     # The hotkey from --wallet.name / --wallet.hotkey is used as the registered miner identity.
     try:
-        wallet = bt.Wallet(
-            name=api_auth.wallet_name,
-            hotkey=api_auth.wallet_hotkey,
-            path=api_auth.wallet_path,
-        )
-        miner_hotkey = wallet.hotkey.ss58_address
+        miner_hotkey = _get_miner_hotkey_ss58(api_auth)
         console.print(f"Using miner hotkey from wallet: {miner_hotkey}")
-    except Exception as e:
+    except click.ClickException as e:
+        # Re-raise with additional context specific to the submission flow
         raise click.ClickException(
-            f"Failed to load hotkey from wallet '{api_auth.wallet_name}' / '{api_auth.wallet_hotkey}'.\n"
-            f"Error: {e}\n\n"
-            "Make sure the wallet and hotkey exist and are unlocked if password-protected."
+            str(e) + "\nThe same configuration is used both for API authentication and for\n"
+            "identifying which hotkey is submitting the solution."
         ) from e
     console.print(
         _styled_panel(
@@ -1474,57 +1434,213 @@ def run_miner_main_menu(console: Console, base_url: str | None, api_auth: CliApi
             continue
 
 
-def _list_my_submissions(console: Console, api_auth: CliApiAuth) -> None:
-    """Show the operator their local submissions and received validator statuses."""
-    miner_hotkey = (os.getenv("MINER_HOTKEY_SS58") or "").strip()
-    if not miner_hotkey:
-        miner_hotkey = Prompt.ask(
-            Text.assemble(("Enter your miner hotkey (SS58)", f"dim {c(3)}"))
-        ).strip()
+def _get_miner_hotkey_ss58(api_auth: CliApiAuth) -> str:
+    """Resolve the SS58 address of the miner's hotkey.
 
-    if not miner_hotkey:
-        console.print("[yellow]No hotkey provided.[/]")
+    Priority:
+      1. MINER_HOTKEY_SS58 environment variable (explicit/power-user override)
+      2. The hotkey from --wallet.name / --wallet.hotkey (the normal path)
+    """
+    env_hotkey = (os.getenv("MINER_HOTKEY_SS58") or "").strip()
+    if env_hotkey:
+        return env_hotkey
+
+    try:
+        wallet = bt.Wallet(
+            name=api_auth.wallet_name,
+            hotkey=api_auth.wallet_hotkey,
+            path=api_auth.wallet_path,
+        )
+        return wallet.hotkey.ss58_address
+    except Exception as e:
+        wallet_desc = (
+            f"'{api_auth.wallet_name}' / '{api_auth.wallet_hotkey}'"
+            + (f" (path={api_auth.wallet_path})" if api_auth.wallet_path else "")
+        )
+        raise click.ClickException(
+            f"Failed to load miner hotkey from wallet {wallet_desc}.\n\n"
+            f"Error: {e}\n\n"
+            "Please configure your wallet using:\n"
+            "  --wallet.name NAME\n"
+            "  --wallet.hotkey HOTKEY\n"
+            "  --wallet.path PATH     (optional)\n\n"
+        ) from e
+
+
+def _submission_table(submissions: list[dict], selected: int) -> Table:
+    """Build a selectable table of submissions with highlight on the current row."""
+    table = Table(
+        title=Text("Your Submissions", style=f"bold {c(1)}"),
+        box=box.ROUNDED,
+        border_style=f"dim {c(4)}",
+        header_style=f"bold {c(1)}",
+        expand=True,
+    )
+    table.add_column("", width=3, justify="center")
+    table.add_column("TX (short)", style="dim")
+    table.add_column("Milestone", style="cyan")
+    table.add_column("Submitted", style="green")
+    table.add_column("Validator Statuses", style="white")
+
+    if not submissions:
+        table.add_row("—", "[dim]No submissions[/dim]", "", "", "")
+        return table
+
+    n = len(submissions)
+    sel = max(0, min(selected, n - 1))
+
+    for i, sub in enumerate(submissions):
+        marker = "▶" if i == sel else " "
+        row_style: str | None = "reverse bold" if i == sel else None
+
+        tx_short = (sub.get("tx_hash") or "?")[:12] + "..."
+        ms_short = (sub.get("challenge_milestone_id") or "?")[:8] + "..."
+        submitted = (
+            sub["submitted_at"].strftime("%Y-%m-%d %H:%M")
+            if sub.get("submitted_at")
+            else "[dim]—[/dim]"
+        )
+
+        status_lines = []
+        for vhotkey, info in (sub.get("validator_statuses") or {}).items():
+            status = info.get("status", "?")
+            color = c(2) if str(status).lower() in ("success", "offered") else c(1)
+            status_lines.append(f"[{color}]{status}[/]")
+
+        status_display = "  ".join(status_lines) if status_lines else "[dim]—[/dim]"
+
+        table.add_row(
+            marker,
+            tx_short,
+            ms_short,
+            submitted,
+            status_display,
+            style=row_style,
+        )
+    return table
+
+
+def _submissions_frame(submissions: list[dict], selected: int, hotkey_short: str) -> Group:
+    """Wrap the submissions table with consistent footer (matches challenge/milestone lists)."""
+    body = _submission_table(submissions, selected)
+    footer = Align.center(
+        Text.assemble(
+            ("↑ ↓ ", f"bold {c(2)}"),
+            ("Select   ", f"dim {c(3)}"),
+            ("Enter ", f"bold {c(0)}"),
+            ("Details   ", f"dim {c(3)}"),
+            ("q ", f"bold {c(1)}"),
+            ("Back to menu", f"dim {c(3)}"),
+        )
+    )
+    return Group(body, Text(""), footer)
+
+
+def _show_submission_details(console: Console, sub: dict[str, Any]) -> None:
+    """Drill-down view for a single submission (shown after pressing Enter on the list)."""
+    tx = sub.get("tx_hash", "?")
+    ms_id = sub.get("challenge_milestone_id", "?")
+    submitted = sub.get("submitted_at")
+    submitted_str = submitted.strftime("%Y-%m-%d %H:%M:%S") if submitted else "—"
+
+    body = Text()
+    body.append("TX Hash:     ", style="dim")
+    body.append(tx + "\n", style="bold")
+    body.append("Milestone:   ", style="dim")
+    body.append(ms_id + "\n", style="cyan")
+    body.append("Submitted:   ", style="dim")
+    body.append(submitted_str + "\n\n", style="green")
+
+    statuses = sub.get("validator_statuses") or {}
+    if statuses:
+        body.append("Validator Reports:\n", style="bold")
+        for vhotkey, info in statuses.items():
+            status = info.get("status", "?")
+            color = c(2) if str(status).lower() in ("success", "offered") else c(1)
+            ts = info.get("reported_at")
+            ts_str = ts.strftime("%Y-%m-%d %H:%M") if ts else ""
+            body.append(f"  {vhotkey[:10]}...  ", style="dim")
+            body.append(f"[{color}]{status}[/]", style=color)
+            if ts_str:
+                body.append(f"  ({ts_str})", style="dim")
+            body.append("\n")
+    else:
+        body.append("[dim]No validator status reports received yet.[/dim]")
+
+    panel = Panel(
+        body,
+        title="[bold]Submission Details[/bold]",
+        border_style=f"dim {c(4)}",
+        box=box.ROUNDED,
+    )
+    console.print(panel)
+    Prompt.ask("Press Enter to return to list", default="", show_default=False)
+
+
+def _list_my_submissions(console: Console, api_auth: CliApiAuth) -> None:
+    """Interactive list of your submissions (↑↓ to select, Enter for details, q to go back).
+
+    Uses the same Live + arrow-key pattern as the challenge and milestone lists.
+    IMPORTANT: All blocking input (Prompt) must happen *outside* any Live context,
+    otherwise terminal state gets corrupted and 'q' / arrow keys become flaky.
+    """
+    try:
+        miner_hotkey = _get_miner_hotkey_ss58(api_auth)
+    except click.ClickException as e:
+        console.print(f"[red]{e}[/red]")
         return
 
     db_connection = DBConnection(
         database_name_prefix=MINER_DB_TABLE_PREFIX,
         hotkey=miner_hotkey,
     )
-
     submissions = db_connection.db_query_miner.list_my_submissions_with_status(limit=100)
 
     if not submissions:
         console.print("[yellow]No submissions found in your local database.[/]")
+        Prompt.ask("Press Enter to return to menu", default="", show_default=False)
         return
 
-    table = Table(title=f"Your Submissions ({miner_hotkey[:8]}...)", box=box.ROUNDED)
-    table.add_column("TX Hash (short)", style="dim")
-    table.add_column("Milestone", style="cyan")
-    table.add_column("Submitted At", style="green")
-    table.add_column("Validator Statuses", style="white")
+    hotkey_short = miner_hotkey[:8] + "..."
+    n = len(submissions)
+    selected = 0
+    pending_sub: dict | None = None
 
-    for sub in submissions:
-        tx_short = sub["tx_hash"][:12] + "..." if sub["tx_hash"] else "?"
-        submitted = sub["submitted_at"].strftime("%Y-%m-%d %H:%M") if sub["submitted_at"] else "[dim]never[/]"
+    if not _HAVE_TERMIOS or not sys.stdin.isatty():
+        # Non-interactive fallback
+        console.print(_submission_table(submissions, 0))
+        Prompt.ask("Press Enter to return to menu", default="", show_default=False)
+        return
 
-        status_lines = []
-        for vhotkey, info in sub.get("validator_statuses", {}).items():
-            status = info.get("status", "?")
-            color = "green" if status.lower() in ("success", "offered") else "red"
-            status_lines.append(f"[{color}]{status}[/] ({vhotkey[:8]}...)")
+    while True:
+        with Live(
+            _submissions_frame(submissions, selected, hotkey_short),
+            console=console,
+            refresh_per_second=12,
+            transient=False,
+        ) as live:
+            while True:
+                selected = max(0, min(selected, n - 1))
+                live.update(_submissions_frame(submissions, selected, hotkey_short))
+                key = _read_key_unix()
 
-        status_display = "\n".join(status_lines) if status_lines else "[dim]No status yet[/]"
+                if key in (KEY_Q, KEY_Q_UPPER):
+                    return
 
-        table.add_row(
-            tx_short,
-            sub["challenge_milestone_id"][:8] + "...",
-            submitted,
-            status_display,
-        )
+                if key == KEY_UP:
+                    selected = (selected - 1) % n
+                elif key == KEY_DOWN:
+                    selected = (selected + 1) % n
+                elif key in (KEY_ENTER, KEY_ENTER_ALT):
+                    pending_sub = submissions[selected]
+                    break  # Exit inner loop + Live *before* doing any input
 
-    console.print(table)
-    console.print()
-    Prompt.ask("Press Enter to return to menu", default="")
+        # We are now safely outside the Live context
+        if pending_sub is not None:
+            _show_submission_details(console, pending_sub)
+            pending_sub = None
+            # Loop back → new Live will be created with current selection
+            continue
 
 
 if __name__ == "__main__":

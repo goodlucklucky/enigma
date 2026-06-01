@@ -15,6 +15,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+from datetime import timedelta
 from typing import Optional
 import requests
 
@@ -211,6 +212,45 @@ class ChallengesClient:
         raise RuntimeError(
             f"milestone_id {milestone_id} not found under challenge {challenge_id}"
         )
+
+    def get_milestone_max_solution_runtime(
+        self,
+        challenge_id: str,
+        milestone_id: str,
+        *,
+        default_seconds: int = 1800,  # 30 minutes fallback
+    ) -> timedelta:
+        """
+        Fetch the max allowed solution runtime for a specific milestone from its
+        configuration in the Challenges API.
+
+        Expected structure in the milestone JSON:
+            {
+              "id": "...",
+              "configuration": {
+                "max_solution_runtime": 1800   # seconds
+              },
+              ...
+            }
+
+        Returns a timedelta. Falls back to default_seconds if not present or on error.
+        """
+        try:
+            challenge = self.get_challenge(challenge_id)
+            for ms in challenge.get("milestones", []):
+                if str(ms.get("id")) == str(milestone_id):
+                    config = ms.get("configuration") or {}
+                    runtime = config.get("max_solution_runtime")
+                    if runtime is not None:
+                        return timedelta(seconds=int(runtime))
+                    break
+        except Exception as e:
+            bt.logging.warning(
+                f"Failed to fetch max_solution_runtime for milestone {milestone_id} "
+                f"(challenge {challenge_id}): {e}. Using default."
+            )
+
+        return timedelta(seconds=default_seconds)
 
     # ------------------------------------------------------------------
     # Authenticated endpoints (require RequestManager)

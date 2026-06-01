@@ -24,7 +24,10 @@ from qbittensor.database.db_connection import DBConnection
 from qbittensor.validator.solution.run_solution import extract_stdout_output
 from qbittensor.validator.solution.validate_solution_output import validate_solution
 from qbittensor.utils.services.challenges import ChallengesClient
-from qbittensor.constants import SOLUTION_CONTAINER_MANAGER_TIMEOUT, MAX_SOLUTION_RUNTIME, MAX_SOLUTIONS
+from qbittensor.constants import SOLUTION_CONTAINER_MANAGER_TIMEOUT, MAX_SOLUTIONS
+# Fallback only - real value should come from milestone configuration via the API
+from datetime import timedelta
+DEFAULT_MAX_SOLUTION_RUNTIME = timedelta(minutes=30)
 import bittensor as bt
 
 
@@ -35,6 +38,7 @@ class SolutionContainerManager:
         self.timer: Timer = Timer(timeout=SOLUTION_CONTAINER_MANAGER_TIMEOUT, run=self.run, run_on_start=True)
         self.database_connection = database_connection
         self.LABEL = validator_label
+        self._runtime_cache: dict[str, timedelta] = {}  # key: "challenge_id:milestone_id" -> timedelta
 
     def run(self) -> None:
         bt.logging.info("🐳 Starting periodic solution container check (pruning, completed, overdue)")
@@ -289,6 +293,64 @@ class SolutionContainerManager:
         prefix = f"{self.LABEL.lower()}_"
         return name.startswith(prefix)
 
+    def _get_max_runtime_for_container(self, container_identifier: str) -> timedelta:
+        """
+        Resolve the max allowed runtime for the milestone associated with this container
+        by looking up the solution record in the local DB and then querying the
+        Challenges API for that milestone's configuration.max_solution_runtime.
+        """
+        try:
+            container_name = container_identifier
+
+            # If we were given a container ID (from docker ps), resolve the human-readable name
+            if not container_identifier.startswith(self.LABEL.lower()):
+                try:
+                    name_res = subprocess.run(
+                        ["docker", "inspect", "--format", "{{.Name}}", container_identifier],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    raw_name = name_res.stdout.strip().lstrip("/")
+                    if raw_name:
+                        container_name = raw_name
+                except Exception:
+                    pass  # fall back to using the identifier as-is
+
+            # Primary lookup by container_name
+            solution = self.database_connection.db_query.get_challenge_solution_location(
+                container_name=container_name
+            )
+
+            if solution and hasattr(solution, "challenge_milestone_id"):
+                milestone_id = solution.challenge_milestone_id
+                challenge_id = getattr(solution, "challenge_id", None)
+
+                cache_key = f"{challenge_id or ''}:{milestone_id}"
+                if cache_key in self._runtime_cache:
+                    return self._runtime_cache[cache_key]
+
+                if self.platform_client:
+                    runtime = self.platform_client.get_milestone_max_solution_runtime(
+                        challenge_id=challenge_id or "",
+                        milestone_id=milestone_id,
+                    )
+                    self._runtime_cache[cache_key] = runtime
+                    bt.logging.debug(
+                        f"Resolved max_solution_runtime={runtime} for milestone {milestone_id}"
+                    )
+                    return runtime
+
+            bt.logging.debug(
+                f"Could not resolve milestone for container {container_identifier}. "
+                f"Using default max runtime."
+            )
+            return DEFAULT_MAX_SOLUTION_RUNTIME
+
+        except Exception as e:
+            bt.logging.warning(f"Failed to resolve max runtime for container {container_identifier}: {e}")
+            return DEFAULT_MAX_SOLUTION_RUNTIME
+
     def _get_overdue_containers(self) -> List[str]:
         """
         Get all of the containers that match our solution label that have been running for too long and need to be terminated
@@ -334,7 +396,8 @@ class SolutionContainerManager:
                     continue
                 started_at = _parse_started_at(started_at_raw)
                 runtime = now - started_at
-                if runtime > MAX_SOLUTION_RUNTIME:
+                max_runtime = self._get_max_runtime_for_container(cid)
+                if runtime > max_runtime:
                     overdue.append(cid)
             except Exception as e:
                 bt.logging.error(f"❌ Failed to inspect container {cid}: {e}")
@@ -343,7 +406,10 @@ class SolutionContainerManager:
 
     def _terminate_overdue_containers(self, overdue_containers: List[str]) -> None:
         """Terminate all overdue containers"""
-        bt.logging.info(f"🛑 Starting termination of {len(overdue_containers)} overdue solutions (runtime exceeded MAX_SOLUTION_RUNTIME)")
+        bt.logging.info(
+            f"🛑 Starting termination of {len(overdue_containers)} overdue solutions "
+            f"(runtime exceeded the milestone's configured max_solution_runtime)"
+        )
         terminated = 0
         images_removed = 0
         for cid in overdue_containers:

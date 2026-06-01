@@ -20,6 +20,7 @@ import binascii
 import os
 import shutil
 import subprocess
+import time
 import zipfile
 
 import bittensor as bt
@@ -122,6 +123,9 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
     host_output = os.path.join(os.path.abspath(host_workspace), CONTAINER_OUTPUT_DIRNAME)
     os.makedirs(host_output, exist_ok=True)
 
+    artifacts_dir = os.path.join(host_output, CONTAINER_SOLUTION_DIRNAME)
+    os.makedirs(artifacts_dir, exist_ok=True)
+
     max_bytes = _stdout_max_bytes()
     try:
         result = subprocess.run(
@@ -134,9 +138,11 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
         bt.logging.error(
             f"❌ Failed to read stdout from '{container_ref}': {stderr}"
         )
+        _write_extraction_diagnostics(artifacts_dir, container_ref, f"docker logs failed: {stderr}")
         return False
     except OSError as e:
         bt.logging.error(f"❌ Failed to invoke docker logs for '{container_ref}': {e}")
+        _write_extraction_diagnostics(artifacts_dir, container_ref, f"Failed to invoke docker logs: {e}")
         return False
 
     raw_stdout = result.stdout or b""
@@ -147,6 +153,10 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
         )
         truncated = raw_stdout[:max_bytes]
         _write_log_file(host_output, truncated)
+        _write_extraction_diagnostics(
+            artifacts_dir, container_ref,
+            f"stdout exceeded cap ({len(raw_stdout)} > {max_bytes} bytes). Truncated logs written; no artifacts extracted."
+        )
         return False
 
     logs_bytes, payload_b64, separator_found = _split_on_separator(raw_stdout)
@@ -157,6 +167,14 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
             f"⚠️ No solution-output separator found in stdout of '{container_ref}'; "
             f"treating the entire stdout as logs and skipping artifact extraction."
         )
+        _write_extraction_diagnostics(
+            artifacts_dir, container_ref,
+            "No SOLUTION_OUTPUT_SEPARATOR found in container stdout.\n"
+            "The solution must write logs, then exactly this line on its own line:\n"
+            f"{SOLUTION_OUTPUT_SEPARATOR.decode('utf-8', errors='replace')!r}\n"
+            "then base64-encoded zip of result.json + output.txt.\n"
+            "See the mock_solution.py example for the required contract."
+        )
         return True
 
     try:
@@ -165,6 +183,7 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
         bt.logging.error(
             f"❌ Solution payload from '{container_ref}' is not valid base64: {e}"
         )
+        _write_extraction_diagnostics(artifacts_dir, container_ref, f"Base64 decode of solution payload failed: {e}")
         return False
 
     zip_path = os.path.join(host_output, SOLUTION_OUTPUT_ZIP_FILENAME)
@@ -175,9 +194,9 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
         bt.logging.error(
             f"❌ Failed to write solution zip for '{container_ref}' to '{zip_path}': {e}"
         )
+        _write_extraction_diagnostics(artifacts_dir, container_ref, f"Failed to write decoded solution zip: {e}")
         return False
 
-    artifacts_dir = os.path.join(host_output, CONTAINER_SOLUTION_DIRNAME)
     if os.path.isdir(artifacts_dir):
         shutil.rmtree(artifacts_dir)
     os.makedirs(artifacts_dir, exist_ok=True)
@@ -187,12 +206,22 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
             f"⚠️ Solution-output payload from '{container_ref}' is empty after the separator; "
             f"leaving '{artifacts_dir}' empty."
         )
+        _write_extraction_diagnostics(
+            artifacts_dir, container_ref,
+            "Separator was present but the base64 payload after it was empty. "
+            "The solution wrote the separator line but no (or zero-length) zip data after it."
+        )
         return True
 
     if not zipfile.is_zipfile(zip_path):
         bt.logging.error(
             f"❌ Solution-output payload from '{container_ref}' at '{zip_path}' "
             f"is not a valid zip archive; skipping artifact extraction."
+        )
+        _write_extraction_diagnostics(
+            artifacts_dir, container_ref,
+            f"Decoded payload after separator is not a valid zip file (path: {zip_path}). "
+            "Common causes: logging after the separator, wrong base64, or the solution wrote raw binary instead of base64."
         )
         return False
 
@@ -203,11 +232,13 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
         bt.logging.error(
             f"❌ Failed to read solution zip for '{container_ref}' at '{zip_path}': {e}"
         )
+        _write_extraction_diagnostics(artifacts_dir, container_ref, f"BadZipFile when extracting: {e}")
         return False
     except (OSError, RuntimeError) as e:
         bt.logging.error(
             f"❌ Failed to extract solution zip for '{container_ref}' to '{artifacts_dir}': {e}"
         )
+        _write_extraction_diagnostics(artifacts_dir, container_ref, f"Failed to extract solution zip: {e}")
         return False
 
     bt.logging.info(
@@ -237,6 +268,25 @@ def _write_log_file(host_output_dir: str, logs_bytes: bytes) -> None:
             f.write(logs_bytes)
     except OSError as e:
         bt.logging.error(f"❌ Failed to write log file '{log_path}': {e}")
+
+
+def _write_extraction_diagnostics(artifacts_dir: str, container_ref: str, message: str) -> None:
+    """Write a small diagnostics file inside the solution artifacts directory.
+
+    This ensures that even on extraction failures, useful diagnostic information
+    (e.g. missing separator, bad base64, docker logs failure, etc.) is included
+    when the artifacts directory is zipped and uploaded on the failure path.
+    """
+    os.makedirs(artifacts_dir, exist_ok=True)
+    diag_path = os.path.join(artifacts_dir, "extraction_diagnostics.txt")
+    try:
+        with open(diag_path, "w", encoding="utf-8") as f:
+            f.write(f"Container: {container_ref}\n")
+            f.write(f"Time: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n\n")
+            f.write(message)
+            f.write("\n")
+    except Exception as e:
+        bt.logging.warning(f"⚠️ Failed to write extraction diagnostics file: {e}")
 
 
 def _safe_extract_zip(zf: zipfile.ZipFile, destination: str) -> None:

@@ -140,7 +140,7 @@ def perform_solution_output_validation(
 
     bt.logging.info(f"🛡️ Performing validation of solution output at '{container_output_path}'")
     solution_folder_path = os.path.join(container_output_path, CONTAINER_SOLUTION_DIRNAME)
-    success: bool = validate_output(solution_folder_path, challenge_milestone_id)
+    success, validation_failure_reason = validate_output(solution_folder_path, challenge_milestone_id)
 
     output_uploaded = False
 
@@ -170,14 +170,18 @@ def perform_solution_output_validation(
     else:
         bt.logging.info("\t❌ Solution output invalid")
 
-        # Best effort: still try to upload whatever artifacts exist so the platform has them
         bt.logging.info("📤 Attempting upload of solution output artifacts (validation failed) for diagnostics...")
-        if os.path.isdir(solution_folder_path) and any(os.scandir(solution_folder_path)):
+        try:
             output_uploaded = upload_zip_to_platform(
                 solution_folder_path, solution_output_data, "solution_output", zip_entire_directory=True
             )
-        else:
-            bt.logging.info("\tℹ️ No solution artifacts directory found or it is empty — skipping output upload on failure")
+        except Exception as upload_exc:
+            bt.logging.warning(f"⚠️ Failed to upload solution artifacts on failure path: {upload_exc}")
+            output_uploaded = False
+
+        failure_message = validation_failure_reason or "Output validation failed (see uploaded stdout.log and solution_output artifacts for details)"
+        if challenge_milestone_id:
+            failure_message = f"Milestone {challenge_milestone_id}: {failure_message}"
 
         report_payload = {
             "status": "Failure",
@@ -187,6 +191,7 @@ def perform_solution_output_validation(
         if challenges_client.report_submission_status(
             submission_id,
             report_payload["status"],
+            reason=failure_message,
             log_data_key=report_payload["log_data_key"],
             output_data_key=report_payload["output_data_key"],
         ):

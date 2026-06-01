@@ -20,13 +20,25 @@ import bittensor as bt
 from qbittensor.validator.solution.milestones import get_milestone_handlers
 
 
-def validate_output(solution_folder_path: str, challenge_milestone_id: str) -> bool:
-    """Run the output validation logic for a given milestone (if one exists)."""
+def validate_output(solution_folder_path: str, challenge_milestone_id: str) -> tuple[bool, str | None]:
+    """Run the output validation logic for a given milestone.
+
+    Assumes the milestone has already been validated as supported.
+
+    Returns:
+        (success, failure_reason)
+        failure_reason is a descriptive string when success is False, suitable
+        for reporting to the platform (includes the actual validation error).
+    """
     handlers = get_milestone_handlers(challenge_milestone_id)
     if not handlers or not handlers.validate:
-        bt.logging.error(
-            f"❌ No output validation found for milestone ID '{challenge_milestone_id}'"
+        # This should not happen if assert_milestone_supported was called earlier.
+        msg = (
+            f"Internal error: No output validation handler found for milestone '{challenge_milestone_id}' "
+            "(expected to have been checked earlier)."
         )
-        return False
+        raise RuntimeError(msg)
 
+    # All registered milestone validators are expected to return
+    # (success: bool, failure_reason: str | None)
     return handlers.validate(solution_folder_path)

@@ -95,3 +95,17 @@ class TestDBQueryMiner:
         assert miner_query.insert_miner_submission_status(
             "m1", "SUCCESS", "5Validator", "0xstatus"
         ) is True
+
+    def test_insert_miner_submission_status_unknown_tx_returns_false_no_error(self, miner_query):
+        """Unknown tx_hash (e.g. stale status from validator history or cross-check) must be ignored gracefully.
+
+        This prevents FOREIGN KEY constraint errors when validators send status updates
+        (including FAILED) for submissions the miner no longer has in its local DB.
+        """
+        # Must return False without raising IntegrityError on the FK to miner_submissions.tx_hash
+        assert miner_query.insert_miner_submission_status(
+            challenge_milestone_id="milestone-x",
+            solution_status="FAILED",
+            validator_hotkey="5Validator",
+            tx_hash="0xnonexistent-tx-that-was-never-inserted",
+        ) is False

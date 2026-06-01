@@ -16,6 +16,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 import json
+from datetime import timedelta
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -190,16 +191,18 @@ class TestCleanUpSolutions:
 
 class TestOverdueContainers:
     def test_get_overdue_filters_by_runtime(self, container_manager):
-        # Mock one running container
-        with patch.object(container_manager, "_get_running_containers", return_value=["ctr_overdue"]), \
+        container = "val_label_ctr_overdue"
+
+        with patch.object(container_manager, "_get_running_containers", return_value=[container]), \
                 patch.object(container_manager, "_container_has_validator_label", return_value=True), \
+                patch.object(container_manager, "_get_max_runtime_for_container", return_value=timedelta(minutes=1)), \
                 patch("subprocess.run") as mock_run:
 
             # Return a very old started time
             mock_run.return_value = MagicMock(stdout="2020-01-01T00:00:00Z", returncode=0)
 
             overdue = container_manager._get_overdue_containers()
-            assert "ctr_overdue" in overdue
+            assert container in overdue
 
     def test_terminate_overdue_respects_label_and_cleans(self, container_manager):
         overdue = ["ctr1"]

@@ -145,7 +145,10 @@ class TestExtractStdoutOutput:
         assert log_path.is_file()
         assert log_path.read_bytes() == b"oops no marker\n"
         assert not (workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_OUTPUT_ZIP_FILENAME).exists()
-        assert not (workspace / CONTAINER_OUTPUT_DIRNAME / CONTAINER_SOLUTION_DIRNAME).exists()
+        # Artifacts directory is now created early so diagnostics can be written into it
+        artifacts_dir = workspace / CONTAINER_OUTPUT_DIRNAME / CONTAINER_SOLUTION_DIRNAME
+        assert artifacts_dir.is_dir()
+        assert (artifacts_dir / "extraction_diagnostics.txt").is_file()
 
     def test_invalid_zip_payload_returns_false_but_logs_kept(self, tmp_path):
         """Payload is valid base64 but decoded bytes are not a valid zip."""
@@ -163,7 +166,10 @@ class TestExtractStdoutOutput:
         assert zip_path.read_bytes() == not_a_zip
         artifacts_dir = workspace / CONTAINER_OUTPUT_DIRNAME / CONTAINER_SOLUTION_DIRNAME
         assert artifacts_dir.is_dir()
-        assert list(artifacts_dir.iterdir()) == []
+        # Directory now contains the extraction diagnostics file (new behavior)
+        files = list(artifacts_dir.iterdir())
+        assert len(files) == 1
+        assert files[0].name == "extraction_diagnostics.txt"
 
     def test_invalid_base64_payload_returns_false(self, tmp_path):
         """Payload after separator is not valid base64 at all."""
