@@ -157,7 +157,8 @@ class TestDockerBuildAndValidate:
             raise AssertionError(f"unexpected command: {cmd}")
 
         with patch("subprocess.run", side_effect=run_side_effect):
-            assert build_image("my_image", "/tmp/code") is False
+            with pytest.raises(InvalidSolutionError):
+                build_image("my_image", "/tmp/code")
 
         assert calls[0][:2] == ["docker", "build"]
         assert calls[1][:3] == ["docker", "image", "inspect"]
@@ -174,12 +175,27 @@ class TestDockerBuildAndValidate:
             raise AssertionError(f"unexpected command: {cmd}")
 
         with patch("subprocess.run", side_effect=run_side_effect):
-            assert build_image("my_image", "/tmp/code") is False
+            with pytest.raises(InvalidSolutionError):
+                build_image("my_image", "/tmp/code")
 
     def test_build_image_failure(self):
         import subprocess
-        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "docker")):
-            assert build_image("my_image", "/tmp/code") is False
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "docker", stderr="build error details")):
+            with pytest.raises(InvalidSolutionError) as exc:
+                build_image("my_image", "/tmp/code")
+            msg = str(exc.value)
+            assert "failed with exit code 1" in msg
+            assert "build error details" in msg
+            assert "Command:" in msg
+            assert "Exit code: 1" in msg
+
+    def test_build_image_raises_rich_error_on_docker_not_found(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError("docker missing")):
+            with pytest.raises(InvalidSolutionError) as exc:
+                build_image("my_image", "/tmp/code")
+            msg = str(exc.value)
+            assert "Docker CLI not found" in msg
+            assert "docker build" in msg.lower() or "build" in msg.lower()
 
     def test_validate_image_exists(self):
         with patch("subprocess.run") as mock_run:
@@ -189,4 +205,5 @@ class TestDockerBuildAndValidate:
     def test_validate_image_missing(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1)
-            assert validate_image("missing_image") is False
+            with pytest.raises(InvalidSolutionError):
+                validate_image("missing_image")

@@ -131,17 +131,13 @@ def run_solution_management(
         # 6. Build docker image
         image_name = f"{solution_tag}_image".lower()  # Docker image names must be lowercase
         bt.logging.info(f"Building docker image: {image_name}")
-        build_success = build_image(image_name=image_name, dockerfile_dir=f"{folder_name}/code")
-        if not build_success:
-            bt.logging.error("Docker image build failed.")
-            raise InvalidSolutionError(message=ValidationErrors.DOCKER_BUILD_FAILED.value)
+        # build_image now raises InvalidSolutionError with rich diagnostics on any failure
+        build_image(image_name=image_name, dockerfile_dir=f"{folder_name}/code")
 
         # 7. Verify the image
         bt.logging.info(f"Validating docker image: {image_name}")
-        image_valid: bool = validate_image(image_name=image_name)
-        if not image_valid:
-            bt.logging.error("Docker image validation failed.")
-            raise InvalidSolutionError(message=ValidationErrors.DOCKER_IMAGE_VALIDATION_FAILED.value)
+        # validate_image now raises InvalidSolutionError with diagnostics on failure
+        validate_image(image_name=image_name)
 
         # Establish challenge input in a fresh read-only mount directory for this run.
         challenge_input_mount_dir = prepare_challenge_input_mount_dir(absolute_path_to_host_folder)

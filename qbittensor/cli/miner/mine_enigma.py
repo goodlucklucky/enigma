@@ -18,6 +18,8 @@
 """Enigma miner CLI — welcome and challenges browser.
 
 Zip upload uses ``POST .../submissions/upload`` (slot) plus the presigned storage upload.
+The fee transfer is performed **only after** the zip has been successfully uploaded
+to storage (i.e. after the direct PUT/POST to the presigned URL has returned success).
 This CLI does **not** call ``POST .../challenges/milestones/{milestone_id}/submissions``
 (validator synapse handler only).
 """
@@ -610,7 +612,13 @@ def submit_solution(
 ) -> dict[str, Any]:
 
     # store solution in the database for the miner_hotkey
-    """Request slot, transfer (as batch + remark), upload zip, then persist DB row for the miner."""
+    """Request slot, upload zip to storage, transfer fee (as batch + remark), then persist DB row.
+
+    The on-chain fee transfer is deliberately performed *after* the zip has been
+    successfully uploaded to storage (i.e. after the direct PUT/POST to the presigned
+    storage URL has returned a successful HTTP response). A successful upload response
+    is treated as sufficient confirmation that the file was received.
+    """
     if not challenge_id:
         raise click.ClickException("challenge_id is required to submit a solution.")
     zip_path = Path(solution_path)
@@ -681,6 +689,30 @@ def submit_solution(
     else:
         price_tao = auth_client.get_milestone_price_tao(challenge_id=challenge_id, milestone_id=milestone_id)
 
+    console.print(Text("Uploading bytes…", style=f"dim {c(3)}"))
+    _upload_solution_zip(console, spec, zip_path)
+
+    console.print()
+    console.print(
+        Align.center(Text("Upload Successful", style=f"bold {c(0)}"))
+    )
+    console.print(
+        _styled_panel(
+            "POST …/submissions/upload response",
+            Syntax(
+                json.dumps(spec, indent=2, default=str),
+                "json",
+                theme="monokai",
+                word_wrap=True,
+            ),
+            border=f"bold {c(0)}",
+        )
+    )
+
+    console.print(
+        Text("Proceeding with fee transfer...", style=f"dim {c(3)}")
+    )
+
     proof_tx = transfer_tao_for_submission(
         console=console,
         source_ss58=source_ss58,
@@ -708,25 +740,6 @@ def submit_solution(
         )
     )
 
-    console.print(Text("Uploading bytes…", style=f"dim {c(3)}"))
-    _upload_solution_zip(console, spec, zip_path)
-
-    console.print()
-    console.print(
-        Align.center(Text("Upload Successful", style=f"bold {c(0)}"))
-    )
-    console.print(
-        _styled_panel(
-            "POST …/submissions/upload response",
-            Syntax(
-                json.dumps(spec, indent=2, default=str),
-                "json",
-                theme="monokai",
-                word_wrap=True,
-            ),
-            border=f"bold {c(0)}",
-        )
-    )
     store_solution_in_database(
         console,
         miner_hotkey,

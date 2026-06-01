@@ -18,6 +18,8 @@
 from typing import List
 from datetime import datetime, timezone
 import json
+import os
+import shutil
 import subprocess
 from qbittensor.utils.timer import Timer
 from qbittensor.database.db_connection import DBConnection
@@ -31,6 +33,59 @@ DEFAULT_MAX_SOLUTION_RUNTIME = timedelta(minutes=30)
 import bittensor as bt
 
 
+def is_docker_available() -> bool:
+    """Check whether the Docker CLI is available and responsive.
+
+    This is called at startup to give early, clear feedback instead of
+    failing on the first solution that needs to be built/run.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            version = result.stdout.strip()
+            bt.logging.info(f"🐳 Docker CLI detected: {version}")
+            return True
+        else:
+            docker_in_path = shutil.which("docker")
+            bt.logging.error(
+                "❌ Docker CLI check failed.\n"
+                f"   Command: docker --version\n"
+                f"   Exit code: {result.returncode}\n"
+                f"   stderr: {result.stderr.strip() or '(empty)'}\n\n"
+                f"   shutil.which('docker') returned: {docker_in_path or 'None'}\n"
+                "   Current PATH seen by the process (pm2 and similar tools often use a minimal one):\n"
+                f"   {os.environ.get('PATH', '(not set)')}\n\n"
+                "   The validator will not be able to build or run solution containers."
+            )
+            return False
+    except FileNotFoundError:
+        docker_in_path = shutil.which("docker")
+        bt.logging.error(
+            "❌ Docker CLI not found in PATH.\n"
+            "   The 'docker' command could not be located by the validator process.\n"
+            "   This commonly happens when running under process managers like pm2,\n"
+            "   because they start with a minimal environment and do not load your\n"
+            "   shell profile (.bashrc, .profile, etc.).\n\n"
+            f"   shutil.which('docker') returned: {docker_in_path or 'None'}\n"
+            "   Current PATH seen by the process:\n"
+            f"   {os.environ.get('PATH', '(not set)')}\n\n"
+            "   Please ensure the directory containing the 'docker' binary is present\n"
+            "   in the PATH used by pm2 (use an ecosystem file with an explicit `env` or `PATH`)."
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        bt.logging.error("❌ Docker CLI check timed out. Docker may be unresponsive.")
+        return False
+    except Exception as e:
+        bt.logging.error(f"❌ Unexpected error while checking Docker availability: {e}")
+        return False
+
+
 class SolutionContainerManager:
 
     def __init__(self, platform_client: ChallengesClient, database_connection: DBConnection, validator_label: str):
@@ -39,6 +94,9 @@ class SolutionContainerManager:
         self.database_connection = database_connection
         self.LABEL = validator_label
         self._runtime_cache: dict[str, timedelta] = {}  # key: "challenge_id:milestone_id" -> timedelta
+
+        # Early Docker availability check (non-fatal, but very loud)
+        is_docker_available()
 
     def run(self) -> None:
         bt.logging.info("🐳 Starting periodic solution container check (pruning, completed, overdue)")

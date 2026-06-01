@@ -16,12 +16,16 @@
 # DEALINGS IN THE SOFTWARE.
 
 import json
+import subprocess
 from datetime import timedelta
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from qbittensor.validator.solution.solution_container_manager import SolutionContainerManager
+from qbittensor.validator.solution.solution_container_manager import (
+    SolutionContainerManager,
+    is_docker_available,
+)
 
 
 @pytest.fixture
@@ -113,6 +117,40 @@ class TestFindCompletedSolutions:
     def test_docker_error_returns_empty(self, container_manager):
         with patch("subprocess.run", side_effect=OSError("fail")):
             assert container_manager._find_completed_solutions() == []
+
+
+class TestIsDockerAvailable:
+    def test_returns_true_when_docker_version_succeeds(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="Docker version 24.0.0\n", returncode=0)
+            assert is_docker_available() is True
+        mock_run.assert_called_once()
+        assert "docker" in mock_run.call_args.args[0]
+
+    def test_returns_false_on_nonzero_exit_and_logs_diagnostics(self, caplog):
+        with patch("subprocess.run") as mock_run, patch("shutil.which", return_value="/usr/bin/docker"):
+            mock_run.return_value = MagicMock(stdout="", stderr="permission denied", returncode=1)
+            with patch.dict("os.environ", {"PATH": "/custom/path"}, clear=True):
+                assert is_docker_available() is False
+        assert "Docker CLI check failed" in caplog.text
+        assert "permission denied" in caplog.text
+        assert "/custom/path" in caplog.text
+        assert "/usr/bin/docker" in caplog.text
+
+    def test_returns_false_on_file_not_found_and_logs_pm2_style_diagnostics(self, caplog):
+        with patch("subprocess.run", side_effect=FileNotFoundError("no docker")), \
+             patch("shutil.which", return_value=None):
+            with patch.dict("os.environ", {"PATH": "/minimal/pm2/path"}, clear=True):
+                assert is_docker_available() is False
+        assert "Docker CLI not found in PATH" in caplog.text
+        assert "pm2" in caplog.text
+        assert "/minimal/pm2/path" in caplog.text
+        assert "None" in caplog.text  # from shutil.which
+
+    def test_returns_false_on_timeout(self, caplog):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["docker"], 10)):
+            assert is_docker_available() is False
+        assert "timed out" in caplog.text
 
 
 # =============================================================================

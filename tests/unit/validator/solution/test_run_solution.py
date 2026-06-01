@@ -42,6 +42,7 @@ from qbittensor.validator.solution.constants import (
     VALIDATOR_DOCKER_MINER_USER_DEFAULT,
 )
 from qbittensor.validator.solution.run_solution import (
+    _run_docker_command,
     docker_run_security_args,
     extract_stdout_output,
     prepare_challenge_input_mount_dir,
@@ -278,6 +279,36 @@ class TestRunImageDetached:
             assert "/output" not in args[i + 1], (
                 f"unexpected /output tmpfs mount: {args[i + 1]}"
             )
+
+    def test_uses_absolute_path_for_challenge_input_mount(self, tmp_path):
+        """Regression test: ensure challenge_mount is always resolved to an absolute path.
+        This would have caught the previous bug where challenge_mount was undefined.
+        """
+        host_folder = tmp_path / "solution"
+        host_folder.mkdir()
+        # Pass a relative path to simulate real usage
+        relative_mount = "some/relative/path"
+        (tmp_path / relative_mount).mkdir(parents=True)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="cid-999\n", returncode=0)
+            # Change cwd temporarily so relative path is meaningful
+            with patch("os.getcwd", return_value=str(tmp_path)):
+                run_image_detached(
+                    image_name="img",
+                    container_name="ctr",
+                    validator_label="label",
+                    challenge_input_mount_dir=relative_mount,
+                )
+
+        args = mock_run.call_args.args[0]
+        mount_args = [args[i+1] for i in range(len(args)) if args[i] == "-v"]
+        challenge_mounts = [m for m in mount_args if CONTAINER_CHALLENGE_INPUT_PATH in m]
+        assert len(challenge_mounts) == 1
+        mount_spec = challenge_mounts[0]
+        # Must be absolute
+        assert mount_spec.startswith("/"), f"Expected absolute mount path, got: {mount_spec}"
+        assert f":{CONTAINER_CHALLENGE_INPUT_PATH}:ro" in mount_spec
         # Host ``output/`` should not be pre-created by run_image_detached.
         assert not (host_folder / "output").exists()
 
@@ -363,12 +394,96 @@ class TestDockerRunSecurityArgs:
 
         with patch(
             "subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "docker", stderr="fail"),
+            side_effect=subprocess.CalledProcessError(
+                1, ["docker", "run"], stderr="container failed to start"
+            ),
         ):
-            with pytest.raises(InvalidSolutionError):
+            with pytest.raises(InvalidSolutionError) as exc:
                 run_image_detached(
                     "img", "ctr", "label", mount_dir
                 )
+        msg = str(exc.value)
+        assert "failed with exit code 1" in msg
+        assert "container failed to start" in msg
+        assert "Command:" in msg
+        assert "Exit code: 1" in msg
+
+    def test_run_image_detached_produces_rich_error_on_127(self, tmp_path):
+        """Ensure run_image_detached surfaces good diagnostics on classic 'docker not found' case."""
+        host_folder = tmp_path / "solution"
+        host_folder.mkdir()
+        mount_dir = prepare_challenge_input_mount_dir(str(host_folder))
+
+        err = subprocess.CalledProcessError(127, ["docker", "run"])
+        err.stderr = "docker: command not found"
+        err.stdout = ""
+
+        with patch("subprocess.run", side_effect=err):
+            with pytest.raises(InvalidSolutionError) as exc:
+                run_image_detached("img", "ctr", "label", mount_dir)
+
+        msg = str(exc.value)
+        assert "exit status 127" in msg
+        assert "docker: command not found" in msg
+        assert "Command:" in msg
+
+
+class TestRunDockerCommand:
+    """Tests for the shared _run_docker_command helper that centralizes
+    error capture and rich InvalidSolutionError messaging.
+    """
+
+    def test_success_returns_completed_process(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="ok\n", stderr="", returncode=0)
+            result = _run_docker_command(["docker", "--version"])
+            assert result.stdout == "ok\n"
+            mock_run.assert_called_once()
+
+    def test_file_not_found_raises_rich_invalid_solution_error(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError("no docker")):
+            with pytest.raises(InvalidSolutionError) as exc:
+                _run_docker_command(["docker", "run", "foo"], description="docker run test")
+        msg = str(exc.value)
+        assert "Docker CLI not found" in msg
+        assert "docker run test" in msg
+        assert "Is Docker installed" in msg
+
+    def test_called_process_error_127_includes_full_diagnostics(self):
+        err = subprocess.CalledProcessError(127, ["docker", "run", "img"])
+        err.stderr = "docker: command not found\n"
+        err.stdout = ""
+        with patch("subprocess.run", side_effect=err):
+            with pytest.raises(InvalidSolutionError) as exc:
+                _run_docker_command(
+                    ["docker", "run", "img"],
+                    description="docker run for container ctr",
+                )
+        msg = str(exc.value)
+        assert "exit status 127" in msg
+        assert "docker run for container ctr" in msg
+        assert "Command: docker run img" in msg
+        assert "Exit code: 127" in msg
+        assert "docker: command not found" in msg
+
+    def test_called_process_error_other_code_includes_stdout_and_stderr(self):
+        err = subprocess.CalledProcessError(1, ["docker", "build", "."])
+        err.stderr = "build failed: no space left on device"
+        err.stdout = "Step 1/3 : FROM python"
+        with patch("subprocess.run", side_effect=err):
+            with pytest.raises(InvalidSolutionError) as exc:
+                _run_docker_command(["docker", "build", "."], description="docker build")
+        msg = str(exc.value)
+        assert "failed with exit code 1" in msg
+        assert "docker build" in msg
+        assert "build failed: no space left on device" in msg
+        assert "Step 1/3 : FROM python" in msg
+
+    def test_success_path_does_not_raise(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="success", stderr="")
+            result = _run_docker_command(["docker", "ps"], check=True)
+            assert result.returncode == 0
 
 
 @pytest.mark.integration

@@ -20,20 +20,25 @@ import subprocess
 import bittensor as bt
 
 from qbittensor.validator.solution.constants import MAX_SOLUTION_DOCKER_IMAGE_SIZE_BYTES
+from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
+from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
+from .run_solution import _run_docker_command
 
 
 def _inspect_image_size_bytes(image_name: str) -> int | None:
     """Return image size in bytes from ``docker image inspect``, or None on failure."""
+    cmd = ["docker", "image", "inspect", image_name, "--format", "{{.Size}}"]
     try:
-        result = subprocess.run(
-            ["docker", "image", "inspect", image_name, "--format", "{{.Size}}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        result = _run_docker_command(cmd, description="docker image inspect for size", check=True)
         return int(result.stdout.strip())
-    except (subprocess.CalledProcessError, ValueError) as e:
-        bt.logging.error(f"\t❌ Failed to inspect image size for '{image_name}': {e}")
+    except InvalidSolutionError:
+        # Docker not available or command failed — treat as uninspectable
+        return None
+    except ValueError as e:
+        bt.logging.error(f"\t❌ Failed to parse image size for '{image_name}': {e}")
+        return None
+    except Exception as e:
+        bt.logging.error(f"\t❌ Unexpected error inspecting image size for '{image_name}': {e}")
         return None
 
 
@@ -48,17 +53,20 @@ def _delete_image(image_name: str) -> None:
 def build_image(image_name: str, dockerfile_dir: str = ".") -> bool:
     bt.logging.info("🧱 Building docker image")
     bt.logging.info(f"\tImage name: {image_name}")
+
+    build_cmd = ["docker", "build", "-t", image_name, dockerfile_dir]
+
     try:
-        subprocess.run(
-            ["docker", "build", "-t", image_name, dockerfile_dir],
-            check=True,
-        )
+        _run_docker_command(build_cmd, description=f"docker build for image {image_name}")
         bt.logging.info("\t✅ Docker image built")
 
         size_bytes = _inspect_image_size_bytes(image_name)
         if size_bytes is None:
             _delete_image(image_name)
-            return False
+            raise InvalidSolutionError(
+                message="Docker build appeared to succeed, but we could not inspect the resulting image size. "
+                        "This usually means the Docker CLI became unavailable or the image was immediately removed."
+            )
 
         if size_bytes > MAX_SOLUTION_DOCKER_IMAGE_SIZE_BYTES:
             bt.logging.error(
@@ -66,7 +74,9 @@ def build_image(image_name: str, dockerfile_dir: str = ".") -> bool:
                 f"{MAX_SOLUTION_DOCKER_IMAGE_SIZE_BYTES} bytes; removing image"
             )
             _delete_image(image_name)
-            return False
+            raise InvalidSolutionError(
+                message=f"Built image exceeds maximum allowed size ({size_bytes} > {MAX_SOLUTION_DOCKER_IMAGE_SIZE_BYTES} bytes)."
+            )
 
         bt.logging.info(
             f"\t✅ Image size {size_bytes} bytes within limit "
@@ -74,11 +84,11 @@ def build_image(image_name: str, dockerfile_dir: str = ".") -> bool:
         )
         return True
 
-    except subprocess.CalledProcessError as e:
-        bt.logging.error("\t❌ Build failed!")
-        bt.logging.error(f"\tExit code: {e.returncode}")
-        return False
+    except InvalidSolutionError:
+        # The helper already raised with rich diagnostics — just re-raise
+        raise
 
     except Exception as e:
-        bt.logging.error(f"\t❌ Failed to build docker image: {e}")
-        return False
+        msg = f"Unexpected error while building Docker image: {e}"
+        bt.logging.error(f"\t❌ {msg}")
+        raise InvalidSolutionError(message=msg) from e

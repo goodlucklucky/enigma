@@ -17,10 +17,13 @@
 
 import json
 import re
-import subprocess
 
 import bittensor as bt
 from pathlib import Path
+
+from .run_solution import _run_docker_command
+from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
+from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
 
 REJECTED_DOCKERFILE_RULES: tuple[str, ...] = (
     "EXPOSE instructions are not allowed",
@@ -196,21 +199,35 @@ def reject_dockerfile(folder_name: str) -> bool:
 
 
 def _image_exists(image_name: str) -> bool:
-    """Checks whether or not the image exists."""
-    result = subprocess.run(
-        ["docker", "image", "inspect", image_name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if result.returncode != 0:
-        bt.logging.error(f"\t❌ Image '{image_name}' doesn't exist")
-    return result.returncode == 0
+    """Checks whether or not the image exists.
+
+    Uses the shared docker runner so we get good diagnostics logged on failure.
+    """
+    cmd = ["docker", "image", "inspect", image_name]
+    try:
+        result = _run_docker_command(cmd, description="docker image inspect (existence check)", check=False)
+        exists = result.returncode == 0
+        if not exists:
+            bt.logging.error(f"\t❌ Image '{image_name}' does not exist")
+            if result.stderr.strip():
+                bt.logging.error(f"\t   stderr: {result.stderr.strip()}")
+        return exists
+    except Exception as e:
+        bt.logging.error(f"\t❌ Error while checking if image '{image_name}' exists: {e}")
+        return False
 
 
 def validate_image(image_name: str) -> bool:
-    """Validate the docker image."""
+    """Validate the docker image.
+
+    Raises InvalidSolutionError with rich diagnostics on critical failures
+    (e.g. Docker CLI unavailable).
+    """
     bt.logging.info("🕵 Validating docker image")
     if not _image_exists(image_name=image_name):
-        return False
+        # _image_exists already logged the reason
+        raise InvalidSolutionError(
+            message=ValidationErrors.DOCKER_IMAGE_VALIDATION_FAILED.value
+        )
     bt.logging.info(f"\t✅ Validation for image '{image_name}' successful")
     return True

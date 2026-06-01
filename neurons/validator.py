@@ -28,7 +28,10 @@ from qbittensor.utils.env import get_api_config
 _api_cfg = get_api_config()
 
 import bittensor as bt
-from qbittensor.validator.solution.solution_container_manager import SolutionContainerManager
+from qbittensor.validator.solution.solution_container_manager import (
+    SolutionContainerManager,
+    is_docker_available,
+)
 from qbittensor.base.validator import BaseValidatorNeuron
 from qbittensor.protocol import SolutionSynapse
 from qbittensor.validator.synapse.process_responses import ResponseProcessor
@@ -70,6 +73,9 @@ class Validator(BaseValidatorNeuron):
 
         self.database_connection: DBConnection = DBConnection(database_name_prefix="challenge_solutions", hotkey=my_hotkey)
         bt.logging.info(f"🗄️  Validator using DB: {self.database_connection.DB_PATH}")
+
+        # Early Docker sanity check (very important for solution execution)
+        is_docker_available()
 
         # Single source of truth for all platform (challenges) API calls.
         # ChallengesClient creates and owns its own RequestManager.

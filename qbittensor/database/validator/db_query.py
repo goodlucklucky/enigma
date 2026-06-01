@@ -15,6 +15,8 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import uuid
+
 import bittensor as bt
 from sqlalchemy import func
 from sqlalchemy.dialects.sqlite import insert
@@ -52,7 +54,15 @@ class DBQuery(BaseDBQuery):
         miner_hotkey: str,
         challenge_id: str | None = None,
     ) -> bool:
-        """Insert a challenge solution row before container/runtime fields are known."""
+        """Create (or re-use via guarded upsert) a challenge solution row for a tx_hash
+        before the container/runtime fields are known.
+
+        Re-execution of the same cloud submission is only permitted when the
+        caller supplies the *same* `submission_id` (the cloud's submission
+        identifier) that is already associated with this `tx_hash`.
+
+        A tx_hash may never be rebound to a different cloud submission_id.
+        """
         return self.insert_challenge_solution(
             challenge_validation_solution_id=challenge_validation_solution_id,
             container_id=self._pending_placeholder(tx_hash, "container_id"),
@@ -123,11 +133,44 @@ class DBQuery(BaseDBQuery):
         miner_hotkey,
         challenge_id: str | None = None,
     ):
-        """Insert a new challenge solution record into the database."""
-        bt.logging.info(f"Inserting challenge solution with tx_hash: {tx_hash}")
+        """Insert (or upsert on tx_hash) a challenge solution record.
+
+        Re-execution of the same cloud submission (identified by the cloud's
+        submission_id) is allowed only when the incoming `submission_id`
+        matches the one already associated with this `tx_hash`.
+
+        This preserves the invariant that a given payment (tx_hash) is bound
+        to exactly one cloud submission.
+
+        If a different cloud submission_id is presented for an existing tx_hash,
+        the operation is rejected (returns False) to avoid corrupting the
+        tx_hash → cloud submission association.
+        """
+        bt.logging.info(f"Inserting/Upserting challenge solution with tx_hash: {tx_hash}")
         try:
             with self._managed_session() as session:
-                new_solution = ChallengeSolution(
+                existing = session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first()
+
+                if existing:
+                    if existing.submission_id and submission_id and existing.submission_id != submission_id:
+                        bt.logging.error(
+                            f"❌ Refusing upsert for tx_hash={tx_hash}: "
+                            "cloud submission_id mismatch. "
+                            f"existing={existing.submission_id} "
+                            f"incoming={submission_id}. "
+                            "A tx_hash must not be associated with a different cloud submission_id."
+                        )
+                        return False
+
+                    # Same cloud submission_id → safe to refresh execution state for re-run
+                    bt.logging.info(
+                        f"Re-executing same cloud submission (tx_hash={tx_hash}, "
+                        f"submission_id={submission_id})"
+                    )
+
+                now = func.now()
+                stmt = insert(ChallengeSolution).values(
+                    id=str(uuid.uuid4()),  # only used on actual INSERT
                     challenge_validation_solution_id=challenge_validation_solution_id,
                     container_id=container_id,
                     container_name=container_name,
@@ -138,13 +181,37 @@ class DBQuery(BaseDBQuery):
                     submission_id=submission_id,
                     solution_status=solution_status,
                     tx_hash=tx_hash,
-                    miner_hotkey=miner_hotkey
+                    miner_hotkey=miner_hotkey,
+                    created_at=now,
+                    updated_at=now,
                 )
-                session.add(new_solution)
-                bt.logging.info(f" ✅ Inserted challenge solution with challenge_validation_solution_id: {challenge_validation_solution_id}")
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["tx_hash"],
+                    set_={
+                        "challenge_validation_solution_id": challenge_validation_solution_id,
+                        "container_id": container_id,
+                        "container_name": container_name,
+                        "image_id": image_id,
+                        "challenge_id": challenge_id,
+                        "challenge_milestone_id": challenge_milestone_id,
+                        "absolute_path_to_solution": absolute_path_to_solution,
+                        "submission_id": submission_id,
+                        "solution_status": solution_status,
+                        "miner_hotkey": miner_hotkey,
+                        "updated_at": now,
+                    },
+                )
+                session.execute(stmt)
+
+                action = "Re-used" if existing else "Inserted new"
+                bt.logging.info(
+                    f" ✅ {action} challenge solution row "
+                    f"(submission_id={submission_id}, tx_hash={tx_hash})"
+                )
                 return True
+
         except Exception as e:
-            bt.logging.error(f" ❌ Error inserting challenge solution: {e}")
+            bt.logging.error(f" ❌ Error inserting/updating challenge solution: {e}")
             return False
 
     def update_solution_status_in_db(self, solution_location, solution_status):

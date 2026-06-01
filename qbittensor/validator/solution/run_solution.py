@@ -366,6 +366,66 @@ def docker_run_security_args() -> list[str]:
     return args
 
 
+def _run_docker_command(
+    cmd: list[str],
+    *,
+    description: str = "docker command",
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    """
+    Centralized helper for running Docker CLI commands.
+
+    - Always captures stdout/stderr as text.
+    - On failure (non-zero exit or 'docker' not found), raises InvalidSolutionError
+      with a rich, platform-friendly message containing the full command,
+      exit code, stderr, and stdout.
+    - This ensures we always get actionable diagnostics sent to the cloud.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+        return result
+
+    except FileNotFoundError as e:
+        msg = (
+            f"Docker CLI not found while running {description}. "
+            "The 'docker' executable is not available in the PATH of the validator process. "
+            "Is Docker installed and properly integrated (especially on WSL)?"
+        )
+        bt.logging.error(f"❌ {msg} | command={' '.join(cmd)} | {e}")
+        raise InvalidSolutionError(message=msg) from e
+
+    except subprocess.CalledProcessError as e:
+        returncode = e.returncode
+        stderr = (e.stderr or "").strip() or "(no stderr captured)"
+        stdout = (e.stdout or "").strip() or "(no stdout captured)"
+
+        if returncode == 127:
+            detail = f"Docker command not found (exit status 127) while running {description}"
+        else:
+            detail = f"{description} failed with exit code {returncode}"
+
+        bt.logging.error(
+            f"❌ {detail}\n"
+            f"   Command: {' '.join(cmd)}\n"
+            f"   stderr:\n{stderr}\n"
+            f"   stdout:\n{stdout}"
+        )
+
+        platform_msg = (
+            f"{detail}\n\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"Exit code: {returncode}\n\n"
+            f"stderr:\n{stderr}\n\n"
+            f"stdout:\n{stdout}"
+        )
+        raise InvalidSolutionError(message=platform_msg) from e
+
+
 def run_image_detached(
     image_name: str,
     container_name: str,
@@ -381,29 +441,28 @@ def run_image_detached(
       zip of artifacts to stdout. The validator captures this after the container
       exits using ``docker logs`` (see :func:`extract_stdout_output`).
     """
+    challenge_mount = os.path.abspath(challenge_input_mount_dir)
+
+    cmd = [
+        "docker",
+        "run",
+        "-d",
+        "--network",
+        "none",
+        *docker_run_security_args(),
+        "--name",
+        container_name,
+        "-v", f"{challenge_mount}:{CONTAINER_CHALLENGE_INPUT_PATH}:ro",
+        "--label",
+        validator_label,
+        image_name,
+    ]
+
     try:
-        challenge_mount = os.path.abspath(challenge_input_mount_dir)
-
-        result = subprocess.run(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--network",
-                "none",
-                *docker_run_security_args(),
-                "--name",
-                container_name,
-                "-v", f"{challenge_mount}:{CONTAINER_CHALLENGE_INPUT_PATH}:ro",
-                "--label",
-                validator_label,
-                image_name,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
+        result = _run_docker_command(
+            cmd,
+            description=f"docker run for container {container_name}",
         )
-
         container_id = result.stdout.strip()
 
         bt.logging.info(
@@ -412,12 +471,13 @@ def run_image_detached(
         )
         return container_id
 
-    except subprocess.CalledProcessError as e:
-        bt.logging.error(
-            f"❌ Failed to start container '{container_name}' from image '{image_name}': {e.stderr}"
-        )
-        raise InvalidSolutionError(message=str(ValidationErrors.DOCKER_RUN_FAILED))
+    except InvalidSolutionError:
+        # Already has rich diagnostics from the helper
+        raise
 
     except Exception as e:
-        bt.logging.error(f"❌ An error occurred while starting the container: {e}")
-        raise InvalidSolutionError(message=str(ValidationErrors.DOCKER_RUN_FAILED))
+        bt.logging.error(f"❌ An unexpected error occurred while starting the container: {e}")
+        raise InvalidSolutionError(
+            message=f"Unexpected error starting Docker container: {e}. "
+                    "Check validator logs for the full docker command and any additional context."
+        ) from e
