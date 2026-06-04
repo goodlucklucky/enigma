@@ -4,7 +4,7 @@ Validators must vote on two different types of proposals:
 
 - ### Whitelist
 
-    When it has been determined that a validator will be running Engima challenge milestones, it will be able to participate in the voting process when a challenge milestone is met. This is controlled by the validator whitelist in the treasury contract.
+    When it has been determined that a validator will be running Enigma challenge milestones, it will be able to participate in the voting process when a challenge milestone is met. This is controlled by the validator whitelist in the treasury contract.
 
     Existing validators in the whitelist will be notified via Discord and expected to vote within the voting period (36 hours).
 
@@ -17,7 +17,7 @@ Validators must vote on two different types of proposals:
 
     The scripts default to the public lite endpoint (`https://lite.chain.opentensor.ai`). Use `--rpc YOUR_RPC` if you need a dedicated endpoint.
 
-    The output will show one or more addresses. The EVM address if properly associated with the validator hotkey will be decoded as well. Ensure before votign that this is a true validator on the subnet. Additions to the whitelist will have a trusted status of `true` and removals will have a trusted status of `false`.
+    The output will show one or more addresses. The EVM address if properly associated with the validator hotkey will be decoded as well. Ensure before voting that this is a true validator on the subnet. Additions to the whitelist will have a trusted status of `true` and removals will have a trusted status of `false`.
 
     Sample Output:
     ```
@@ -40,7 +40,7 @@ Validators must vote on two different types of proposals:
 
 - ### Payout
 
-    When it has been determined that all validators have validated an Engima challenge milestone successfully, a proposal will be made to the miner hotkey that submitted the challenge milestone. Currently, checking the validation status and voting on a proposal will be done manually.
+    When it has been determined that all validators have validated an Enigma challenge milestone successfully, a proposal will be made to the miner hotkey that submitted the challenge milestone. Currently, checking the validation status and voting on a proposal will be done manually.
 
     Existing validators in the whitelist will be notified via Discord and expected to vote within the voting period (36 hours).
 

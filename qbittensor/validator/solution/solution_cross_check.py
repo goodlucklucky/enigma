@@ -36,7 +36,7 @@ class SolutionCrossChecker:
         platform_client: ChallengesClient,
         solution_container_manager: SolutionContainerManager,
         database_connection: DBConnection,
-        subtensor=None,  # Optional: needed for full tx proof verification on first-time cross-check items
+        subtensor: bt.Subtensor,
         telemetry_service: TelemetryService | None = None,
     ):
         self.platform_client: ChallengesClient = platform_client
@@ -44,7 +44,7 @@ class SolutionCrossChecker:
         self.timer: Timer = Timer(timeout=CROSS_CHECK_TIMEOUT, run=self.run, run_on_start=True)
         self.validator_label = validator_label
         self.database_connection: DBConnection = database_connection
-        self.subtensor = subtensor
+        self.subtensor: bt.Subtensor = subtensor
         self.telemetry_service: TelemetryService | None = telemetry_service
 
     def run(self) -> None:
@@ -77,14 +77,13 @@ class SolutionCrossChecker:
             transfer_proof = TransferProof.from_platform_submission(submission)
 
             try:
-                subtensor = getattr(self, "subtensor", None)
                 # Note: We pass the miner's hotkey (submission.address) here, not the validator's.
                 # For cross-check submissions coming from the platform, the expected transfer amount
                 # is provided directly by the platform in the submission record.
                 proof_ok, proof_err = verify_transfer_proof_for_synapse(
                     transfer_proof,
                     submission.address,
-                    subtensor,
+                    self.subtensor,
                     expected_transfer_amount_rao=submission.transfer_amount_rao,
                 )
             except Exception as e:
@@ -118,15 +117,32 @@ class SolutionCrossChecker:
 
         bt.logging.info(f"Running solution cross-check on solution with miner hotkey {submission.address}")
 
+        challenge_id = submission.challenge_id
+        if not challenge_id:
+            bt.logging.error(
+                f"❌ Cross-check submission {submission.id} missing challenge_id for tx_hash {submission.tx_hash}. "
+                "Cannot execute without it per invariant that challenge_id is never optional in execution path."
+            )
+            self.platform_client.report_submission_status(
+                submission_id=submission.id,
+                status="Failure",
+                reason="Missing challenge_id for cross-check submission",
+            )
+            return
+
         start_time = time.time()
+        # For cross-checks we pass the original upload_endpoint_id (the "file upload")
+        # as challenge_validation_solution_id so that the DB guard can recognize it as
+        # the same work item (tx + file upload + challenge + milestone) even if the
+        # cross-check submission uses a different .id .
         image_name, container_id, folder_name = execute_verified_solution(
             db_conn=self.database_connection,
             platform_client=self.platform_client,
             validator_label=self.validator_label,
             download_url=submission.file_download_url,
-            challenge_id=submission.challenge_id,
+            challenge_id=challenge_id,
             challenge_milestone_id=submission.challenge_milestone_id,
-            challenge_validation_solution_id=submission.id,
+            challenge_validation_solution_id=submission.upload_endpoint_id,
             submission_id=submission.id,
             tx_hash=submission.tx_hash,
             miner_hotkey=submission.address,

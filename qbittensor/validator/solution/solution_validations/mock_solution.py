@@ -20,11 +20,14 @@ import os
 import time
 
 import bittensor as bt
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-# Validator requires the signed timestamp to fall within the last hour (with small future skew).
-MOCK_TIMESTAMP_MAX_AGE_SECONDS = 3600
-MOCK_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS = 60
+from qbittensor.challenges.mock_challenge import (
+    Solution as MockSolution,
+    Verif as MockVerif,
+    validate_mock_solution,
+)
+
+# Default for the platform's mock challenge (can be overridden via env).
 ENIGMA_MOCK_PUBLIC_KEY = "5a557ee758020954a512c632993637761bdf933a3f59b080981a98e7ba33d191"
 
 
@@ -68,41 +71,24 @@ def run(file_path: str) -> tuple[bool, str | None]:
         bt.logging.error(f"❌ {msg}")
         return False, msg
 
-    try:
-        payload_data = json.loads(payload)
-        ts = int(payload_data["ts"])
-    except Exception as e:
-        msg = f"Invalid mock payload JSON: {e}"
-        bt.logging.error(f"❌ {msg}")
-        return False, msg
-
-    now = time.time()
-    skew_seconds = ts - now
-    if skew_seconds > MOCK_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS:
-        msg = (
-            f"Mock payload timestamp is too far in the future "
-            f"({skew_seconds:.0f}s > {MOCK_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS}s skew allowed)"
-        )
-        bt.logging.error(f"❌ {msg}")
-        return False, msg
-
-    age_seconds = now - ts
-    if age_seconds > MOCK_TIMESTAMP_MAX_AGE_SECONDS:
-        msg = (
-            f"Mock payload timestamp older than one hour "
-            f"({age_seconds:.0f}s > {MOCK_TIMESTAMP_MAX_AGE_SECONDS}s)"
-        )
-        bt.logging.error(f"❌ {msg}")
-        return False, msg
-
     public_key_hex = os.getenv("ENIGMA_MOCK_PUBLIC_KEY") or ENIGMA_MOCK_PUBLIC_KEY
+
+    # Delegate crypto + timestamp checks to the shared implementation in
+    # qbittensor.challenges.mock_challenge (used by MockChallenge.verify for the
+    # offline workbench too). This eliminates the previous duplicated logic
+    # (and risk of the two getting out of sync).
     try:
-        public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
-        public_key.verify(bytes.fromhex(signature_hex), payload.encode("utf-8"))
+        sol = MockSolution(status=status, signature=signature_hex, payload=payload)
+        ver = MockVerif(public_key_hex=public_key_hex)
+        success, reason = validate_mock_solution(sol, ver)
     except Exception as e:
         msg = f"Invalid mock signature verification: {e}"
         bt.logging.error(f"❌ {msg}")
         return False, msg
+
+    if not success:
+        bt.logging.error(f"❌ {reason}")
+        return False, reason
 
     bt.logging.info("✅ Mock challenge output is valid")
     return True, None

@@ -27,7 +27,6 @@ from qbittensor.validator.solution.validate_solution_output import (
     perform_solution_output_validation,
     upload_zip_to_platform,
     validate_solution,
-    verify_upload_locations,
 )
 from qbittensor.utils.services.challenges import ChallengesClient
 
@@ -46,66 +45,27 @@ class TestEstablishUploadLocations:
         assert establish_upload_locations_for_solution_data("/tmp", "logs", platform_client) is None
 
 
-class TestVerifyUploadLocations:
-    def test_success(self, platform_client):
-        db = Mock()
-        db.db_query.get_submission_id_by_solution_location.return_value = "sub-1"
-        logs = ChallengeSubmissionVerifyUploadAddressResponse(id="log-id", url="https://u/log")
-        output = ChallengeSubmissionVerifyUploadAddressResponse(id="out-id", url="https://u/out")
-        platform_client.report_submission_status.return_value = True
-        assert verify_upload_locations("/tmp/sol", logs, output, db) is True
-
-    def test_failure(self):
-        db = Mock()
-        db.db_query.get_submission_id_by_solution_location.return_value = None  # simulate missing submission
-        logs = ChallengeSubmissionVerifyUploadAddressResponse(id="log-id", url="https://u/log")
-        output = ChallengeSubmissionVerifyUploadAddressResponse(id="out-id", url="https://u/out")
-        assert verify_upload_locations("/tmp/sol", logs, output, db) is False
-
-
 class TestPerformSolutionOutputValidation:
     @patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform")
     @patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(True, None))
-    def test_success_path(self, _validate, _upload, platform_client):
+    def test_success_path_with_explicit_ids(self, _validate, _upload, platform_client):
+        """Preferred path: all required stable ids supplied."""
         db = Mock()
-        db.db_query.get_challenge_milestone_id_by_file_path.return_value = (
-            "012b3e8e-b1e9-401e-ab70-f1598b34746f"
-        )
-        db.db_query.get_submission_id_by_solution_location.return_value = "sub-1"
-        request_manager = Mock()
-        request_manager.patch.return_value = Mock(status_code=200)
         platform_data = ChallengeSubmissionVerifyUploadAddressResponse(
             id="out-id", url="https://upload.example/out"
         )
 
         status = perform_solution_output_validation(
-            "/tmp/workspace",
             "/tmp/workspace/output",
             platform_data,  # logs_data
             platform_data,  # solution_output_data (same mock is fine for test)
             platform_client,
-            db,
             logs_uploaded=True,
+            submission_id="sub-1",
+            challenge_milestone_id="012b3e8e-b1e9-401e-ab70-f1598b34746f",
+            challenge_id="challenge-1",
         )
         assert status == SolutionStatus.SUCCESS.value
-
-    def test_missing_milestone_returns_failed(self, platform_client):
-        db = Mock()
-        db.db_query.get_challenge_milestone_id_by_file_path.return_value = None
-        db.db_query.get_submission_id_by_solution_location.return_value = "sub-1"
-        platform_data = ChallengeSubmissionVerifyUploadAddressResponse(
-            id="out-id", url="https://upload.example/out"
-        )
-        status = perform_solution_output_validation(
-            "/tmp/workspace",
-            "/tmp/workspace/output",
-            platform_data,  # logs_data
-            platform_data,  # solution_output_data
-            platform_client,
-            db,
-            logs_uploaded=True,
-        )
-        assert status == SolutionStatus.FAILED.value
 
 
 class TestUploadZipToPlatform:
@@ -142,7 +102,13 @@ class TestValidateSolutionCorePaths:
         platform_client.create_verification_upload_url.return_value = None
         db = Mock()
 
-        status = validate_solution(ws, platform_client, db)
+        status = validate_solution(
+            ws,
+            platform_client,
+            submission_id="sub-x",
+            challenge_milestone_id="m-x",
+            challenge_id="c-x",
+        )
         assert status.upper() == "FAILED_UPLOAD"
 
     def test_perform_validation_success_reports_success_with_keys(self, tmp_path, platform_client):
@@ -158,14 +124,17 @@ class TestValidateSolutionCorePaths:
         platform_client.report_submission_status.return_value = True
 
         db = Mock()
-        db.db_query.get_challenge_milestone_id_by_file_path.return_value = "m1"
-        db.db_query.get_submission_id_by_solution_location.return_value = "sub1"
-
-        with patch("qbittensor.validator.solution.validate_solution_output.verify_upload_locations", return_value=True), \
-                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
+        # Pass all required stable ids explicitly
+        with patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(True, None)):
 
-            status = validate_solution(ws, platform_client, db)
+            status = validate_solution(
+                ws,
+                platform_client,
+                submission_id="sub1",
+                challenge_milestone_id="m1",
+                challenge_id="c1",
+            )
             assert status.upper() == "SUCCESS"
             platform_client.report_submission_status.assert_called_with(
                 "sub1", "Success", log_data_key="log_id", output_data_key="out-id"
@@ -184,14 +153,16 @@ class TestValidateSolutionCorePaths:
         platform_client.report_submission_status.return_value = True
 
         db = Mock()
-        db.db_query.get_challenge_milestone_id_by_file_path.return_value = "m1"
-        db.db_query.get_submission_id_by_solution_location.return_value = "sub1"
-
-        with patch("qbittensor.validator.solution.validate_solution_output.verify_upload_locations", return_value=True), \
-                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
+        with patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(False, "Output validation failed")):
 
-            status = validate_solution(ws, platform_client, db)
+            status = validate_solution(
+                ws,
+                platform_client,
+                submission_id="sub1",
+                challenge_milestone_id="m1",
+                challenge_id="c1",
+            )
             assert status.upper() == "FAILED"
             platform_client.report_submission_status.assert_called_with(
                 "sub1", "Failure",

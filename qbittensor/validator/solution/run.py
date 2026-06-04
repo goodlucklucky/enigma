@@ -39,6 +39,7 @@ from .run_solution import prepare_challenge_input_mount_dir, run_image_detached
 from qbittensor.utils.solution_status import SolutionStatus
 from qbittensor.utils.services.challenges import ChallengesClient
 from qbittensor.utils.services.telemetry import TelemetryService
+from .solution_context import SolutionExecution
 
 
 def run_solution_management(
@@ -50,10 +51,22 @@ def run_solution_management(
     tx_hash: str,
     miner_hotkey: str,
     submission_id: str | None,
-    challenge_id: str | None = None,
+    challenge_id: str,
+    milestone_configuration: dict | None = None,
     platform_client: ChallengesClient | None = None,
     telemetry_service: TelemetryService | None = None,
+    max_solution_runtime_seconds: int | None = None,
 ) -> Tuple[str | None, str | None, str | None]:
+    """Run the full setup/download/build/run pipeline for a solution.
+
+    The claim identifiers are passed individually up to (and including) the
+    DB create step. A SolutionExecution (pure identity value object) is created
+    *only after* we successfully obtain the stable solution_id from
+    create_challenge_solution. It is then used for label generation etc.
+    Runtime container/image/workspace details are kept in local variables.
+
+    The appropriate handler (setup + validation) is selected by challenge_id.
+    """
 
     image_name: str | None = None
     container_id: str | None = None
@@ -62,6 +75,7 @@ def run_solution_management(
     folder_name: str | None = None
     did_start_solution = False
     did_insert_solution = False
+    execution: SolutionExecution | None = None
 
     bt.logging.info(f"🔧 run_solution_management starting for {challenge_validation_solution_id} (tx={tx_hash})")
 
@@ -78,9 +92,8 @@ def run_solution_management(
         )
 
     try:
-        # 0. insert challenge solution
         bt.logging.info(f"Inserting pending challenge solution for miner with hotkey {miner_hotkey}")
-        if not db_conn.db_query.create_challenge_solution(
+        solution_id = db_conn.db_query.create_challenge_solution(
             challenge_validation_solution_id=challenge_validation_solution_id,
             challenge_milestone_id=challenge_milestone_id,
             submission_id=submission_id,
@@ -88,53 +101,66 @@ def run_solution_management(
             tx_hash=tx_hash,
             miner_hotkey=miner_hotkey,
             challenge_id=challenge_id,
-        ):
+            max_solution_runtime_seconds=max_solution_runtime_seconds,
+        )
+        if not solution_id:
             bt.logging.error("Failed to insert pending challenge solution.")
             return None, None, None
         did_insert_solution = True
 
-        # 1. Setup
+        execution = SolutionExecution.create(
+            tx_hash=tx_hash,
+            submission_id=submission_id or "",
+            challenge_validation_solution_id=challenge_validation_solution_id,
+            challenge_id=challenge_id,
+            challenge_milestone_id=challenge_milestone_id,
+            miner_hotkey=miner_hotkey,
+            download_url=download_url,
+            solution_id=solution_id,
+        )
+
+        # Setup
         bt.logging.info(f"Setting up folder for solution id: {challenge_validation_solution_id}")
         solution_tag, folder_name = setup(validator_label, challenge_validation_solution_id=challenge_validation_solution_id)
         absolute_path_to_host_folder = os.path.abspath(folder_name)
 
-        # 2. Download zip
+        # Download zip
         local_filepath = download_zip(url=download_url, folder_name=folder_name)
         if local_filepath is None:
             bt.logging.error("Failed to download zip file.")
             raise InvalidSolutionError(message=ValidationErrors.TARBALL_DOWNLOAD_FAILED.value)
 
-        # 3. Validate zip
+        # Validate zip
         bt.logging.info("Validating zip...")
         valid_zipfile = validate_zip(local_filepath)
         if not valid_zipfile:
             bt.logging.error("Zip validation failed.")
             raise InvalidSolutionError(message=ValidationErrors.INVALID_TARBALL.value)
 
-        # 4. Extract code from zip
+        # Extract code from zip
         bt.logging.info("Extracting code from zip...")
         unzip(folder_name=folder_name, source_filepath=local_filepath)
 
-        # 5. Validate code
+        # Validate code
         bt.logging.info("Validating code...")
         code_is_valid = validate_code(folder_name=folder_name)
         if not code_is_valid:
             bt.logging.error("Code validation failed.")
             raise InvalidSolutionError(message=ValidationErrors.INVALID_PROGRAM.value)
 
-        # 5. Validate Dockerfile security policy
+        # Validate Dockerfile security policy
         bt.logging.info("Validating Dockerfile policy...")
         if not reject_dockerfile(folder_name=folder_name):
             bt.logging.error("Dockerfile policy validation failed.")
             raise InvalidSolutionError(message=ValidationErrors.INVALID_PROGRAM.value)
 
-        # 6. Build docker image
+        # Build docker image
         image_name = f"{solution_tag}_image".lower()  # Docker image names must be lowercase
         bt.logging.info(f"Building docker image: {image_name}")
         # build_image now raises InvalidSolutionError with rich diagnostics on any failure
         build_image(image_name=image_name, dockerfile_dir=f"{folder_name}/code")
 
-        # 7. Verify the image
+        # Verify the image
         bt.logging.info(f"Validating docker image: {image_name}")
         # validate_image now raises InvalidSolutionError with diagnostics on failure
         validate_image(image_name=image_name)
@@ -142,11 +168,13 @@ def run_solution_management(
         # Establish challenge input in a fresh read-only mount directory for this run.
         challenge_input_mount_dir = prepare_challenge_input_mount_dir(absolute_path_to_host_folder)
         run_challenge_setup(
-            challenge_milestone_id=challenge_milestone_id,
+            challenge_id=challenge_id,
             solution_folder_path=challenge_input_mount_dir,
+            configuration=milestone_configuration,
         )
 
-        # 8. Run the image in a container, capture the container id
+        # Run the image in a container, capture the container id
+        # Pass the SolutionExecution (pure identity; used for labels via to_labels).
         container_name = f"{solution_tag}_container".lower()  # Docker container names must be lowercase
         bt.logging.info(f"Running docker container: {container_name}")
         container_id = run_image_detached(
@@ -154,12 +182,14 @@ def run_solution_management(
             container_name=container_name,
             validator_label=validator_label,
             challenge_input_mount_dir=challenge_input_mount_dir,
+            solution_execution=execution,
         )
 
-        # 9. Update challenge solution with container/runtime fields
-        bt.logging.info(f"Updating challenge solution for miner with hotkey {miner_hotkey}")
-        if not db_conn.db_query.update_challenge_solution(
-            tx_hash=tx_hash,
+        # Persist runtime fields via by-id update (no longer stored on the SolutionExecution).
+        assert execution is not None
+        bt.logging.info(f"Updating challenge solution for miner with hotkey {execution.miner_hotkey}")
+        if not db_conn.db_query.update_challenge_solution_by_id(
+            solution_id=execution.solution_id,
             container_id=container_id,
             container_name=container_name,
             image_id=image_name,
@@ -179,14 +209,16 @@ def run_solution_management(
         if tb and "NoneType: None" not in tb:
             rich_reason += f"\n\nTraceback:\n{tb}"
 
-        if did_insert_solution and not did_start_solution:
-            db_conn.db_query.update_challenge_solution_status(
-                tx_hash=tx_hash,
+        if did_insert_solution and not did_start_solution and execution is not None:
+            # We constructed the SolutionExecution (with stable id) only on successful create.
+            db_conn.db_query.update_challenge_solution_status_by_id(
+                solution_id=execution.solution_id,
                 solution_status=SolutionStatus.FAILED.value,
             )
         if platform_client:
+            sub_for_report = execution.submission_id if execution is not None else (submission_id or "")
             platform_client.report_submission_status(
-                submission_id=submission_id or "",
+                submission_id=sub_for_report,
                 status="Failure",
                 reason=rich_reason[:2000],  # keep platform messages reasonable length
             )
@@ -247,7 +279,6 @@ def clean_up_failed_solution(image_name: str | None, container_id: str | None, f
 # =============================================================================
 
 def execute_verified_solution(
-    *,
     db_conn: DBConnection,
     platform_client: ChallengesClient | None,
     validator_label: str,
@@ -257,7 +288,7 @@ def execute_verified_solution(
     submission_id: str,
     tx_hash: str,
     miner_hotkey: str,
-    challenge_id: str | None = None,
+    challenge_id: str,
     # Optional: include these when the logs and solution output have been uploaded
     # so they can be reported together with the final status (as required by the platform).
     log_data_key: Optional[str] = None,
@@ -272,6 +303,15 @@ def execute_verified_solution(
       - The normal synapse processing path (ResponseProcessor)
       - The cross-check path (SolutionCrossChecker)
 
+    Claim identifiers are passed as individual values. A SolutionExecution
+    (the stable identity value object with solution_id etc.) is created
+    *internally* inside run_solution_management only after create_challenge_solution
+    succeeds. Runtime details are not part of SolutionExecution.
+
+    The handler (setup for challenge inputs + output validation) is looked up
+    by challenge_id (see MILESTONE_REGISTRY).
+
+
     On failure it reports via report_submission_status (including keys if provided).
     On success, the caller is responsible for any final Success report (with keys if applicable).
     """
@@ -280,9 +320,42 @@ def execute_verified_solution(
         f"(miner {miner_hotkey}, tx {tx_hash}, milestone {challenge_milestone_id})"
     )
 
-    # Fail fast if this milestone does not have registered setup + validation handlers.
-    # Per design, we cannot execute solutions for unsupported milestones.
-    assert_milestone_supported(challenge_milestone_id)
+    # Fail fast if this challenge id does not have registered setup + validation handlers.
+    # Per design, we cannot execute solutions for unsupported challenges.
+    # Handlers are registered/looked up directly by challenge_id.
+    assert_milestone_supported(challenge_id)
+
+    # Fetch milestone configuration from the platform API (contains difficulty, runtime, etc.)
+    milestone_configuration = {}
+    max_solution_runtime_seconds: int | None = None
+    if platform_client:
+        milestone_configuration = platform_client.get_milestone_configuration(
+            challenge_id, challenge_milestone_id
+        )
+        bt.logging.info(f"📋 Milestone configuration: {milestone_configuration}")
+        raw_runtime = milestone_configuration.get("max_solution_runtime") if isinstance(milestone_configuration, dict) else None
+        if raw_runtime is not None:
+            try:
+                secs = int(raw_runtime)
+                if secs > 0:
+                    max_solution_runtime_seconds = secs
+            except (TypeError, ValueError):
+                pass
+
+    if max_solution_runtime_seconds is None:
+        bt.logging.error(
+            f"❌ Missing or invalid max_solution_runtime for milestone {challenge_milestone_id} "
+            f"(challenge {challenge_id}). Refusing to run solution per policy: runtime limit must come from milestone config."
+        )
+        if platform_client:
+            platform_client.report_submission_status(
+                submission_id=submission_id,
+                status="Failure",
+                reason="Milestone is missing required max_solution_runtime configuration; validator cannot enforce timeout.",
+            )
+        else:
+            bt.logging.warning("No platform_client provided — could not report failure for missing max_solution_runtime")
+        return None, None, None
 
     start_ts = time.time()
 
@@ -296,8 +369,10 @@ def execute_verified_solution(
         tx_hash=tx_hash,
         miner_hotkey=miner_hotkey,
         challenge_id=challenge_id,
+        milestone_configuration=milestone_configuration,
         platform_client=platform_client,
         telemetry_service=telemetry_service,
+        max_solution_runtime_seconds=max_solution_runtime_seconds,
     )
 
     elapsed = time.time() - start_ts

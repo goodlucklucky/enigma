@@ -12,7 +12,7 @@ The `mine_enigma` CLI is an operator workflow for preparing a submission that th
 High-level flow:
 
 1. Load `.env` values (and optional CLI overrides).
-2. Query challenge data from the Engima Challenges API.
+2. Query challenge data from the Enigma Challenges API.
 3. Let the user pick a challenge/milestone and `.zip` file.
 4. Request an upload slot from `POST /v1/submissions/upload` (JWT-authenticated via `RequestManager`).
 5. Send the TAO fee payment on-chain as a `Utility.batch_all` containing a `Balances.transfer_keep_alive` + a `System.remark_with_event` (signed by your fee coldkey). The remark contains the canonical binding between the payment and your specific submission.

@@ -193,6 +193,29 @@ class ChallengesClient:
         resp = self._request("get", f"v1/challenges/{challenge_id}", operation="get_challenge")
         return resp.json()
 
+    def get_milestone_configuration(
+        self,
+        challenge_id: str,
+        milestone_id: str,
+    ) -> dict:
+        """
+        Fetch the configuration object for a specific milestone from the Challenges API.
+
+        Returns the configuration dict (e.g. {"difficulty": 320, "max_solution_runtime": 14400}).
+        Returns an empty dict if not found or on error.
+        """
+        try:
+            challenge = self.get_challenge(challenge_id)
+            for ms in challenge.get("milestones", []):
+                if str(ms.get("id")) == str(milestone_id):
+                    return ms.get("configuration") or {}
+        except Exception as e:
+            bt.logging.warning(
+                f"Failed to fetch configuration for milestone {milestone_id} "
+                f"(challenge {challenge_id}): {e}. Returning empty config."
+            )
+        return {}
+
     def get_milestone_price_tao(self, challenge_id: str, milestone_id: str) -> float:
         """
         Fetch the current priceTao for a milestone from the platform.
@@ -217,8 +240,6 @@ class ChallengesClient:
         self,
         challenge_id: str,
         milestone_id: str,
-        *,
-        default_seconds: int = 1800,  # 30 minutes fallback
     ) -> timedelta:
         """
         Fetch the max allowed solution runtime for a specific milestone from its
@@ -228,12 +249,13 @@ class ChallengesClient:
             {
               "id": "...",
               "configuration": {
-                "max_solution_runtime": 1800   # seconds
+                "max_solution_runtime": 14400   # seconds (4h)
               },
               ...
             }
 
-        Returns a timedelta. Falls back to default_seconds if not present or on error.
+        Returns a timedelta. Raises if the value is not present in the milestone
+        configuration or cannot be retrieved (no silent fallback).
         """
         try:
             challenge = self.get_challenge(challenge_id)
@@ -243,14 +265,19 @@ class ChallengesClient:
                     runtime = config.get("max_solution_runtime")
                     if runtime is not None:
                         return timedelta(seconds=int(runtime))
-                    break
-        except Exception as e:
-            bt.logging.warning(
-                f"Failed to fetch max_solution_runtime for milestone {milestone_id} "
-                f"(challenge {challenge_id}): {e}. Using default."
+                    raise RuntimeError(
+                        f"milestone {milestone_id} (challenge {challenge_id}) has no "
+                        "max_solution_runtime in its configuration"
+                    )
+            raise RuntimeError(
+                f"milestone_id {milestone_id} not found under challenge {challenge_id}"
             )
-
-        return timedelta(seconds=default_seconds)
+        except Exception as e:
+            bt.logging.error(
+                f"Failed to fetch max_solution_runtime for milestone {milestone_id} "
+                f"(challenge {challenge_id}): {e}"
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Authenticated endpoints (require RequestManager)
@@ -266,10 +293,10 @@ class ChallengesClient:
 
         endpoint = f"v1/challenges/milestones/{milestone_id}/submissions"
 
-        upload_id = getattr(payload, "upload_endpoint_id", None)
-        tx = getattr(payload, "tx_hash", None)
         bt.logging.info(
-            f"📤 POST submit_solution milestone={milestone_id} upload_id={upload_id} tx={tx}"
+            f"📤 POST submit_solution milestone={milestone_id} "
+            f"upload_id={getattr(payload, 'upload_endpoint_id', None)} "
+            f"tx={getattr(payload, 'tx_hash', None)}"
         )
 
         try:

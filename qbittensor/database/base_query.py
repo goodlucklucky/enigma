@@ -46,7 +46,7 @@ class BaseDBQuery:
         return self._session_factory
 
     @contextmanager
-    def _managed_session(self, *, read_only: bool = False) -> Iterator[Session]:
+    def _managed_session(self, read_only: bool = False) -> Iterator[Session]:
         """
         Context manager that handles the full session lifecycle safely.
 

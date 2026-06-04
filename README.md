@@ -20,7 +20,7 @@
 
 By leveraging Bittensor's incentive layer, Enigma turns critical security research into a transparent, competitive, and publicly verifiable process. Winners drain prize pools (including the current Treasury Wallet challenge), and successful exploits are open-sourced to advance the ecosystem.
 
-> **Current Focus**: Breaking today to build a better tomorrow. The subnet is pioneering Bittensor's Treasury Wallet feature.
+> **Current Focus**: Breaking today to build a better tomorrow. The first challenge — Breaking RSA — is live. The subnet pioneers Bittensor's Treasury Wallet feature to fund challenge prize pools.
 
 ---
 
@@ -71,9 +71,21 @@ The Treasury Wallet is a core component of Subnet 63, implemented as a smart con
 
 Challenges and prizes will be paid to the winner based upon a proposal and vote by validators.
 
+For current treasury balance and active prize pools, visit the [Enigma page](https://www.qbittensorlabs.com/enigma).
+
 ---
 
-## Current Live Challenge: Coming Soon
+## Challenges
+
+### Breaking RSA — Live
+
+Factor large semiprimes to break RSA encryption. Solutions run in Docker containers on validator hardware (RTX PRO 6000, `--network none`, `linux/amd64`) with a 4-hour wall time.
+
+See the [Breaking RSA challenge README](workbench/challenges/breaking_rsa/README.md) for details, and the [Miner Guide](qbittensor/miner/README.md) for submission instructions.
+
+### Peaked Circuits — Coming Soon
+
+For current prize pools, milestones, and additional details, visit the [Enigma page](https://www.qbittensorlabs.com/enigma).
 
 ---
 

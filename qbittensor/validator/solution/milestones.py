@@ -20,13 +20,19 @@ from typing import Callable, Optional
 
 from qbittensor.validator.solution.challenge_inputs.mock_solution_setup import mock_solution_setup
 from qbittensor.validator.solution.solution_validations.mock_solution import run as run_mock_solution
+from qbittensor.validator.solution.challenge_inputs.breaking_rsa_setup import breaking_rsa_setup
+from qbittensor.validator.solution.solution_validations.breaking_rsa_solution import run as run_breaking_rsa
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
 
 
 @dataclass(frozen=True)
 class MilestoneHandlers:
-    """Holds the optional setup and validation functions for a given milestone."""
+    """Holds the optional setup and validation functions for a given milestone.
+
+    Setup signature:   (solution_folder_path: str, configuration: dict) -> str
+    Validate signature: (solution_folder_path: str) -> tuple[bool, str | None]
+    """
 
     setup: Optional[Callable] = None
     validate: Optional[Callable] = None
@@ -43,46 +49,56 @@ class MilestoneHandlers:
 # (challenge_setup_map and solution_map) that had to be kept in sync manually.
 # =============================================================================
 
-MOCK_MILESTONE_ID = "9c869f1e-66da-4ebe-9fe1-4f5a2b9c8228"
+# Registered challenge IDs (UUIDs from the platform, or synthetic for staging).
+MOCK_CHALLENGE_ID = "b513b40c-ecab-4d9c-b146-e1ffb357113b"
+BREAKING_RSA_CHALLENGE_ID = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
 
 MILESTONE_REGISTRY: dict[str, MilestoneHandlers] = {
-    # Mock challenge used for testing private/public key (Ed25519) validation
-    MOCK_MILESTONE_ID: MilestoneHandlers(
+    # Mock challenge used for testing private/public key (Ed25519) validation.
+    # Handlers are registered by challenge_id (the UUID from the platform).
+    # Adding support for a new challenge_id requires updating this registry (and redeploy).
+    MOCK_CHALLENGE_ID: MilestoneHandlers(
         setup=mock_solution_setup,
         validate=run_mock_solution,
+    ),
+    # Breaking RSA (semiprime factorization) challenge.
+    # Requires gmpy2 for prime generation during setup.
+    BREAKING_RSA_CHALLENGE_ID: MilestoneHandlers(
+        setup=breaking_rsa_setup,
+        validate=run_breaking_rsa,
     ),
 }
 
 
-def get_milestone_handlers(milestone_id: str) -> MilestoneHandlers | None:
-    """Return the handlers for a milestone, or None if the milestone is unknown."""
-    return MILESTONE_REGISTRY.get(milestone_id)
+def get_milestone_handlers(challenge_id: str) -> MilestoneHandlers | None:
+    """Return the handlers for a challenge id, or None if unknown."""
+    return MILESTONE_REGISTRY.get(challenge_id)
 
 
-def assert_milestone_supported(challenge_milestone_id: str) -> None:
+def assert_milestone_supported(challenge_id: str) -> None:
     """
-    Enforce that a milestone has registered handlers for both setup and validation.
+    Enforce that a challenge id has registered handlers for both setup and validation.
 
     Per design, every runnable milestone must have these handlers.
     If not present, the solution cannot be executed.
     This check should be performed very early (before downloading or building images).
+    The lookup is by challenge_id because handlers are selected per challenge.
     """
-    handlers = get_milestone_handlers(challenge_milestone_id)
+    handlers = get_milestone_handlers(challenge_id)
     if not handlers:
         raise InvalidSolutionError(
             message=ValidationErrors.INVALID_PROGRAM.value,
-            details=f"No handlers registered for milestone '{challenge_milestone_id}'. "
-                    "This milestone is not supported for execution.",
+            details=f"No handlers registered for challenge_id '{challenge_id}'.",
         )
 
     if not handlers.setup:
         raise InvalidSolutionError(
             message=ValidationErrors.INVALID_PROGRAM.value,
-            details=f"Milestone '{challenge_milestone_id}' is missing a challenge setup handler.",
+            details=f"Challenge_id '{challenge_id}' is missing a setup handler.",
         )
 
     if not handlers.validate:
         raise InvalidSolutionError(
             message=ValidationErrors.INVALID_PROGRAM.value,
-            details=f"Milestone '{challenge_milestone_id}' is missing an output validation handler.",
+            details=f"Challenge_id '{challenge_id}' is missing a validation handler.",
         )

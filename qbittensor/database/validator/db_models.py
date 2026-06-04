@@ -17,7 +17,7 @@
 
 import logging
 import uuid
-from sqlalchemy import Column, String, DateTime, func
+from sqlalchemy import Column, String, DateTime, func, Boolean, Integer
 from ..base import Base
 
 logger = logging.getLogger(__name__)
@@ -27,22 +27,28 @@ class ChallengeSolution(Base):
     __tablename__ = "challenge_solutions"
 
     id = Column(String(50), primary_key=True, default=lambda: str(uuid.uuid4()))
-    challenge_validation_solution_id = Column(String(50))
+    challenge_validation_solution_id = Column(String(50), nullable=False)
     container_id = Column(String(100), nullable=False)
     container_name = Column(String(100), nullable=False)
     image_id = Column(String(100), nullable=False)
     challenge_id = Column(String(100), nullable=True)
     challenge_milestone_id = Column(String(100), nullable=False)
+    max_solution_runtime_seconds = Column(Integer, nullable=True)
     absolute_path_to_solution = Column(String(100), nullable=False)
     submission_id = Column(String(100), nullable=False)
     solution_status = Column(String(100), nullable=False)
     tx_hash = Column(String(100), nullable=False, unique=True)
     miner_hotkey = Column(String(100), nullable=False)
+    cleaned = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     def __repr__(self):
-        return f"<ChallengeSolution(challenge_validation_solution_id='{self.challenge_validation_solution_id}', container_id='{self.container_id}', container_name='{self.container_name}', challenge_milestone_id='{self.challenge_milestone_id}', absolute_path_to_solution='{self.absolute_path_to_solution}', submission_id='{self.submission_id}', created_at='{self.created_at}')>"
+        return (
+            f"<ChallengeSolution(id='{self.id}', submission_id='{self.submission_id}', "
+            f"container_name='{self.container_name}', status='{self.solution_status}', "
+            f"cleaned={self.cleaned})>"
+        )
 
     def __str__(self):
         return self.__repr__()
@@ -59,7 +65,10 @@ class MinerMaintenanceIncentive(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     def __repr__(self):
-        return f"<MinerMaintenanceIncentive(miner_hotkey='{self.miner_hotkey}', challenge_milestone_id='{self.challenge_milestone_id}', tx_hash='{self.tx_hash}', created_at='{self.created_at}')>"
+        return (
+            f"<MinerMaintenanceIncentive(id='{self.id}', miner_hotkey='{self.miner_hotkey}', "
+            f"challenge_milestone_id='{self.challenge_milestone_id}', tx_hash='{self.tx_hash}')>"
+        )
 
     def __str__(self):
         return self.__repr__()

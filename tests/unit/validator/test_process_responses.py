@@ -24,7 +24,7 @@ from qbittensor.validator.synapse.process_responses import ResponseProcessor
 from qbittensor.utils.services.challenges import ChallengesClient
 
 
-def _make_synapse(*, milestone_id="m1", upload_id="up1", prep_id="prep1", challenge_id="ch1"):
+def _make_synapse(*, milestone_id="m1", upload_id="up1", challenge_id="ch1"):
     synapse = Mock()
     synapse.challenge_id = challenge_id
     synapse.tx_hash = "0xabc"
@@ -38,7 +38,6 @@ def _make_synapse(*, milestone_id="m1", upload_id="up1", prep_id="prep1", challe
         challenge_milestone_id=milestone_id,
         upload_endpoint_id=upload_id,
         challenge_id=challenge_id,
-        challenge_preparation_id=prep_id,
     )
     return synapse
 

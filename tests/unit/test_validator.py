@@ -79,6 +79,8 @@ def mock_validator(mock_config):
         patch("qbittensor.validator.synapse.process_responses.ResponseProcessor") as mock_response_processor_cls,
         patch("qbittensor.validator.solution.solution_container_manager.SolutionContainerManager") as mock_solution_container_manager_cls,
         patch("qbittensor.validator.solution.solution_cross_check.SolutionCrossChecker") as mock_cross_check_cls,
+        patch("neurons.validator.test_gpu_container", return_value=True),
+        patch("neurons.validator.is_docker_available"),
     ):
 
         mock_wallet.return_value = Mock()

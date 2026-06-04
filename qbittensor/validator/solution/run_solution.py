@@ -27,6 +27,7 @@ import bittensor as bt
 
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
+from .solution_context import SolutionExecution
 from .constants import (
     CHALLENGE_INPUT_DIRNAME,
     CONTAINER_CHALLENGE_INPUT_PATH,
@@ -41,6 +42,8 @@ from .constants import (
     VALIDATOR_DOCKER_CAP_DROP_ENV,
     VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT,
     VALIDATOR_DOCKER_CPU_LIMIT_ENV,
+    VALIDATOR_DOCKER_GPUS_DEFAULT,
+    VALIDATOR_DOCKER_GPUS_ENV,
     VALIDATOR_DOCKER_MINER_USER_DEFAULT,
     VALIDATOR_DOCKER_MINER_USER_ENV,
     VALIDATOR_DOCKER_NO_NEW_PRIVILEGES_DEFAULT,
@@ -359,6 +362,10 @@ def docker_run_security_args() -> list[str]:
     if memory:
         args.extend(["--memory", memory, "--memory-swap", memory])
 
+    gpus = os.getenv(VALIDATOR_DOCKER_GPUS_ENV, VALIDATOR_DOCKER_GPUS_DEFAULT).strip()
+    if gpus:
+        args.extend(["--gpus", gpus])
+
     run_user = _container_run_user()
     if run_user:
         args.extend(["--user", run_user])
@@ -368,7 +375,6 @@ def docker_run_security_args() -> list[str]:
 
 def _run_docker_command(
     cmd: list[str],
-    *,
     description: str = "docker command",
     check: bool = True,
 ) -> subprocess.CompletedProcess:
@@ -431,6 +437,8 @@ def run_image_detached(
     container_name: str,
     validator_label: str,
     challenge_input_mount_dir: str,
+    *,
+    solution_execution: SolutionExecution | None = None,
 ) -> str:
     """
     Run a Docker container in detached mode with hardened mounts.
@@ -440,6 +448,11 @@ def run_image_detached(
       text logs + a :data:`SOLUTION_OUTPUT_SEPARATOR` line + a base64-encoded
       zip of artifacts to stdout. The validator captures this after the container
       exits using ``docker logs`` (see :func:`extract_stdout_output`).
+
+    If ``solution_execution`` is provided, stable identifiers (including the
+    solution_id) are attached as ``--label`` values via ``solution_execution.to_labels()``.
+    This is the preferred path. Direct calls from tests that don't need our
+    correlation labels can pass ``solution_execution=None``.
     """
     challenge_mount = os.path.abspath(challenge_input_mount_dir)
 
@@ -455,8 +468,13 @@ def run_image_detached(
         "-v", f"{challenge_mount}:{CONTAINER_CHALLENGE_INPUT_PATH}:ro",
         "--label",
         validator_label,
-        image_name,
     ]
+
+    if solution_execution is not None:
+        for k, v in solution_execution.to_labels().items():
+            cmd.extend(["--label", f"{k}={v}"])
+
+    cmd.append(image_name)
 
     try:
         result = _run_docker_command(

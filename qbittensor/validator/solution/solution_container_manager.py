@@ -16,7 +16,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 from typing import List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -27,10 +27,10 @@ from qbittensor.validator.solution.run_solution import extract_stdout_output
 from qbittensor.validator.solution.validate_solution_output import validate_solution
 from qbittensor.utils.services.challenges import ChallengesClient
 from qbittensor.constants import SOLUTION_CONTAINER_MANAGER_TIMEOUT, MAX_SOLUTIONS
-# Fallback only - real value should come from milestone configuration via the API
-from datetime import timedelta
-DEFAULT_MAX_SOLUTION_RUNTIME = timedelta(minutes=30)
+from qbittensor.utils.solution_status import SolutionStatus
 import bittensor as bt
+
+from .solution_context import SolutionExecution, SolutionPostProcessInfo
 
 
 def is_docker_available() -> bool:
@@ -93,10 +93,14 @@ class SolutionContainerManager:
         self.timer: Timer = Timer(timeout=SOLUTION_CONTAINER_MANAGER_TIMEOUT, run=self.run, run_on_start=True)
         self.database_connection = database_connection
         self.LABEL = validator_label
-        self._runtime_cache: dict[str, timedelta] = {}  # key: "challenge_id:milestone_id" -> timedelta
 
         # Early Docker availability check (non-fatal, but very loud)
         is_docker_available()
+
+        # Recover from previous run: process completed (for proper validation/reporting),
+        # leave any still-running solutions untouched (so they continue and are monitored
+        # to completion), and only remnant-clean truly lost/orphaned ones.
+        self.recover_and_clean_on_startup()
 
     def run(self) -> None:
         bt.logging.info("🐳 Starting periodic solution container check (pruning, completed, overdue)")
@@ -134,57 +138,67 @@ class SolutionContainerManager:
                 exit_msg += f", finished_at={details['finished_at']}"
             bt.logging.info(f"📦 Container '{name}' has exited ({exit_msg})")
 
-        # Pull each completed container's stdout via ``docker logs`` and split it into
-        # the run's log file and the run's solution-output zip before validation reads
-        # them; the container can be safely removed afterwards because nothing on disk
-        # was shared with the validator (no /output volume or bind mount).
-        self._extract_outputs_from_completed_containers(completed_containers)
+        infos = self._collect_completed_solution_infos(completed_containers)
+        bt.logging.info(f"📂 Found {len(infos)} completed solutions for output validation + cleanup")
 
-        solution_locations = self._find_location_of_completed_solutions(completed_containers)
-        bt.logging.info(f"📂 Found {len(solution_locations)} output folders for completed solutions")
+        self._extract_outputs_from_completed_containers(infos)
 
-        self._validate_and_report_solutions(solution_locations)
+        self._validate_and_report_solutions(infos)
 
-    def _extract_outputs_from_completed_containers(self, container_names: List[str]) -> None:
+    def _extract_outputs_from_completed_containers(self, solutions: List[SolutionPostProcessInfo]) -> None:
         """
         Pull each completed container's stdout via ``docker logs`` and split it into
         the run's log file and the solution-output zip on the host workspace.
         """
-        for name in container_names:
+        for info in solutions:
+            name = info.container_name
             if not self._container_has_validator_label(name):
                 bt.logging.warning(
                     f"⚠️ Skipping output extraction for container {name}; "
                     f"validator label {self.LABEL} not found"
                 )
                 continue
-            solution = self.database_connection.db_query.get_challenge_solution_location(container_name=name)
-            if not solution:
-                bt.logging.warning(
-                    f"⚠️ Skipping output extraction for container {name}; "
-                    f"no solution location in database"
-                )
-                continue
-            extract_stdout_output(name, solution.absolute_path_to_solution)
+            # We already have the path from the collected info; no extra lookup needed.
+            extract_stdout_output(name, info.workspace_path)
 
-    def _validate_and_report_solutions(self, solution_locations: List[str]) -> None:
-        """Validate the outputs of completed solutions and report results to the platform"""
-        for location in solution_locations:
-            bt.logging.info(f"🔍 Validating solution output at {location}")
-            solution_status = validate_solution(location, self.platform_client, self.database_connection)
-            self.database_connection.db_query.update_solution_status_in_db(solution_location=location, solution_status=solution_status)
+    def _validate_and_report_solutions(self, solutions: List[SolutionPostProcessInfo]) -> None:
+        """Validate the outputs of completed solutions and report results to the platform.
 
-        self._clean_up_solutions(solution_locations)
+        Uses stable identifiers from the collected info objects (delegated via
+        the embedded SolutionExecution for the identity fields).
+        """
+        for info in solutions:
+            bt.logging.info(f"🔍 Validating solution output at {info.workspace_path}")
+            solution_status = validate_solution(
+                info.workspace_path,
+                self.platform_client,
+                submission_id=info.submission_id,
+                challenge_milestone_id=info.challenge_milestone_id,
+                challenge_id=info.challenge_id,
+            )
+            self.database_connection.db_query.update_solution_status_by_id(
+                info.id, solution_status
+            )
 
-    def _clean_up_solutions(self, solution_locations: List[str]) -> None:
+        self._clean_up_solutions(solutions)
+
+    def _clean_up_solutions(self, solutions: List[SolutionPostProcessInfo]) -> None:
         cleaned = 0
-        for location in solution_locations:
-            bt.logging.info(f"🧹 Cleaning up solution at {location}")
+        for info in solutions:
+            bt.logging.info(f"🧹 Cleaning up solution at {info.workspace_path}")
 
-            container_name = str(self.database_connection.db_query.get_container_name_by_solution_location(location))
-            image_id = self.database_connection.db_query.get_image_id_from_solution_location(location)
+            # Use carried values from stable-key row lookup; never look up by path
+            container_name = info.container_name
+            image_id = info.image_id
+            location = info.workspace_path
+
+            if not os.path.exists(location):
+                bt.logging.info(f"    FS path does not exist for {info.id}, marking as cleaned")
+                self.database_connection.db_query.mark_solution_cleaned(info.id)
+                # still attempt container/image cleanup below if names present
 
             try:
-                if container_name is not None:
+                if container_name:
                     if not self._container_has_validator_label(container_name):
                         bt.logging.warning(
                             f"⚠️ Refusing to clean up container {container_name}; validator label {self.LABEL} not found"
@@ -222,14 +236,15 @@ class SolutionContainerManager:
                 if rmf_res.returncode == 0:
                     bt.logging.info(f"🗑️ Removed solution folder {location}")
                     cleaned += 1
+                    self.database_connection.db_query.mark_solution_cleaned(info.id)
                 else:
                     bt.logging.warning(f"⚠️ Failed to remove folder {location}")
 
             except Exception as e:
                 bt.logging.error(f"❌ Failed to clean up solution at {location}: {e}")
 
-        if solution_locations:
-            bt.logging.info(f"🧹 Cleaned up {cleaned}/{len(solution_locations)} solution locations")
+        if solutions:
+            bt.logging.info(f"🧹 Cleaned up {cleaned}/{len(solutions)} solution locations")
 
     def _find_completed_solutions(self) -> List[str]:
         """Find containers that have completed their run and are ready for output validation"""
@@ -264,18 +279,98 @@ class SolutionContainerManager:
         except Exception:
             return {"exit_code": -1, "error": "", "finished_at": ""}
 
-    def _find_location_of_completed_solutions(self, container_names: List[str]) -> List[str]:
-        """Find the host folder locations of completed solutions"""
-        solution_locations: List[str] = []
+    def _get_container_state(self, container_identifier: str) -> str | None:
+        """Return the docker State.Status for a container (e.g. 'running', 'exited', 'created')
+        or None if the container does not exist or inspect fails.
+        Used by recovery to decide whether a solution's container is still alive.
+        """
+        if not container_identifier:
+            return None
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Status}}", container_identifier],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                status = result.stdout.strip()
+                return status or None
+            return None
+        except Exception:
+            return None
+
+    def _get_stable_keys_from_container(self, container_name: str) -> dict[str, str | None]:
+        """Inspect the container's labels (attached at `docker run` time) to extract
+        stable identifiers (primarily solution_id, plus others for diagnostics).
+        This allows DB correlation via get_challenge_solution_by_id.
+        """
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", container_name, "--format", "{{json .Config.Labels}}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            labels = json.loads(result.stdout.strip() or "{}") or {}
+            return {
+                "submission_id": labels.get("submission_id"),
+                "tx_hash": labels.get("tx_hash"),
+                "challenge_validation_solution_id": labels.get("challenge_validation_solution_id"),
+                "solution_id": labels.get("solution_id"),
+            }
+        except Exception as e:
+            bt.logging.debug(f"Could not extract stable labels from container {container_name}: {e}")
+            return {"submission_id": None, "tx_hash": None, "challenge_validation_solution_id": None, "solution_id": None}
+
+    def _collect_completed_solution_infos(self, container_names: List[str]) -> List[SolutionPostProcessInfo]:
+        """Collect post-process info for completed solutions.
+
+        We extract the solution_id (and other stable identifiers) from Docker labels
+        attached at `docker run --label` time. When present, we look up the DB row
+        using get_challenge_solution_by_id (preferred). We build a SolutionExecution
+        (for identity) + SolutionPostProcessInfo (embedding it + runtime details).
+        The info carries the internal `id` (via .id / .execution.solution_id) for
+        all subsequent by-id operations.
+        """
+        infos: List[SolutionPostProcessInfo] = []
         for name in container_names:
-            solution = self.database_connection.db_query.get_challenge_solution_location(container_name=name)
-            if solution:
-                bt.logging.info(f"📂 Found solution location for container {name}: {solution.absolute_path_to_solution}")
-                solution_locations.append(solution.absolute_path_to_solution)  # type: ignore
+            stable = self._get_stable_keys_from_container(name)
+            solution = None
+            if stable.get("solution_id"):
+                solution = self.database_connection.db_query.get_challenge_solution_by_id(stable["solution_id"])
             else:
-                bt.logging.warning(f"⚠️ No solution location found for container {name}")
+                # No solution_id label — treat as no DB row (orphan cleanup will handle docker side).
+                # All containers are expected to carry the solution_id label.
+                solution = None
+
+            if solution:
+                bt.logging.info(f"📂 Found solution for container {name}: {solution.absolute_path_to_solution}")
+                # Reconstruct a SolutionExecution for the identity fields we have from the DB row.
+                # download_url is not stored in the row (it is transient to the initial execution);
+                # we use a placeholder since it is not needed for post-processing.
+                exec_identity = SolutionExecution.create(
+                    tx_hash=solution.tx_hash,
+                    submission_id=solution.submission_id,
+                    challenge_validation_solution_id=solution.challenge_validation_solution_id or "",
+                    challenge_id=solution.challenge_id or "",
+                    challenge_milestone_id=solution.challenge_milestone_id,
+                    miner_hotkey=solution.miner_hotkey,
+                    download_url="",
+                    solution_id=solution.id,
+                )
+                infos.append(
+                    SolutionPostProcessInfo(
+                        execution=exec_identity,
+                        container_name=name,
+                        workspace_path=solution.absolute_path_to_solution,
+                        image_id=solution.image_id,
+                    )
+                )
+            else:
+                bt.logging.warning(f"⚠️ No solution row found for container {name}")
                 self._clean_up_orphaned_solutions(name)
-        return solution_locations
+        return infos
 
     def validator_is_busy(self) -> bool:
         """Check if the validator is running the max number of solutions"""
@@ -353,9 +448,19 @@ class SolutionContainerManager:
 
     def _get_max_runtime_for_container(self, container_identifier: str) -> timedelta:
         """
-        Resolve the max allowed runtime for the milestone associated with this container
-        by looking up the solution record in the local DB and then querying the
-        Challenges API for that milestone's configuration.max_solution_runtime.
+        Return the max allowed runtime for the milestone of this container.
+
+        The value is read exclusively from the max_solution_runtime_seconds stored
+        on the ChallengeSolution DB row (recorded at start time from the milestone
+        configuration). Containers are only started after the early fetch + fail-fast
+        check, so a valid positive value is expected.
+
+        The solution row is located via the stable solution_id label on the container.
+
+        If no valid stored runtime can be obtained for a container we own (via our
+        validator label), we return 0s. This causes the container to be treated as
+        immediately overdue and terminated. No API re-query is performed, and there
+        are no hardcoded fallbacks.
         """
         try:
             container_name = container_identifier
@@ -375,39 +480,52 @@ class SolutionContainerManager:
                 except Exception:
                     pass  # fall back to using the identifier as-is
 
-            # Primary lookup by container_name
-            solution = self.database_connection.db_query.get_challenge_solution_location(
-                container_name=container_name
-            )
+            # Use solution_id label (attached at docker run) for stable lookup.
+            # We require the DB row to have the runtime limit recorded.
+            stable = self._get_stable_keys_from_container(container_name)
+            solution = None
+            if stable.get("solution_id"):
+                solution = self.database_connection.db_query.get_challenge_solution_by_id(stable["solution_id"])
 
-            if solution and hasattr(solution, "challenge_milestone_id"):
+            if solution:
                 milestone_id = solution.challenge_milestone_id
-                challenge_id = getattr(solution, "challenge_id", None)
 
-                cache_key = f"{challenge_id or ''}:{milestone_id}"
-                if cache_key in self._runtime_cache:
-                    return self._runtime_cache[cache_key]
+                stored = solution.max_solution_runtime_seconds
+                if stored is not None:
+                    try:
+                        secs = int(stored)
+                        if secs > 0:
+                            runtime = timedelta(seconds=secs)
+                            bt.logging.debug(
+                                f"Using stored max_solution_runtime={runtime} for milestone {milestone_id}"
+                            )
+                            return runtime
+                    except (TypeError, ValueError):
+                        pass
 
-                if self.platform_client:
-                    runtime = self.platform_client.get_milestone_max_solution_runtime(
-                        challenge_id=challenge_id or "",
-                        milestone_id=milestone_id,
-                    )
-                    self._runtime_cache[cache_key] = runtime
-                    bt.logging.debug(
-                        f"Resolved max_solution_runtime={runtime} for milestone {milestone_id}"
-                    )
-                    return runtime
+                # Row exists but has no valid runtime recorded. This violates the
+                # "started only after early fetch" rule. Kill it (no limit = terminate).
+                bt.logging.error(
+                    f"❌ Container {container_identifier} (solution_id={stable.get('solution_id')}) "
+                    f"has no valid max_solution_runtime_seconds on its DB row "
+                    f"(milestone={milestone_id}). Terminating as unenforced."
+                )
+                return timedelta(0)
 
-            bt.logging.debug(
-                f"Could not resolve milestone for container {container_identifier}. "
-                f"Using default max runtime."
+            # No solution row (missing solution_id label, or label present but row gone).
+            # We only manage containers we started with labels + DB rows. Kill it.
+            bt.logging.error(
+                f"❌ Could not resolve DB solution row (and thus runtime limit) for container "
+                f"{container_identifier} via labels. Terminating as unenforced (no solution_id label or no row)."
             )
-            return DEFAULT_MAX_SOLUTION_RUNTIME
+            return timedelta(0)
 
         except Exception as e:
-            bt.logging.warning(f"Failed to resolve max runtime for container {container_identifier}: {e}")
-            return DEFAULT_MAX_SOLUTION_RUNTIME
+            bt.logging.error(
+                f"❌ Error resolving max runtime for container {container_identifier}: {e}. "
+                "Terminating as unenforced."
+            )
+            return timedelta(0)
 
     def _get_overdue_containers(self) -> List[str]:
         """
@@ -477,7 +595,14 @@ class SolutionContainerManager:
                 )
                 continue
             config_image = self._inspect_container_config_image(cid)
-            db_image = self.database_connection.db_query.get_image_id_by_container_id(cid)
+            # Use stable solution_id from labels (attached at docker run time) to look up the DB row
+            # and its image_id. No fallback needed; all containers created after labeling change
+            # will have the solution_id label.
+            stable = self._get_stable_keys_from_container(cid)
+            db_image = None
+            if stable.get("solution_id"):
+                sol = self.database_connection.db_query.get_challenge_solution_by_id(stable["solution_id"])
+                db_image = sol.image_id if sol else None
             image_to_remove: str | None = None
             if config_image and self._image_ref_owned_by_validator(config_image):
                 image_to_remove = config_image
@@ -608,21 +733,149 @@ class SolutionContainerManager:
             else:
                 bt.logging.warning(f"⚠️ Failed to remove orphaned container {container_name}")
 
-            # clean up image as well, if we can find it in the db
-            image_id = self.database_connection.db_query.get_image_id_by_container_name(container_name)
-            if image_id and self._image_ref_owned_by_validator(image_id):
-                bt.logging.info(f"🗑️ Removing orphan image {image_id}")
-                rmi_res = subprocess.run(["docker", "rmi", "-f", image_id], check=False, capture_output=True, text=True)
+            # Clean up the image directly via inspect (no DB needed for orphans).
+            # If the container had a DB row we would have the image_id in the info,
+            # but for true orphans we still want to remove our images if present.
+            image_ref = self._inspect_container_config_image(container_name)
+            if image_ref and self._image_ref_owned_by_validator(image_ref):
+                bt.logging.info(f"🗑️ Removing orphan image {image_ref}")
+                rmi_res = subprocess.run(["docker", "rmi", "-f", image_ref], check=False, capture_output=True, text=True)
                 if rmi_res.returncode == 0:
-                    bt.logging.info(f"🗑️ Removed orphan image {image_id}")
+                    bt.logging.info(f"🗑️ Removed orphan image {image_ref}")
                 else:
-                    bt.logging.warning(f"⚠️ Failed to remove orphan image {image_id}")
-            elif image_id:
+                    bt.logging.warning(f"⚠️ Failed to remove orphan image {image_ref}")
+            elif image_ref:
                 bt.logging.warning(
-                    f"⚠️ Refusing to remove orphan image {image_id}; name does not match validator label prefix"
+                    f"⚠️ Refusing to remove orphan image {image_ref}; name does not match validator label prefix"
                 )
 
-            self.database_connection.db_query.remove_solution_from_db_by_conainer_name(container_name=container_name)
+            # Remove any stale DB row preferring by solution id from labels.
+            # (We no longer fall back to container_name lookup; for pre-labeling orphan
+            # containers we simply leave any stale DB row -- it will be aged out by prune
+            # or is harmless. This keeps all DB mutations by stable id only.)
+            stable = self._get_stable_keys_from_container(container_name)
+            if stable.get("solution_id"):
+                self.database_connection.db_query.remove_solution_by_id(stable["solution_id"])
+            else:
+                bt.logging.debug(
+                    f"No solution_id label on orphan container {container_name}; "
+                    "skipping DB row removal (no fragile container_name lookup)"
+                )
 
         except Exception as e:
             bt.logging.error(f"❌ Failed to clean up orphaned solution associated to container: {container_name}: {e}")
+
+    def recover_and_clean_on_startup(self) -> None:
+        """On validator startup, recover from prior runs (including abrupt shutdowns).
+
+        Policy (per design: just recover and monitor; never forcefully exit a running solution):
+        - First, delegate to handle_completed_solutions() so any containers that exited around
+          shutdown get the full normal path: extract stdout/artifacts, validate output,
+          report status to platform, and clean + mark_cleaned. This prevents force-failing
+          solutions that actually completed.
+        - Re-query uncleaned rows.
+        - For each still-uncleaned solution:
+          - If it has a container that is *currently running* and carries our validator label:
+            - Log that we recovered/adopted a live solution.
+            - Leave the container completely untouched (no stop, no rm).
+            - Leave the DB row uncleaned (status unchanged).
+            - Future periodic runs will see it via _get_overdue_containers (for max-runtime)
+              and handle_completed_solutions (once it exits).
+          - Otherwise (no container, container exited/gone, or not owned):
+            - Clean any remnants (container if present, image if owned, FS path if present).
+            - mark_solution_cleaned(id)
+            - If the prior status was RUNNING or PENDING, set FAILED (lost in-flight work).
+        - Always guard docker mutations with label checks.
+        - Rows with missing paths/containers are marked cleaned so they are not re-processed
+          on future restarts.
+        """
+        bt.logging.info("🔄 Recovering uncleaned solutions from previous validator run (if any)")
+        try:
+            uncleaned = self.database_connection.db_query.get_uncleaned_solutions()
+            if not uncleaned:
+                bt.logging.info("✅ No uncleaned solutions to recover")
+                return
+
+            # Proactively process any *exited* containers first. This lets solutions that
+            # completed just before shutdown go through the proper extraction/validation/
+            # reporting path instead of being force-cleaned+failed here.
+            self.handle_completed_solutions()
+
+            # Re-fetch: exited ones that had rows should now be marked cleaned by the normal path.
+            # Remaining will be running containers we must not touch, plus lost/orphaned ones.
+            still_uncleaned = self.database_connection.db_query.get_uncleaned_solutions()
+            if not still_uncleaned:
+                bt.logging.info("✅ No uncleaned solutions left after processing completed ones")
+                return
+
+            recovered = 0
+            for sol in still_uncleaned:
+                bt.logging.info(f"  Recovering solution id={sol.id} name={sol.container_name} path={sol.absolute_path_to_solution} status={sol.solution_status}")
+                cleaned_something = False
+
+                container_name = sol.container_name
+                state = self._get_container_state(container_name) if container_name else None
+
+                if container_name and state == "running" and self._container_has_validator_label(container_name):
+                    bt.logging.info(
+                        f"    🔄 Recovered still-running solution id={sol.id} container={container_name}; "
+                        "leaving container running and row uncleaned so normal monitoring "
+                        "(handle_completed_solutions + _get_overdue_containers) will observe completion. "
+                        "Not stopping, not marking cleaned, not forcing FAILED."
+                    )
+                    continue  # <--- key: do not kill it, do not mark, do not fail
+
+                # No owned+running container for this uncleaned row -> safe to clean remnants.
+                # (covers: container never existed, exited+already-handled, exited+rm'd externally, lost, etc.)
+
+                # Try to remove container if it still exists (but we already know it's not a live running one we own)
+                if container_name and self._container_has_validator_label(container_name):
+                    try:
+                        # stop is harmless for exited/dead containers
+                        stop_res = subprocess.run(["docker", "stop", container_name], check=False, capture_output=True, text=True)
+                        if stop_res.returncode == 0:
+                            bt.logging.info(f"    Stopped container {container_name}")
+                        rm_res = subprocess.run(["docker", "rm", "-v", container_name], check=False, capture_output=True, text=True)
+                        if rm_res.returncode == 0:
+                            bt.logging.info(f"    Removed container {container_name}")
+                            cleaned_something = True
+                    except Exception as e:
+                        bt.logging.warning(f"    Error cleaning container {container_name}: {e}")
+
+                # Remove image if we have it and it's ours (best effort)
+                if sol.image_id and self._image_ref_owned_by_validator(sol.image_id):
+                    try:
+                        rmi_res = subprocess.run(["docker", "rmi", "-f", sol.image_id], check=False, capture_output=True, text=True)
+                        if rmi_res.returncode == 0:
+                            bt.logging.info(f"    Removed image {sol.image_id}")
+                            cleaned_something = True
+                    except Exception as e:
+                        bt.logging.warning(f"    Error removing image {sol.image_id}: {e}")
+
+                # Remove FS path if it exists (or note it is already gone)
+                if sol.absolute_path_to_solution:
+                    if os.path.exists(sol.absolute_path_to_solution):
+                        try:
+                            shutil.rmtree(sol.absolute_path_to_solution, ignore_errors=True)
+                            bt.logging.info(f"    Removed FS path {sol.absolute_path_to_solution}")
+                            cleaned_something = True
+                        except Exception as e:
+                            bt.logging.warning(f"    Error removing path {sol.absolute_path_to_solution}: {e}")
+                    else:
+                        bt.logging.info(f"    FS path already gone for {sol.id}, marking cleaned")
+                        cleaned_something = True
+
+                # Mark cleaned for the orphaned/lost case; also fail in-flight statuses
+                if cleaned_something:
+                    self.database_connection.db_query.mark_solution_cleaned(sol.id)
+                    if sol.solution_status in (SolutionStatus.RUNNING.value, SolutionStatus.PENDING.value):
+                        self.database_connection.db_query.update_solution_status_by_id(
+                            sol.id, SolutionStatus.FAILED.value
+                        )
+                    recovered += 1
+                else:
+                    bt.logging.warning(f"    Could not clean anything for {sol.id}, leaving uncleaned for now")
+
+            bt.logging.info(f"✅ Startup recovery complete: processed {len(uncleaned)} uncleaned, marked {recovered} cleaned")
+        except Exception as e:
+            bt.logging.error(f"❌ Error during startup recovery of solutions: {e}")

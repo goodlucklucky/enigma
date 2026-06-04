@@ -61,6 +61,7 @@ class TestValidatorModels:
             solution_status="RUNNING",
             tx_hash="0xabc",
             miner_hotkey="5Miner",
+            cleaned=False,
         )
         assert "ChallengeSolution" in repr(sol)
 
@@ -77,6 +78,7 @@ class TestValidatorModels:
             solution_status="RUNNING",
             tx_hash="0xabc",
             miner_hotkey="5Miner",
+            cleaned=False,
         )
         assert sol.challenge_id is None
 

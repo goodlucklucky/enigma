@@ -94,7 +94,6 @@ A passing CI run (lint + tests) is required for merge.
 
 - **Environment variables**: API configuration (e.g. `CHALLENGES_API_URL`, `TELEMETRY_API_URL`) is loaded via `python-dotenv`. Create a local `.env` file as needed. Never commit secrets or `.env*` files (they are gitignored).
 - **Database paths**: The supported launch commands (`python neurons/validator.py`, `python neurons/miner.py`, `python cli/mine_enigma.py`, and `python cli/check_validation.py`) reliably place SQLite databases in `<checkout>/data/` via `sys.argv[0]` (and cwd fallback) heuristics inside `_resolve_db_dir()`. This works even when the current working directory is outside the repository or when multiple editable installs exist. Setting `ENIGMA_DATA_DIR` or `ENIGMA_REPO_ROOT` provides explicit overrides if needed. An editable install (`pip install -e .`) of the checkout you are actively developing in is the most reliable setup.
-- **Miner code**: The miner and related CLI are currently deprecated for most operations. Primary development focus is on the validator, treasury tooling, and challenge validation infrastructure.
 - **Entry points**: After `pip install -e .` you can run `check-validation` directly from the command line.
 - **Docker**: Several integration tests and the full validator solution pipeline require Docker for building/running untrusted solution containers.
 

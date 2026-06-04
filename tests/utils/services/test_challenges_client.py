@@ -217,6 +217,7 @@ class TestGetNextCrossCheckSubmission:
         rm, make_resp = mock_request_manager
         data = {
             "id": "sub_999",
+            "challenge_id": "ch-999",
             "challenge_milestone_id": "m42",
             "tx_hash": "0xabc",
             "address": "5Addr",
@@ -236,6 +237,7 @@ class TestGetNextCrossCheckSubmission:
         result = c.get_next_cross_check_submission()
         assert isinstance(result, ChallengeSubmissionRead)
         assert result.challenge_milestone_id == "m42"
+        assert result.challenge_id == "ch-999"
 
     def test_auth_error_is_logged_and_returns_none(self, mock_request_manager):
         rm, _ = mock_request_manager

@@ -198,14 +198,13 @@ class ResponseProcessor:
                 address=miner_hotkey,
                 upload_endpoint_id=solution_candidate.upload_endpoint_id,
                 tx_hash=synapse.tx_hash,
-                challenge_preparation_id=solution_candidate.challenge_preparation_id,
                 validator_busy=validator_busy,
-                transfer_block_hash=getattr(synapse, "transfer_block_hash", None),
-                transfer_from_ss58=getattr(synapse, "transfer_from_ss58", None),
-                transfer_to_ss58=getattr(synapse, "transfer_to_ss58", None),
-                transfer_amount_rao=getattr(synapse, "transfer_amount_rao", None),
-                transfer_proof_message=getattr(synapse, "transfer_proof_message", None),
-                transfer_proof_signature_hex=getattr(synapse, "transfer_proof_signature_hex", None),
+                transfer_block_hash=synapse.transfer_block_hash,
+                transfer_from_ss58=synapse.transfer_from_ss58,
+                transfer_to_ss58=synapse.transfer_to_ss58,
+                transfer_amount_rao=synapse.transfer_amount_rao,
+                transfer_proof_message=synapse.transfer_proof_message,
+                transfer_proof_signature_hex=synapse.transfer_proof_signature_hex,
             )
 
             try:

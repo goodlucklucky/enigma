@@ -25,11 +25,12 @@ from qbittensor.validator.solution.challenge_inputs.challenge_setups import (
     run_challenge_setup,
 )
 from qbittensor.validator.solution.challenge_inputs.mock_solution_setup import mock_solution_setup
-from qbittensor.validator.solution.milestones import MOCK_MILESTONE_ID
 from qbittensor.validator.solution.solution_validations.mock_solution import run as run_mock
 from qbittensor.validator.solution.solution_validations.solution_validator import (
     validate_output,
 )
+from qbittensor.validator.solution.milestones import MOCK_CHALLENGE_ID
+from qbittensor.challenges.mock_challenge import MOCK_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS
 
 
 class TestChallengeSetups:
@@ -39,13 +40,13 @@ class TestChallengeSetups:
         content = (tmp_path / "challenge_input.txt").read_text()
         assert "Hello" in content
 
-    def test_run_challenge_setup_known_milestone(self, tmp_path):
-        result = run_challenge_setup(MOCK_MILESTONE_ID, str(tmp_path))
+    def test_run_challenge_setup_known_challenge(self, tmp_path):
+        result = run_challenge_setup(MOCK_CHALLENGE_ID, str(tmp_path), {"difficulty": 1})
         assert isinstance(result, str)
 
-    def test_run_challenge_setup_unknown_milestone(self, tmp_path):
-        with pytest.raises(RuntimeError, match="No challenge setup handler found"):
-            run_challenge_setup("unknown-id", str(tmp_path))
+    def test_run_challenge_setup_unknown_challenge(self, tmp_path):
+        result = run_challenge_setup("00000000-0000-0000-0000-000000000000", str(tmp_path), {})
+        assert result is False
 
 
 class TestMockSolutionValidation:
@@ -84,13 +85,29 @@ class TestMockSolutionValidation:
         assert reason is not None
         assert "older than one hour" in reason
 
+    def test_rejects_future_timestamp(self, tmp_path, monkeypatch):
+        private_key = Ed25519PrivateKey.generate()
+        public_hex = private_key.public_key().public_bytes_raw().hex()
+        monkeypatch.setenv("ENIGMA_MOCK_PUBLIC_KEY", public_hex)
+
+        future_ts = int(time.time()) + MOCK_TIMESTAMP_MAX_FUTURE_SKEW_SECONDS + 10
+        payload = json.dumps({"ts": future_ts, "challenge": "mock"})
+        signature = private_key.sign(payload.encode("utf-8"))
+        solution = {"status": "success", "signature": signature.hex(), "payload": payload}
+        (tmp_path / "result.json").write_text(json.dumps(solution))
+        success, reason = run_mock(str(tmp_path))
+        assert success is False
+        assert reason is not None
+        assert "too far in the future" in reason
+
 
 class TestSolutionValidator:
-    def test_unknown_milestone_raises(self, tmp_path):
-        with pytest.raises(RuntimeError, match="No output validation handler found"):
-            validate_output(str(tmp_path), "not-a-real-milestone")
+    def test_unknown_challenge_returns_false(self, tmp_path):
+        success, reason = validate_output(str(tmp_path), "00000000-0000-0000-0000-000000000000")
+        assert success is False
+        assert reason is not None and "No validation handler" in reason
 
-    def test_known_milestone_dispatches(self, tmp_path, monkeypatch):
+    def test_known_challenge_dispatches(self, tmp_path, monkeypatch):
         private_key = Ed25519PrivateKey.generate()
         public_hex = private_key.public_key().public_bytes_raw().hex()
         monkeypatch.setenv("ENIGMA_MOCK_PUBLIC_KEY", public_hex)
@@ -103,6 +120,6 @@ class TestSolutionValidator:
             "payload": payload,
         }
         (tmp_path / "result.json").write_text(json.dumps(solution))
-        success, reason = validate_output(str(tmp_path), MOCK_MILESTONE_ID)
+        success, reason = validate_output(str(tmp_path), MOCK_CHALLENGE_ID)
         assert success is True
         assert reason is None

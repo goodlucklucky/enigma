@@ -53,15 +53,26 @@ class DBQuery(BaseDBQuery):
         tx_hash: str,
         miner_hotkey: str,
         challenge_id: str | None = None,
-    ) -> bool:
+        max_solution_runtime_seconds: int | None = None,
+    ) -> str | None:
         """Create (or re-use via guarded upsert) a challenge solution row for a tx_hash
         before the container/runtime fields are known.
 
-        Re-execution of the same cloud submission is only permitted when the
-        caller supplies the *same* `submission_id` (the cloud's submission
-        identifier) that is already associated with this `tx_hash`.
+        Returns the stable solution `id` (PK) on success (new or re-used row), or None on failure.
+        This lets callers (e.g. the execution path) immediately get the id for docker labels
+        and by-id updates without a separate get-by-tx lookup.
 
-        A tx_hash may never be rebound to a different cloud submission_id.
+        Re-execution / re-run (including when the cloud offers a cross-check for
+        an already-processed item) is permitted only when the key identifiers for
+        the work item match those already associated with this `tx_hash`:
+        file upload (via challenge_validation_solution_id / upload_endpoint_id),
+        challenge_id, and challenge_milestone_id (submission_id is also checked
+        for the primary cloud claim binding).
+
+        If the cloud offers the same tx_hash but with a differing file-upload /
+        challenge_id / milestone_id (or a conflicting submission_id for different
+        work), the request is rejected. This disallows tx_hash reuse across
+        different submissions/uploads/challenges/milestones.
         """
         return self.insert_challenge_solution(
             challenge_validation_solution_id=challenge_validation_solution_id,
@@ -75,48 +86,48 @@ class DBQuery(BaseDBQuery):
             solution_status=solution_status,
             tx_hash=tx_hash,
             miner_hotkey=miner_hotkey,
+            cleaned=False,
+            max_solution_runtime_seconds=max_solution_runtime_seconds,
         )
 
-    def update_challenge_solution_status(self, tx_hash: str, solution_status: str) -> bool:
-        """Update only the solution status on an existing challenge solution row."""
-        try:
-            with self._managed_session() as session:
-                solution = session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first()
-                if not solution:
-                    bt.logging.warning(f"No challenge solution found with tx_hash: {tx_hash}")
-                    return False
-                solution.solution_status = solution_status
-                bt.logging.info(f"Updated solution status for tx_hash {tx_hash} to {solution_status}")
-                return True
-        except Exception as e:
-            bt.logging.error(f"Error updating challenge solution status: {e}")
-            return False
+    def update_challenge_solution_status_by_id(self, solution_id: str, solution_status: str) -> bool:
+        """Update only the solution status using the stable primary key id.
 
-    def update_challenge_solution(
+        Preferred (delegates to the general by-id updater). Use this (or the
+        shorter update_solution_status_by_id) and carry the id from
+        create_challenge_solution / SolutionPostProcessInfo (which embeds SolutionExecution) for all status updates.
+        """
+        return self.update_solution_status_by_id(solution_id, solution_status)
+
+    def update_challenge_solution_by_id(
         self,
-        tx_hash: str,
+        solution_id: str,
         container_id: str,
         container_name: str,
         image_id: str,
         absolute_path_to_solution: str,
         solution_status: str,
     ) -> bool:
-        """Update runtime fields on an existing challenge solution row."""
+        """Update runtime fields (container, image, path, status) using the stable primary key id.
+
+        This is the clean path once the solution row has been created and its id
+        is available (returned by create_challenge_solution, or via labels -> get_by_id).
+        """
         try:
             with self._managed_session() as session:
-                solution = session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first()
+                solution = session.query(ChallengeSolution).filter_by(id=solution_id).first()
                 if not solution:
-                    bt.logging.warning(f"No challenge solution found with tx_hash: {tx_hash}")
+                    bt.logging.warning(f"No challenge solution found with id: {solution_id}")
                     return False
                 solution.container_id = container_id
                 solution.container_name = container_name
                 solution.image_id = image_id
                 solution.absolute_path_to_solution = absolute_path_to_solution
                 solution.solution_status = solution_status
-                bt.logging.info(f" ✅ Updated challenge solution with tx_hash: {tx_hash}")
+                bt.logging.info(f" ✅ Updated challenge solution id={solution_id}")
                 return True
         except Exception as e:
-            bt.logging.error(f" ❌ Error updating challenge solution: {e}")
+            bt.logging.error(f" ❌ Error updating challenge solution by id: {e}")
             return False
 
     def insert_challenge_solution(
@@ -132,19 +143,26 @@ class DBQuery(BaseDBQuery):
         tx_hash,
         miner_hotkey,
         challenge_id: str | None = None,
+        cleaned: bool = False,
+        max_solution_runtime_seconds: int | None = None,
     ):
         """Insert (or upsert on tx_hash) a challenge solution record.
 
-        Re-execution of the same cloud submission (identified by the cloud's
-        submission_id) is allowed only when the incoming `submission_id`
-        matches the one already associated with this `tx_hash`.
+        Re-execution of the same cloud submission, or re-running for a cross-check
+        that the cloud offers for the *same* file upload / tx_hash / challenge id /
+        milestone id, is allowed when the identifiers are consistent with the
+        row already bound to this tx_hash.
 
-        This preserves the invariant that a given payment (tx_hash) is bound
-        to exactly one cloud submission.
+        The primary binding is tx_hash → one cloud submission (by submission_id),
+        plus the specific work item (file upload identified by
+        challenge_validation_solution_id/upload_endpoint_id, plus challenge_id and
+        challenge_milestone_id).
 
-        If a different cloud submission_id is presented for an existing tx_hash,
-        the operation is rejected (returns False) to avoid corrupting the
-        tx_hash → cloud submission association.
+        If an existing row for the tx_hash has differing values for any of
+        submission_id (for different work), challenge_validation_solution_id (file
+        upload), challenge_id, or challenge_milestone_id, the upsert is rejected.
+        This disallows tx_hash reuse for different submissions / file uploads /
+        challenges / milestones.
         """
         bt.logging.info(f"Inserting/Upserting challenge solution with tx_hash: {tx_hash}")
         try:
@@ -152,21 +170,70 @@ class DBQuery(BaseDBQuery):
                 existing = session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first()
 
                 if existing:
+                    # Check consistency of the key identifiers the cloud uses to identify
+                    # a cross-check / execution item for this tx: file upload (the
+                    # challenge_validation_solution_id / upload_endpoint_id), challenge_id,
+                    # challenge_milestone_id, and submission_id.
+                    # This allows legitimate re-runs when the cloud re-offers the *same*
+                    # cross-check for the same file/tx/challenge/milestone (even if it
+                    # presents a different submission.id for the cross-check task itself),
+                    # while rejecting attempts to reuse a tx_hash for different work.
+                    mismatches = []
                     if existing.submission_id and submission_id and existing.submission_id != submission_id:
-                        bt.logging.error(
-                            f"❌ Refusing upsert for tx_hash={tx_hash}: "
-                            "cloud submission_id mismatch. "
-                            f"existing={existing.submission_id} "
-                            f"incoming={submission_id}. "
-                            "A tx_hash must not be associated with a different cloud submission_id."
+                        mismatches.append(
+                            f"submission_id (existing={existing.submission_id} != incoming={submission_id})"
                         )
-                        return False
+                    if (
+                        existing.challenge_validation_solution_id
+                        and challenge_validation_solution_id
+                        and existing.challenge_validation_solution_id != challenge_validation_solution_id
+                    ):
+                        mismatches.append(
+                            f"challenge_validation_solution_id/file_upload "
+                            f"(existing={existing.challenge_validation_solution_id} != incoming={challenge_validation_solution_id})"
+                        )
+                    if existing.challenge_id and challenge_id and existing.challenge_id != challenge_id:
+                        mismatches.append(
+                            f"challenge_id (existing={existing.challenge_id} != incoming={challenge_id})"
+                        )
+                    if existing.challenge_milestone_id != challenge_milestone_id:
+                        mismatches.append(
+                            f"challenge_milestone_id (existing={existing.challenge_milestone_id} != incoming={challenge_milestone_id})"
+                        )
 
-                    # Same cloud submission_id → safe to refresh execution state for re-run
-                    bt.logging.info(
-                        f"Re-executing same cloud submission (tx_hash={tx_hash}, "
-                        f"submission_id={submission_id})"
-                    )
+                    if mismatches:
+                        # Special case: allow if this is a cross-check / re-run for the
+                        # *same* underlying file upload + challenge + milestone, even if
+                        # the submission_id differs (the cross-check task uses its own id).
+                        # We consider the work the same if file/ch/milestone line up.
+                        work_id_mismatches = [m for m in mismatches if "submission_id" not in m]
+                        if work_id_mismatches:
+                            # Real mismatch on the work item (file / ch / mil) → hard reject to
+                            # disallow tx reuse for different submissions/uploads/challenges.
+                            bt.logging.error(
+                                f"❌ Refusing upsert for tx_hash={tx_hash}: "
+                                f"identifier mismatch on {', '.join(mismatches)}. "
+                                "A tx_hash must not be reused for a different file upload / "
+                                "submission / challenge / milestone."
+                            )
+                            return None
+                        else:
+                            # Only submission_id differs, but file/challenge/milestone match
+                            # the previously recorded work for this tx → this is a legitimate
+                            # re-execution (e.g. platform cross-check for the same miner's
+                            # uploaded solution).
+                            bt.logging.info(
+                                f"Re-executing same work item for tx_hash={tx_hash} "
+                                f"(file/ch/milestone match; submission_id differs, e.g. cross-check "
+                                f"existing={existing.submission_id} incoming={submission_id})"
+                            )
+                    else:
+                        # Everything (including submission_id) matches → standard re-execution
+                        # of the same cloud submission.
+                        bt.logging.info(
+                            f"Re-executing same cloud submission (tx_hash={tx_hash}, "
+                            f"submission_id={submission_id})"
+                        )
 
                 now = func.now()
                 stmt = insert(ChallengeSolution).values(
@@ -182,6 +249,8 @@ class DBQuery(BaseDBQuery):
                     solution_status=solution_status,
                     tx_hash=tx_hash,
                     miner_hotkey=miner_hotkey,
+                    cleaned=cleaned,
+                    max_solution_runtime_seconds=max_solution_runtime_seconds,
                     created_at=now,
                     updated_at=now,
                 )
@@ -198,36 +267,48 @@ class DBQuery(BaseDBQuery):
                         "submission_id": submission_id,
                         "solution_status": solution_status,
                         "miner_hotkey": miner_hotkey,
+                        "cleaned": cleaned,
+                        "max_solution_runtime_seconds": max_solution_runtime_seconds,
                         "updated_at": now,
                     },
                 )
                 session.execute(stmt)
 
-                action = "Re-used" if existing else "Inserted new"
-                bt.logging.info(
-                    f" ✅ {action} challenge solution row "
-                    f"(submission_id={submission_id}, tx_hash={tx_hash})"
-                )
-                return True
+                # Return the authoritative id (the PK that was inserted or already present on re-use).
+                # Callers get the id directly from create/insert; no need for a follow-up tx_hash lookup.
+                row = session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first()
+                if row:
+                    action = "Re-used" if existing else "Inserted new"
+                    bt.logging.info(
+                        f" ✅ {action} challenge solution row "
+                        f"(id={row.id}, submission_id={submission_id}, tx_hash={tx_hash})"
+                    )
+                    return row.id
+
+                return None
 
         except Exception as e:
             bt.logging.error(f" ❌ Error inserting/updating challenge solution: {e}")
-            return False
+            return None
 
-    def update_solution_status_in_db(self, solution_location, solution_status):
-        """Update the solution status in the database."""
+    def update_solution_status_by_id(self, solution_id: str, solution_status: str) -> bool:
+        """Update the solution status using the stable primary key id from the DB row.
+
+        This is the cleanest once you have the id in a passed-around object
+        (e.g. SolutionPostProcessInfo.id or .execution.solution_id).
+        """
         try:
             with self._managed_session() as session:
-                solution = session.query(ChallengeSolution).filter_by(absolute_path_to_solution=solution_location).first()
+                solution = session.query(ChallengeSolution).filter_by(id=solution_id).first()
                 if solution:
                     solution.solution_status = solution_status
-                    bt.logging.info(f"Updated solution status for {solution_location} to {solution_status}")
+                    bt.logging.info(f"Updated solution status for id {solution_id} to {solution_status}")
                     return True
                 else:
-                    bt.logging.warning(f"No challenge solution found with absolute_path_to_solution: {solution_location}")
+                    bt.logging.warning(f"No challenge solution found with id: {solution_id}")
                     return False
         except Exception as e:
-            bt.logging.error(f"Error updating solution status: {e}")
+            bt.logging.error(f"Error updating solution status by id: {e}")
             return False
 
     def prune_old_solutions(self):
@@ -243,51 +324,70 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error pruning old solutions: {e}")
             return False
 
-    def remove_challenge_solution(self, challenge_validation_solution_id):
-        """Remove a challenge solution record from the database."""
-        try:
-            with self._managed_session() as session:
-                solution = session.query(ChallengeSolution).filter_by(challenge_validation_solution_id=challenge_validation_solution_id).first()
-                if solution:
-                    session.delete(solution)
-                    bt.logging.info(f"Removed challenge solution with challenge_validation_solution_id: {challenge_validation_solution_id}")
-                    return True
-                else:
-                    bt.logging.warning(f"No challenge solution found with challenge_validation_solution_id: {challenge_validation_solution_id}")
-                    return False
-        except Exception as e:
-            bt.logging.error(f"Error removing challenge solution: {e}")
-            return False
+    def get_challenge_solution_by_id(self, solution_id: str):
+        """Retrieve a challenge solution record by its primary key (the stable DB id).
 
-    def get_challenge_solution_location(self, container_name):
-        """Retrieve a challenge solution record from the database."""
+        Preferred for any lookups once you have the id (e.g. from a passed-around
+        SolutionPostProcessInfo (embedding SolutionExecution) or other context object).
+        """
         try:
             with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(container_name=container_name).first()
+                solution = session.query(ChallengeSolution).filter_by(id=solution_id).first()
                 if solution:
-                    bt.logging.info(f"Retrieved challenge solution with container_name: {container_name}")
+                    bt.logging.info(f"Retrieved challenge solution with id: {solution_id}")
                     return solution
                 else:
-                    bt.logging.warning(f"No challenge solution found with container_name: {container_name}")
+                    bt.logging.warning(f"No challenge solution found with id: {solution_id}")
                     return None
         except Exception as e:
-            bt.logging.error(f"Error retrieving challenge solution: {e}")
+            bt.logging.error(f"Error retrieving challenge solution by id: {e}")
             return None
 
-    def get_container_name_by_solution_location(self, absolute_path_to_solution):
-        """Retrieve a challenge solution record from the database."""
+    def mark_solution_cleaned(self, solution_id: str) -> bool:
+        """Mark a solution record as cleaned (FS/containers removed)."""
+        try:
+            with self._managed_session() as session:
+                solution = session.query(ChallengeSolution).filter_by(id=solution_id).first()
+                if solution:
+                    solution.cleaned = True
+                    bt.logging.info(f"Marked solution {solution_id} as cleaned")
+                    return True
+                else:
+                    bt.logging.warning(f"No challenge solution found with id: {solution_id} to mark cleaned")
+                    return False
+        except Exception as e:
+            bt.logging.error(f"Error marking solution cleaned: {e}")
+            return False
+
+    def get_uncleaned_solutions(self):
+        """Get all ChallengeSolution records that have not been marked cleaned."""
         try:
             with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(absolute_path_to_solution=absolute_path_to_solution).first()
-                if solution:
-                    bt.logging.info(f"Retrieved challenge solution with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return solution.container_name
-                else:
-                    bt.logging.warning(f"No challenge solution found with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return None
+                return (
+                    session.query(ChallengeSolution)
+                    .filter_by(cleaned=False)
+                    .order_by(ChallengeSolution.created_at.desc())
+                    .all()
+                )
         except Exception as e:
-            bt.logging.error(f"Error retrieving challenge solution: {e}")
-            return None
+            bt.logging.error(f"Error querying uncleaned solutions: {e}")
+            return []
+
+    def remove_solution_by_id(self, solution_id: str) -> bool:
+        """Remove a challenge solution record by its primary id."""
+        try:
+            with self._managed_session() as session:
+                solution = session.query(ChallengeSolution).filter_by(id=solution_id).first()
+                if solution:
+                    session.delete(solution)
+                    bt.logging.info(f"Removed challenge solution with id: {solution_id}")
+                    return True
+                else:
+                    bt.logging.warning(f"No challenge solution found with id: {solution_id}")
+                    return False
+        except Exception as e:
+            bt.logging.error(f"Error removing challenge solution by id: {e}")
+            return False
 
     def get_miner_submission_statuses(self, miner_hotkey):
         """Retrieve the challenge solutions for a given miner hotkey from the database."""
@@ -311,101 +411,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"Error retrieving challenge solutions for miner hotkey: {miner_hotkey}: {e}")
             return []
 
-    def get_image_id_from_solution_location(self, absolute_path_to_solution):
-        """Retrieve a challenge solution record from the database."""
-        try:
-            with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(absolute_path_to_solution=absolute_path_to_solution).first()
-                if solution:
-                    bt.logging.info(f"Retrieved challenge solution with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return solution.image_id
-                else:
-                    bt.logging.warning(f"No challenge solution found with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return None
-        except Exception as e:
-            bt.logging.error(f"Error retrieving challenge solution: {e}")
-            return None
-
-    def get_image_id_by_container_name(self, container_name: str):
-        """Return stored image tag/name for a solution row keyed by Docker container name."""
-        try:
-            with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(container_name=container_name).first()
-                if solution:
-                    bt.logging.info(f"Retrieved image_id for container_name: {container_name}")
-                    return solution.image_id
-                bt.logging.warning(f"No challenge solution found with container_name: {container_name}")
-                return None
-        except Exception as e:
-            bt.logging.error(f"Error retrieving challenge solution by container_name: {e}")
-            return None
-
-    def get_image_id_by_container_id(self, container_id: str):
-        """Return stored image tag/name for a row whose container_id matches (exact, else prefix for short IDs)."""
-        try:
-            with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(container_id=container_id).first()
-                if not solution:
-                    solution = (
-                        session.query(ChallengeSolution)
-                        .filter(ChallengeSolution.container_id.like(f"{container_id}%"))
-                        .first()
-                    )
-                if solution:
-                    bt.logging.info(f"Retrieved image_id for container_id: {container_id}")
-                    return solution.image_id
-                bt.logging.warning(f"No challenge solution found with container_id starting with: {container_id}")
-                return None
-        except Exception as e:
-            bt.logging.error(f"Error retrieving challenge solution by container_id: {e}")
-            return None
-
-    def remove_solution_from_db_by_conainer_name(self, container_name):
-        """Remove a challenge solution record from the database."""
-        try:
-            with self._managed_session() as session:
-                solution = session.query(ChallengeSolution).filter_by(container_name=container_name).first()
-                if solution:
-                    session.delete(solution)
-                    bt.logging.info(f"Removed challenge solution with container_name: {container_name}")
-                    return True
-                else:
-                    bt.logging.warning(f"No challenge solution found with container_name: {container_name}")
-                    return False
-        except Exception as e:
-            bt.logging.error(f"Error removing challenge solution: {e}")
-            return False
-
-    def get_submission_id_by_solution_location(self, absolute_path_to_solution):
-        """Retrieve a challenge solution record from the database."""
-        try:
-            with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(absolute_path_to_solution=absolute_path_to_solution).first()
-                if solution:
-                    bt.logging.info(f"✅ Retrieved challenge solution with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return solution.submission_id
-                else:
-                    bt.logging.warning(f"No challenge solution found with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return None
-        except Exception as e:
-            bt.logging.error(f"❌ Error retrieving challenge solution: {e}")
-            return None
-
-    def get_challenge_milestone_id_by_file_path(self, absolute_path_to_solution):
-        """Retrieve a challenge solution record from the database."""
-        try:
-            with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(absolute_path_to_solution=absolute_path_to_solution).first()
-                if solution:
-                    bt.logging.info(f"✅ Retrieved challenge solution with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return solution.challenge_milestone_id
-                else:
-                    bt.logging.warning(f"No challenge solution found with absolute_path_to_solution: {absolute_path_to_solution}")
-                    return None
-        except Exception as e:
-            bt.logging.error(f"❌ Error retrieving challenge solution: {e}")
-            return None
-
     def insert_for_maintenance_incentive(
         self,
         miner_hotkey: str,
@@ -428,21 +433,6 @@ class DBQuery(BaseDBQuery):
             bt.logging.error(f"❌ Error inserting miner solution: {e}")
             return False
 
-    def get_solutions_by_milestone(self, challenge_milestone_id: str):
-        """Get all ChallengeSolution records for a given milestone."""
-        try:
-            with self._managed_session(read_only=True) as session:
-                solutions = (
-                    session.query(ChallengeSolution)
-                    .filter_by(challenge_milestone_id=challenge_milestone_id)
-                    .order_by(ChallengeSolution.created_at.desc())
-                    .all()
-                )
-                return solutions
-        except Exception as e:
-            bt.logging.error(f"Error querying solutions by milestone {challenge_milestone_id}: {e}")
-            return []
-
     def get_solution_by_submission_id(self, submission_id: str):
         """Get a ChallengeSolution by submission_id."""
         try:
@@ -451,16 +441,6 @@ class DBQuery(BaseDBQuery):
                 return solution
         except Exception as e:
             bt.logging.error(f"Error querying by submission_id {submission_id}: {e}")
-            return None
-
-    def get_solution_by_tx_hash(self, tx_hash: str):
-        """Get a ChallengeSolution by tx_hash."""
-        try:
-            with self._managed_session(read_only=True) as session:
-                solution = session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first()
-                return solution
-        except Exception as e:
-            bt.logging.error(f"Error querying by tx_hash {tx_hash}: {e}")
             return None
 
     def prune_old_miner_solutions(self):

@@ -35,6 +35,7 @@ from qbittensor.validator.solution.constants import (
     SOLUTION_OUTPUT_SEPARATOR,
     SOLUTION_OUTPUT_ZIP_FILENAME,
     VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT,
+    VALIDATOR_DOCKER_GPUS_DEFAULT,
     VALIDATOR_MEMORY_LIMIT_DEFAULT,
     VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT,
     VALIDATOR_DOCKER_TMPFS_DEFAULT,
@@ -241,6 +242,7 @@ class TestRunImageDetached:
                 container_name="ctr",
                 validator_label="val_label",
                 challenge_input_mount_dir=mount_dir,
+                solution_execution=None,
             )
 
         assert cid == "container-id-123"
@@ -299,6 +301,7 @@ class TestRunImageDetached:
                     container_name="ctr",
                     validator_label="label",
                     challenge_input_mount_dir=relative_mount,
+                    solution_execution=None,
                 )
 
         args = mock_run.call_args.args[0]
@@ -339,6 +342,8 @@ class TestDockerRunSecurityArgs:
         assert ["--memory", VALIDATOR_MEMORY_LIMIT_DEFAULT] == args[mem_idx: mem_idx + 2]
         swap_idx = args.index("--memory-swap")
         assert ["--memory-swap", VALIDATOR_MEMORY_LIMIT_DEFAULT] == args[swap_idx: swap_idx + 2]
+        gpus_idx = args.index("--gpus")
+        assert ["--gpus", VALIDATOR_DOCKER_GPUS_DEFAULT] == args[gpus_idx: gpus_idx + 2]
 
     def test_env_overrides(self, monkeypatch):
         monkeypatch.setenv("VALIDATOR_DOCKER_PIDS_LIMIT", "64")
@@ -387,6 +392,21 @@ class TestDockerRunSecurityArgs:
         assert "--memory" not in args
         assert "--memory-swap" not in args
 
+    def test_gpus_env_override(self, monkeypatch):
+        monkeypatch.setenv("VALIDATOR_DOCKER_GPUS", "all")
+        args = docker_run_security_args()
+        assert ["--gpus", "all"] == args[args.index("--gpus"): args.index("--gpus") + 2]
+
+    def test_gpus_device_env_override(self, monkeypatch):
+        monkeypatch.setenv("VALIDATOR_DOCKER_GPUS", "device=0")
+        args = docker_run_security_args()
+        assert ["--gpus", "device=0"] == args[args.index("--gpus"): args.index("--gpus") + 2]
+
+    def test_empty_gpus_disables_gpus_flag(self, monkeypatch):
+        monkeypatch.setenv("VALIDATOR_DOCKER_GPUS", "")
+        args = docker_run_security_args()
+        assert "--gpus" not in args
+
     def test_docker_failure_raises_invalid_solution(self, tmp_path):
         host_folder = tmp_path / "solution"
         host_folder.mkdir()
@@ -400,7 +420,7 @@ class TestDockerRunSecurityArgs:
         ):
             with pytest.raises(InvalidSolutionError) as exc:
                 run_image_detached(
-                    "img", "ctr", "label", mount_dir
+                    "img", "ctr", "label", mount_dir, solution_execution=None
                 )
         msg = str(exc.value)
         assert "failed with exit code 1" in msg
@@ -420,7 +440,7 @@ class TestDockerRunSecurityArgs:
 
         with patch("subprocess.run", side_effect=err):
             with pytest.raises(InvalidSolutionError) as exc:
-                run_image_detached("img", "ctr", "label", mount_dir)
+                run_image_detached("img", "ctr", "label", mount_dir, solution_execution=None)
 
         msg = str(exc.value)
         assert "exit status 127" in msg
@@ -503,6 +523,18 @@ class TestMockSolutionDockerIntegration:
         monkeypatch.delenv("VALIDATOR_DOCKER_CPU_LIMIT", raising=False)
         monkeypatch.delenv("VALIDATOR_MEMORY_LIMIT", raising=False)
         monkeypatch.delenv("VALIDATOR_SOLUTION_STDOUT_MAX_BYTES", raising=False)
+        # Force small cpu/mem so the test runs on any Docker host (CI, laptops, macOS).
+        # We still delenv first so no outer override, then set small portable values.
+        # The inspect asserts below verify the *effective* values we forced here.
+        # (Prod defaults are large; this keeps the integration test hermetic.)
+        monkeypatch.setenv("VALIDATOR_DOCKER_CPU_LIMIT", "0.5")
+        monkeypatch.setenv("VALIDATOR_MEMORY_LIMIT", "100m")
+        # Force-disable GPU for this test so it runs on any Docker host (including
+        # CPU-only CI/dev boxes and macOS). The mock image does not exercise GPU;
+        # GPU passthrough for solutions is covered by unit tests + the separate
+        # gpu_verification smoke test. Without this, default="all" would make the
+        # test require NVIDIA Container Toolkit.
+        monkeypatch.setenv("VALIDATOR_DOCKER_GPUS", "")
 
         workspace = tmp_path / "workspace"
         workspace.mkdir()
@@ -511,12 +543,20 @@ class TestMockSolutionDockerIntegration:
 
         container_name = f"enigma-test-mock-{uuid.uuid4().hex[:12]}"
         container_id = None
+        # Pre-emptively remove any container using our chosen name. This defends
+        # against a prior aborted/failed test run leaving a container behind.
+        # (UUID makes collision improbable, but the test must be robust to
+        # "test container already exists".)
+        subprocess.run(
+            ["docker", "rm", "-fv", container_name], capture_output=True, check=False
+        )
         try:
             container_id = run_image_detached(
                 image_name=mock_solution_image,
                 container_name=container_name,
                 validator_label="pytest_validator",
                 challenge_input_mount_dir=mount_dir,
+                solution_execution=None,
             )
 
             wait = subprocess.run(
@@ -553,11 +593,10 @@ class TestMockSolutionDockerIntegration:
             )
             host_config = json.loads(inspect.stdout)
             assert host_config["PidsLimit"] == int(VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT)
-            assert host_config["NanoCpus"] == int(
-                float(VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT) * 1_000_000_000
-            )
-            assert host_config["Memory"] == int(VALIDATOR_MEMORY_LIMIT_DEFAULT)
-            assert host_config["MemorySwap"] == int(VALIDATOR_MEMORY_LIMIT_DEFAULT)
+            # cpu/mem were overridden above to small portable values (see monkeypatch.setenv)
+            assert host_config["NanoCpus"] == int(0.5 * 1_000_000_000)
+            assert host_config["Memory"] == 100 * 1024 * 1024
+            assert host_config["MemorySwap"] == 100 * 1024 * 1024
             assert host_config["ReadonlyRootfs"] is True
             assert "ALL" in host_config.get("CapDrop", [])
             assert any(
@@ -612,7 +651,16 @@ class TestMockSolutionDockerIntegration:
             )
             assert user.stdout.strip() == VALIDATOR_DOCKER_MINER_USER_DEFAULT
         finally:
-            if container_id:
+            # Always attempt cleanup by the *name* we asked for (this cleans
+            # pre-existing stale containers in the conflict case where we never
+            # got a container_id back). Also clean by id if distinct.
+            if container_name:
+                subprocess.run(
+                    ["docker", "rm", "-fv", container_name],
+                    capture_output=True,
+                    check=False,
+                )
+            if container_id and container_id != container_name:
                 subprocess.run(
                     ["docker", "rm", "-fv", container_id],
                     capture_output=True,
@@ -652,8 +700,9 @@ class TestRunSolutionManagement:
 
         db = Mock()
         db.db_query.has_seen_tx_hash = Mock(return_value=False)
-        db.db_query.create_challenge_solution = Mock(return_value=True)
-        db.db_query.update_challenge_solution = Mock(return_value=True)
+        # create now returns the solution id (for labeling) on success
+        db.db_query.create_challenge_solution = Mock(return_value="test-sol-id-123")
+        db.db_query.update_challenge_solution_by_id = Mock(return_value=True)
 
         with patch(
             "qbittensor.validator.solution.run.run_image_detached",
@@ -675,7 +724,7 @@ class TestRunSolutionManagement:
         assert container == "container-abc"
         assert folder == "/tmp/tag_folder"
         db.db_query.create_challenge_solution.assert_called_once()
-        db.db_query.update_challenge_solution.assert_called_once()
+        db.db_query.update_challenge_solution_by_id.assert_called_once()
 
     @patch("qbittensor.validator.solution.run.clean_up_failed_solution")
     @patch("qbittensor.validator.solution.run.download_zip", return_value=None)
@@ -683,8 +732,8 @@ class TestRunSolutionManagement:
     def test_download_failure_returns_none_triple(self, _setup, _download, mock_cleanup):
         db = Mock()
         db.db_query.has_seen_tx_hash = Mock(return_value=False)
-        db.db_query.create_challenge_solution = Mock(return_value=True)
-        db.db_query.update_challenge_solution_status = Mock(return_value=True)
+        db.db_query.create_challenge_solution = Mock(return_value="test-sol-id-456")
+        db.db_query.update_challenge_solution_status_by_id = Mock(return_value=True)
 
         result = run_solution_management(
             db_conn=db,

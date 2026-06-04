@@ -22,26 +22,6 @@ from pydantic import BaseModel
 from qbittensor.database.miner.db_models import MinerSubmission
 
 
-class ChallengeResponse(BaseModel):
-    """
-    Lightweight representation of a preparation/submission context returned
-    from the platform.
-    """
-    id: Optional[str] = None
-    challenge_milestone_id: str
-    upload_endpoint_id: str
-
-    def __repr__(self) -> str:
-        return "ChallengeResponse(challenge_milestone_id: {}, id: {}, upload_endpoint_id: {})".format(
-            self.challenge_milestone_id,
-            self.id,
-            self.upload_endpoint_id,
-        )
-
-    def __str__(self) -> str:
-        return self.__repr__()
-
-
 class SolutionCandidate(BaseModel):
     """
     Data needed by the validator to process/run a solution.
@@ -49,15 +29,6 @@ class SolutionCandidate(BaseModel):
     challenge_milestone_id: str
     upload_endpoint_id: str
     challenge_id: Optional[str] = None
-    challenge_preparation_id: Optional[str] = None
-
-    @staticmethod
-    def from_challenge_response(challenge_response: ChallengeResponse) -> SolutionCandidate:
-        return SolutionCandidate(
-            challenge_milestone_id=challenge_response.challenge_milestone_id,
-            upload_endpoint_id=challenge_response.upload_endpoint_id,
-            challenge_preparation_id=challenge_response.id,
-        )
 
     @staticmethod
     def from_miner_submission(miner_submission: MinerSubmission) -> SolutionCandidate:
@@ -65,15 +36,13 @@ class SolutionCandidate(BaseModel):
             challenge_milestone_id=miner_submission.challenge_milestone_id,
             upload_endpoint_id=miner_submission.upload_id,
             challenge_id=miner_submission.challenge_id,
-            challenge_preparation_id=None,
         )
 
     def __repr__(self) -> str:
-        return "SolutionCandidate(challenge_milestone_id: {}, upload_endpoint_id: {}, challenge_id: {}, challenge_preparation_id: {})".format(
+        return "SolutionCandidate(challenge_milestone_id: {}, upload_endpoint_id: {}, challenge_id: {})".format(
             self.challenge_milestone_id,
             self.upload_endpoint_id,
             self.challenge_id,
-            self.challenge_preparation_id,
         )
 
     def __str__(self) -> str:
@@ -85,7 +54,6 @@ class ChallengeSubmissionRequest(BaseModel):
     address: str
     upload_endpoint_id: str
     tx_hash: str
-    challenge_preparation_id: Optional[str] = None
     validator_busy: bool = False
     transfer_block_hash: str
     transfer_from_ss58: str
@@ -109,15 +77,12 @@ class ChallengeSubmissionVerifyUploadAddressResponse(BaseModel):
 
 class ChallengeSubmissionRead(BaseModel):
     id: str
-    challenge_milestone_id: str
     challenge_id: Optional[str] = None
-    challenge_preparation_id: Optional[str] = None
+    challenge_milestone_id: str
     file_download_url: str
     upload_endpoint_id: str
     tx_hash: str
     address: str
-
-    # Full transfer proof data (used for fee verification on /next items)
     transfer_block_hash: str
     transfer_from_ss58: str
     transfer_to_ss58: str
@@ -128,6 +93,7 @@ class ChallengeSubmissionRead(BaseModel):
     def __repr__(self) -> str:
         return (
             f"ChallengeSubmissionRead(id={self.id}, "
+            f"challenge_id={self.challenge_id}, "
             f"challenge_milestone_id={self.challenge_milestone_id}, "
             f"tx_hash={self.tx_hash}, address={self.address})"
         )
@@ -183,6 +149,6 @@ class TransferProof(BaseModel):
             solution_candidate=SolutionCandidateProof(
                 challenge_milestone_id=submission.challenge_milestone_id,
                 upload_endpoint_id=submission.upload_endpoint_id,
-                challenge_id=submission.challenge_preparation_id,
+                challenge_id=submission.challenge_id,
             ),
         )

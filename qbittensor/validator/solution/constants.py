@@ -34,11 +34,9 @@ CONTAINER_CHALLENGE_INPUT_PATH: str = "/challenge_input"
 # from a base64-encoded zip of the solution artifacts (everything after). Docker's
 # json-file logging driver treats stdout as UTF-8 text and corrupts raw binary, so
 # the zip MUST be base64-encoded by the miner and is base64-decoded by the validator.
-# Picked to be unique enough that miners are unlikely to log it accidentally — keep
-# this in sync with workbench/challenges/.../mock_solution.py.
-SOLUTION_OUTPUT_SEPARATOR: bytes = (
-    b"\n----- ENIGMA-SOLUTION-OUTPUT-BEGIN-a8c7f3e2-9d4b-4c5a-8f1e-2b6d3a4e5f7c -----\n"
-)
+# Canonical definition lives in qbittensor.challenges.solution_output; re-exported
+# here for backward compatibility with existing validator imports.
+from qbittensor.challenges.solution_output import SOLUTION_OUTPUT_SEPARATOR  # noqa: F401
 
 # Cap on how many bytes of stdout the validator will read from a single solution
 # container. Anything larger than this means the miner is misbehaving / blasting
@@ -81,12 +79,19 @@ VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_DEFAULT: int = 1 * 1024**3  # 1 GiB
 
 # ``docker run --memory`` cap. Default is bytes; env may use Docker suffixes (e.g. 2g, 512m).
 # Empty disables. When set, ``--memory-swap`` is set to the same value (no extra swap).
+# Target host: ~26 vCPU / 96 GiB RAM. Allocate the bulk to solution containers.
 VALIDATOR_MEMORY_LIMIT_ENV: str = "VALIDATOR_MEMORY_LIMIT"
-VALIDATOR_MEMORY_LIMIT_DEFAULT: str = str(2 * 1024**3)  # 2 GiB
+VALIDATOR_MEMORY_LIMIT_DEFAULT: str = "85g"  # ~85 GiB for solution containers
 
 # ``docker run --cpus`` limit in CPU cores (fractional allowed, e.g. 0.5). Empty disables.
+# Target host: ~26 vCPU / 96 GiB RAM. Allocate the bulk to solution containers.
 VALIDATOR_DOCKER_CPU_LIMIT_ENV: str = "VALIDATOR_DOCKER_CPU_LIMIT"
-VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT: str = "2"
+VALIDATOR_DOCKER_CPU_LIMIT_DEFAULT: str = "24"
+
+# ``docker run --gpus`` passthrough (e.g. ``all``, ``device=0``). Empty disables.
+# Requires NVIDIA drivers and the NVIDIA Container Toolkit on the validator host.
+VALIDATOR_DOCKER_GPUS_ENV: str = "VALIDATOR_DOCKER_GPUS"
+VALIDATOR_DOCKER_GPUS_DEFAULT: str = "all"
 
 # Max built miner solution Docker image size (``docker image inspect --format='{{.Size}}'``, bytes).
 MAX_SOLUTION_DOCKER_IMAGE_SIZE_BYTES_ENV: str = "MAX_SOLUTION_DOCKER_IMAGE_SIZE_BYTES"

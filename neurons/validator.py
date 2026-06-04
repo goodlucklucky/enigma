@@ -40,6 +40,7 @@ from qbittensor.utils.services.challenges import ChallengesClient
 from qbittensor.database.db_connection import DBConnection
 from qbittensor.validator.solution.constants import CHALLENGE_SOLTION_PREFIX
 from qbittensor.protocol import MinerSubmissionStatus
+from qbittensor.validator.utils.gpu_verification.gpu_access import test_gpu_container
 from qbittensor.utils.uids import is_valid_miner_axon
 
 TREASURY_HOTKEY: str = "5DCLafsAKaLeZwm9hjMHvrQNjtucSwBhKyTLYnYmMvhxF2Uc"
@@ -77,6 +78,11 @@ class Validator(BaseValidatorNeuron):
         # Early Docker sanity check (very important for solution execution)
         is_docker_available()
 
+        if not test_gpu_container():
+            bt.logging.error("CRITICAL: GPU container smoke test failed -- unable to launch Validator. See qbittensor/validator/utils/gpu_verification/GPU_README.md for more details.")
+            bt.logging.error("Shutting down validator.")
+            exit(1)
+
         # Single source of truth for all platform (challenges) API calls.
         # ChallengesClient creates and owns its own RequestManager.
         self.platform_client = ChallengesClient(
@@ -86,10 +92,7 @@ class Validator(BaseValidatorNeuron):
             netuid=self.config.netuid,
         )
 
-        # For any internal paths that still need a raw challenges-scoped RM,
-        # derive it from the platform client (the RM has the correct base URL baked in).
         challenges_rm = self.platform_client.request_manager
-        self.request_manager = challenges_rm  # compatibility for anything reading validator.request_manager
 
         self.response_processor: ResponseProcessor = ResponseProcessor(
             challenges_rm,

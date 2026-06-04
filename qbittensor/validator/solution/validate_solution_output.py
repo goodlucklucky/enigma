@@ -30,14 +30,24 @@ from qbittensor.database.db_connection import DBConnection
 from qbittensor.utils.services.challenges import ChallengesClient
 
 
-def validate_solution(solution_workspace_path: str, challenges_client: ChallengesClient, database_connection: DBConnection) -> str:
-    """Validate the output of the solution
+def validate_solution(
+    solution_workspace_path: str,
+    challenges_client: ChallengesClient,
+    submission_id: str,
+    challenge_milestone_id: str,
+    challenge_id: str,
+) -> str:
+    """Validate the output of the solution.
 
     Args:
         solution_workspace_path (str): Absolute path to the extracted solution workspace (DB
             ``absolute_path_to_solution``). The validator writes logs and extracted artifacts
             into the ``output`` subfolder after reading them from the container's stdout via
             ``docker logs``.
+        submission_id: The cloud submission ID (always present by the time output
+            validation runs, because the platform submission happened before execution).
+        challenge_milestone_id, challenge_id: These stable values (from the
+            SolutionPostProcessInfo.execution) are always present for completed solutions.
 
     Returns:
         Solution status string (e.g. ``SolutionStatus.SUCCESS``).
@@ -56,10 +66,6 @@ def validate_solution(solution_workspace_path: str, challenges_client: Challenge
         bt.logging.info("❌ Could not establish upload locations for solution output and logs")
         return SolutionStatus.FAILED_UPLOAD.value
 
-    if not verify_upload_locations(solution_workspace_path, logs_data, solution_output_data, database_connection):
-        bt.logging.info("❌ Could not resolve submission for upload locations.")
-        return SolutionStatus.FAILED_UPLOAD.value
-
     bt.logging.info("📤 Uploading container stdout logs to platform")
     logs_uploaded = upload_zip_to_platform(container_output_path, logs_data, "stdout.log")
     if logs_uploaded:
@@ -68,13 +74,14 @@ def validate_solution(solution_workspace_path: str, challenges_client: Challenge
         bt.logging.warning("⚠️ Logs upload did not succeed (will still attempt to report status)")
 
     solution_status = perform_solution_output_validation(
-        solution_workspace_path,
         container_output_path,
         logs_data,
         solution_output_data,
         challenges_client,
-        database_connection,
         logs_uploaded=logs_uploaded,
+        submission_id=submission_id,
+        challenge_milestone_id=challenge_milestone_id,
+        challenge_id=challenge_id,
     )
     return solution_status
 
@@ -94,34 +101,14 @@ def establish_upload_locations_for_solution_data(
     return upload_location_data
 
 
-def verify_upload_locations(
-    location: str,
-    logs_data: ChallengeSubmissionVerifyUploadAddressResponse,
-    output_data: ChallengeSubmissionVerifyUploadAddressResponse,
-    database_connection: DBConnection,
-) -> bool:
-    """
-    Lightweight check that we can resolve a submission_id for this location.
-    We no longer send a partial "Running + keys" update here.
-    The keys will be sent together with the final status after uploads.
-    """
-    submission_id = database_connection.db_query.get_submission_id_by_solution_location(location)
-    if not submission_id:
-        bt.logging.error("❌ Could not find submission_id for location")
-        return False
-
-    bt.logging.info("\t✅ Upload locations resolved for reporting with final status")
-    return True
-
-
 def perform_solution_output_validation(
-    solution_workspace_path: str,
     container_output_path: str,
     logs_data: ChallengeSubmissionVerifyUploadAddressResponse,
     solution_output_data: ChallengeSubmissionVerifyUploadAddressResponse,
     challenges_client: ChallengesClient,
-    database_connection: DBConnection,
-    *,
+    submission_id: str,
+    challenge_milestone_id: str,
+    challenge_id: str,
     logs_uploaded: bool = True,
 ) -> str:
     """
@@ -130,17 +117,16 @@ def perform_solution_output_validation(
     Attempts to upload solution artifacts on both success and failure paths
     (best effort). Only includes the corresponding data keys in the final
     report if the upload actually succeeded.
-    """
-    challenge_milestone_id = database_connection.db_query.get_challenge_milestone_id_by_file_path(solution_workspace_path)
-    submission_id = database_connection.db_query.get_submission_id_by_solution_location(solution_workspace_path)
 
-    if challenge_milestone_id is None:
-        bt.logging.error("❌ No challenge milestone ID found for output path.")
-        return SolutionStatus.FAILED.value
+    The caller must supply the stable identifiers (submission_id,
+    challenge_milestone_id, challenge_id) from the SolutionPostProcessInfo
+    (via its embedded SolutionExecution or the convenience properties).
+    No DB lookups (path-based or otherwise) are performed inside this function.
+    """
 
     bt.logging.info(f"🛡️ Performing validation of solution output at '{container_output_path}'")
     solution_folder_path = os.path.join(container_output_path, CONTAINER_SOLUTION_DIRNAME)
-    success, validation_failure_reason = validate_output(solution_folder_path, challenge_milestone_id)
+    success, validation_failure_reason = validate_output(solution_folder_path, challenge_id)
 
     output_uploaded = False
 
@@ -180,8 +166,7 @@ def perform_solution_output_validation(
             output_uploaded = False
 
         failure_message = validation_failure_reason or "Output validation failed (see uploaded stdout.log and solution_output artifacts for details)"
-        if challenge_milestone_id:
-            failure_message = f"Milestone {challenge_milestone_id}: {failure_message}"
+        failure_message = f"Milestone {challenge_milestone_id}: {failure_message}"
 
         report_payload = {
             "status": "Failure",
@@ -205,7 +190,6 @@ def upload_zip_to_platform(
     output_file_path: str,
     platform_data: ChallengeSubmissionVerifyUploadAddressResponse,
     file_name: str,
-    *,
     zip_entire_directory: bool = False,
 ) -> bool:
     """

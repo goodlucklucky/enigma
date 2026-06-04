@@ -101,3 +101,28 @@ class TestTelemetryServiceFlushBatch:
         assert call_kwargs["json"]["datapoints"][0]["string_value"] == "1.2.3"
         assert call_kwargs["json"]["datapoints"][0]["type"] == "heartbeat_version"
         assert call_kwargs.get("additional_headers") is not None
+
+
+class TestCpuGpuLookupHelpers:
+    def test_get_cpu_model_returns_something_reasonable(self):
+        from qbittensor.utils.services.telemetry import _get_cpu_model
+        model = _get_cpu_model()
+        assert isinstance(model, str)
+        assert len(model) > 0
+        # Should not be the bare arch that was previously reported as "family"
+        assert model.lower() not in {"x86_64", "amd64", "i386", "unknown"}
+
+    def test_get_gpu_info_cpu_path(self):
+        from qbittensor.utils.services.telemetry import _get_gpu_info
+        count, models = _get_gpu_info("cpu")
+        assert count == 0
+        assert models == "none"
+
+    def test_get_gpu_info_nonexistent_cuda(self):
+        from qbittensor.utils.services.telemetry import _get_gpu_info
+        # Should not explode; on this env will be nvidia-smi not found or error
+        count, models = _get_gpu_info("cuda:99")
+        assert isinstance(count, int)
+        assert count >= 0
+        assert isinstance(models, str)
+        assert len(models) > 0

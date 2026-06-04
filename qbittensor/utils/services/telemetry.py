@@ -22,8 +22,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
 import queue
 import threading
+import os
 import psutil
 import platform
+import subprocess
 
 from qbittensor.utils.request.request_manager import RequestManager
 from qbittensor.utils.timer import Timer
@@ -36,6 +38,148 @@ try:
 except ImportError:
     NVML_AVAILABLE = False
     bt.logging.warning("pynvml not available, GPU metrics will be skipped")
+
+
+def _get_cpu_model() -> str:
+    """Best-effort human readable CPU model / family.
+
+    platform.processor() often returns bare arch (e.g. "x86_64") on Linux/macOS.
+    We try /proc/cpuinfo, sysctl, wmic, then sensible fallbacks.
+    """
+    try:
+        system = platform.system().lower()
+        if system == "linux":
+            try:
+                with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if "model name" in line.lower():
+                            val = line.split(":", 1)[1].strip()
+                            if val:
+                                return val
+            except Exception:
+                pass
+        elif system == "darwin":
+            try:
+                out = subprocess.check_output(
+                    ["sysctl", "-n", "machdep.cpu.brand_string"],
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                ).decode("utf-8", errors="ignore").strip()
+                if out:
+                    return out
+            except Exception:
+                pass
+        elif system == "windows":
+            try:
+                out = subprocess.check_output(
+                    ["wmic", "cpu", "get", "name", "/value"],
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                ).decode("utf-8", errors="ignore")
+                for line in out.splitlines():
+                    if line.lower().startswith("name="):
+                        val = line.split("=", 1)[1].strip()
+                        if val:
+                            return val
+            except Exception:
+                pass
+
+        # Better-than-nothing fallbacks (avoid returning bare "x86_64" etc as "family")
+        proc = (platform.processor() or "").strip()
+        bad_archs = {"", "x86_64", "amd64", "i386", "i686", "arm64", "aarch64", "unknown"}
+        if proc and proc.lower() not in bad_archs:
+            return proc
+
+        mach = (platform.machine() or "").strip()
+        if mach and mach.lower() not in bad_archs:
+            return mach
+
+        return platform.platform(aliased=True, terse=True) or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _get_gpu_info(device: str) -> tuple[int, str]:
+    """Return (gpu_count, models_str) using pynvml when it works at runtime,
+    with nvidia-smi subprocess fallback (more reliable in some envs).
+
+    This is *only* for the startup model/count strings.
+    Periodic utilization still requires working pynvml + self.gpu_indices.
+    """
+    if device == "cpu":
+        return 0, "none"
+
+    # Try pynvml first (for consistency with periodic metrics path)
+    if NVML_AVAILABLE:
+        try:
+            nvmlInit()
+            try:
+                device_count = nvmlDeviceGetCount()
+                if device.startswith("cuda:"):
+                    try:
+                        gpu_index = int(device.split(":", 1)[1])
+                        if 0 <= gpu_index < device_count:
+                            handle = nvmlDeviceGetHandleByIndex(gpu_index)
+                            name = nvmlDeviceGetName(handle)
+                            if isinstance(name, (bytes, bytearray)):
+                                name = name.decode("utf-8", errors="ignore")
+                            return 1, str(name).strip()
+                        else:
+                            return 0, "invalid device"
+                    except Exception as e:
+                        bt.logging.warning(f"Single-GPU pynvml query failed for {device}: {e}")
+                        # fall through to nvidia-smi
+                else:
+                    # "cuda" or other -> report all
+                    gpu_models_list = []
+                    for i in range(device_count):
+                        handle = nvmlDeviceGetHandleByIndex(i)
+                        name = nvmlDeviceGetName(handle)
+                        if isinstance(name, (bytes, bytearray)):
+                            name = name.decode("utf-8", errors="ignore")
+                        gpu_models_list.append(str(name).strip())
+                    models = ", ".join(gpu_models_list) if gpu_models_list else "none"
+                    return device_count, models
+            finally:
+                try:
+                    nvmlShutdown()
+                except Exception:
+                    pass
+        except Exception as e:
+            bt.logging.warning(f"pynvml runtime init/query failed ({e}); trying nvidia-smi fallback for models")
+
+    # Fallback to nvidia-smi (doesn't require pynvml python package or its .so quirks)
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            lines = [line.strip() for line in (result.stdout or "").strip().splitlines() if line.strip()]
+            if not lines:
+                return 0, "none"
+            if device.startswith("cuda:"):
+                try:
+                    idx = int(device.split(":", 1)[1])
+                    if 0 <= idx < len(lines):
+                        return 1, lines[idx]
+                    else:
+                        return 0, "invalid device"
+                except Exception:
+                    return 0, "error"
+            else:
+                # all GPUs
+                return len(lines), ", ".join(lines)
+        else:
+            bt.logging.warning(f"nvidia-smi query failed (rc={result.returncode}): {result.stderr[:200] if result.stderr else ''}")
+    except FileNotFoundError:
+        return 0, "nvidia-smi not found"
+    except Exception as e:
+        bt.logging.warning(f"nvidia-smi fallback error: {e}")
+
+    return 0, "error"
 
 
 class TelemetryService:
@@ -232,58 +376,48 @@ class TelemetryService:
             bt.logging.info(f"Failed to enqueue heartbeat: {e}")
 
     def record_startup_metrics(self):
-        """Record startup system metrics (CPU family, count, GPU count/models)."""
+        """Record startup system metrics (CPU family, max CPUs, max RAM, GPU count/models)."""
         try:
             timestamp = datetime.now(timezone.utc).isoformat()
-            cpu_family = platform.processor()
-            cpu_count = psutil.cpu_count()
+
+            cpu_family = _get_cpu_model()
+            cpu_count = psutil.cpu_count() or os.cpu_count() or 1
+            total_ram = psutil.virtual_memory().total
             self._enqueue_datapoint("system_cpu_family", timestamp, cpu_family)
             self._enqueue_datapoint("system_cpu_count", timestamp, cpu_count)
+            self._enqueue_datapoint("system_ram_bytes", timestamp, total_ram)
 
-            # GPU info
-            if NVML_AVAILABLE:
-                try:
-                    nvmlInit()
-                    device_count = nvmlDeviceGetCount()
-                    if self.device == "cpu":
-                        gpu_count = 0
-                        gpu_models = "none"
-                    elif self.device.startswith("cuda:"):
-                        gpu_index = int(self.device.split(":")[1])
-                        if gpu_index < device_count:
-                            handle = nvmlDeviceGetHandleByIndex(gpu_index)
-                            gpu_count = 1
-                            gpu_models = nvmlDeviceGetName(handle).decode()
-                        else:
-                            gpu_count = 0
-                            gpu_models = "invalid device"
-                    else:
-                        gpu_count = device_count
-                        gpu_models_list = []
-                        for i in range(device_count):
-                            handle = nvmlDeviceGetHandleByIndex(i)
-                            gpu_models_list.append(nvmlDeviceGetName(handle).decode())
-                        gpu_models = ", ".join(gpu_models_list)
-                except Exception as e:
-                    bt.logging.warning(f"Failed to get GPU info: {e}")
-                    gpu_count = 0
-                    gpu_models = "error"
-            else:
-                gpu_count = 0
-                gpu_models = "pynvml not available"
-
+            # GPU count + models: robust (pynvml preferred, nvidia-smi fallback) so we avoid
+            # reporting the opaque string "error" when the driver is present but pynvml had
+            # a runtime hiccup (common in some container/perm/LD_LIBRARY_PATH setups).
+            gpu_count, gpu_models = _get_gpu_info(self.device)
             self._enqueue_datapoint("system_gpu_count", timestamp, gpu_count)
             self._enqueue_datapoint("system_gpu_models", timestamp, gpu_models)
 
-            # Store GPU indices for periodic metrics
+            # Store GPU indices *only* for periodic metrics (which require live pynvml handles).
+            # We do a fresh init here; _get_gpu_info may have already done one+shutdown.
             self.gpu_indices = []
-            if gpu_count > 0:
-                if self.device == "cpu":
-                    pass
-                elif self.device.startswith("cuda:"):
-                    self.gpu_indices = [gpu_index]
-                else:
-                    self.gpu_indices = list(range(device_count))
+            if NVML_AVAILABLE:
+                try:
+                    nvmlInit()
+                    try:
+                        device_count = nvmlDeviceGetCount()
+                        if self.device == "cpu":
+                            pass
+                        elif self.device.startswith("cuda:"):
+                            gpu_index = int(self.device.split(":", 1)[1])
+                            if gpu_index < device_count:
+                                self.gpu_indices = [gpu_index]
+                        else:
+                            self.gpu_indices = list(range(device_count))
+                    finally:
+                        try:
+                            nvmlShutdown()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    bt.logging.warning(f"Could not populate GPU indices for periodic metrics (pynvml): {e}")
+                    self.gpu_indices = []
         except Exception as e:
             bt.logging.warning(f"Startup metrics recording failed: {e}")
 

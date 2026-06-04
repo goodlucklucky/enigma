@@ -38,30 +38,56 @@ def _insert_solution(query, **overrides):
         solution_status=SolutionStatus.RUNNING.value,
         tx_hash="0xabc",
         miner_hotkey="5Miner",
+        cleaned=False,
     )
     defaults.update(overrides)
-    assert query.insert_challenge_solution(**defaults) is True
+    # insert now returns the solution id (str) on success (preferred stable key)
+    # or None/empty on failure. Bare assert checks for truthy id.
+    returned_id = query.insert_challenge_solution(**defaults)
+    assert returned_id
+    defaults["id"] = returned_id
     return defaults
 
 
 class TestDBQuery:
-    def test_insert_and_get_by_container_name(self, validator_query):
+    def test_insert_and_get_by_stable_key(self, validator_query):
         data = _insert_solution(validator_query)
-        row = validator_query.get_challenge_solution_location(data["container_name"])
+        # Prefer lookup by the stable PK id (returned from insert and now in data)
+        row = validator_query.get_challenge_solution_by_id(data["id"])
         assert row is not None
         assert row.absolute_path_to_solution == data["absolute_path_to_solution"]
 
-    def test_update_solution_status(self, validator_query):
+        # Also retrievable by the stable primary key id (preferred once you have it
+        # in a passed-around object like SolutionPostProcessInfo)
+        row_by_id = validator_query.get_challenge_solution_by_id(data["id"])
+        assert row_by_id is not None
+        assert row_by_id.submission_id == data["submission_id"]
+
+    def test_update_solution_status_by_stable_keys(self, validator_query):
         data = _insert_solution(validator_query)
-        ok = validator_query.update_solution_status_in_db(
-            data["absolute_path_to_solution"], SolutionStatus.SUCCESS.value
+        # Use the id returned by insert (now present in data dict)
+        original_id = data["id"]
+        row = validator_query.get_challenge_solution_by_id(original_id)
+        assert row is not None
+
+        # By the internal id (preferred, carried in SolutionPostProcessInfo / .execution)
+        ok = validator_query.update_solution_status_by_id(
+            original_id, SolutionStatus.SUCCESS.value
         )
         assert ok is True
-        row = validator_query.get_challenge_solution_location(data["container_name"])
+        row = validator_query.get_challenge_solution_by_id(original_id)
         assert row.solution_status == SolutionStatus.SUCCESS.value
 
+        # Also test by id again for failed
+        ok2 = validator_query.update_solution_status_by_id(
+            original_id, SolutionStatus.FAILED.value
+        )
+        assert ok2 is True
+        row = validator_query.get_challenge_solution_by_id(original_id)
+        assert row.solution_status == SolutionStatus.FAILED.value
+
     def test_insert_early_and_update_challenge_solution(self, validator_query):
-        assert validator_query.create_challenge_solution(
+        created_id = validator_query.create_challenge_solution(
             challenge_validation_solution_id="cv-early",
             challenge_milestone_id="milestone-1",
             submission_id="sub-early",
@@ -70,27 +96,28 @@ class TestDBQuery:
             miner_hotkey="5Miner",
             challenge_id="ch-1",
         )
-        row = validator_query.get_challenge_solution_location(
-            validator_query._pending_placeholder("0xearly", "container_name")
-        )
+        assert created_id
+        row = validator_query.get_challenge_solution_by_id(created_id)
         assert row is not None
         assert row.solution_status == SolutionStatus.PENDING.value
+        assert row.id == created_id  # demonstrate id returned from create
 
-        assert validator_query.update_challenge_solution(
-            tx_hash="0xearly",
+        # Update using stable id (preferred; no tx_hash lookup for the update)
+        assert validator_query.update_challenge_solution_by_id(
+            solution_id=created_id,
             container_id="cid-final",
             container_name="ctr_final",
             image_id="img_final",
             absolute_path_to_solution="/tmp/final/path",
             solution_status=SolutionStatus.RUNNING.value,
         )
-        row = validator_query.get_challenge_solution_location("ctr_final")
+        row = validator_query.get_challenge_solution_by_id(created_id)
         assert row.container_id == "cid-final"
         assert row.absolute_path_to_solution == "/tmp/final/path"
         assert row.solution_status == SolutionStatus.RUNNING.value
 
     def test_create_challenge_solution_without_challenge_id(self, validator_query):
-        assert validator_query.create_challenge_solution(
+        created_id = validator_query.create_challenge_solution(
             challenge_validation_solution_id="cv-cross",
             challenge_milestone_id="milestone-1",
             submission_id="sub-cross",
@@ -99,41 +126,139 @@ class TestDBQuery:
             miner_hotkey="5Miner",
             challenge_id=None,
         )
-        row = validator_query.get_challenge_solution_location(
-            validator_query._pending_placeholder("0xcross", "container_name")
-        )
+        assert created_id
+        row = validator_query.get_challenge_solution_by_id(created_id)
         assert row is not None
         assert row.challenge_id is None
 
-    def test_get_container_name_by_solution_location(self, validator_query):
-        data = _insert_solution(validator_query)
-        name = validator_query.get_container_name_by_solution_location(
-            data["absolute_path_to_solution"]
-        )
-        assert name == data["container_name"]
-
     def test_get_image_id_lookups(self, validator_query):
         data = _insert_solution(validator_query)
-        assert validator_query.get_image_id_from_solution_location(
-            data["absolute_path_to_solution"]
-        ) == data["image_id"]
-        assert validator_query.get_image_id_by_container_name(data["container_name"]) == data["image_id"]
-        assert validator_query.get_image_id_by_container_id(data["container_id"]) == data["image_id"]
-        assert validator_query.get_image_id_by_container_id("cid-abc") == data["image_id"]
+        # Verify data via stable key (by id) then read field
+        row = validator_query.get_challenge_solution_by_id(data["id"])
+        assert row is not None
+        assert row.image_id == data["image_id"]
 
-    def test_get_submission_and_milestone_ids(self, validator_query):
+    def test_get_submission_and_milestone_via_stable_keys(self, validator_query):
         data = _insert_solution(validator_query)
-        assert validator_query.get_submission_id_by_solution_location(
-            data["absolute_path_to_solution"]
-        ) == data["submission_id"]
-        assert validator_query.get_challenge_milestone_id_by_file_path(
-            data["absolute_path_to_solution"]
-        ) == data["challenge_milestone_id"]
+        # Use stable key (by id) + read from row
+        row = validator_query.get_challenge_solution_by_id(data["id"])
+        assert row is not None
+        assert row.submission_id == data["submission_id"]
+        assert row.challenge_milestone_id == data["challenge_milestone_id"]
 
-    def test_remove_by_container_name(self, validator_query):
+        # Also via get_solution_by_submission_id (still supported for external IDs)
+        row2 = validator_query.get_solution_by_submission_id(data["submission_id"])
+        assert row2 is not None
+        assert row2.challenge_milestone_id == data["challenge_milestone_id"]
+
+    def test_create_rejects_tx_reuse_on_identifier_mismatch(self, validator_query):
+        """Cross-check / re-run guard: same tx is allowed for identical file-upload/ch/mil (or same sub),
+        but rejected if any of file-upload (challenge_validation_solution_id), challenge_id,
+        milestone, or (for different work) submission_id differ. This disallows tx reuse.
+        """
+        tx = "0xreusetest"
+
+        # First legitimate creation (as in a normal submission)
+        first_id = validator_query.create_challenge_solution(
+            challenge_validation_solution_id="upload-abc",  # the "file upload"
+            challenge_milestone_id="m1",
+            submission_id="sub-original",
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash=tx,
+            miner_hotkey="5Miner",
+            challenge_id="ch-1",
+        )
+        assert first_id
+
+        row = validator_query.get_challenge_solution_by_id(first_id)
+        assert row is not None
+        assert row.challenge_validation_solution_id == "upload-abc"
+
+        # Re-run with *exact same* identifiers (including submission) → allowed (re-use/refresh)
+        same_id = validator_query.create_challenge_solution(
+            challenge_validation_solution_id="upload-abc",
+            challenge_milestone_id="m1",
+            submission_id="sub-original",
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash=tx,
+            miner_hotkey="5Miner",
+            challenge_id="ch-1",
+        )
+        assert same_id
+        assert same_id == first_id  # same row (upsert)
+
+        # Cross-check style re-run: different submission_id (cross-check task id), but
+        # *same* file upload / challenge / milestone → allowed (re-run the same work)
+        cross_id = validator_query.create_challenge_solution(
+            challenge_validation_solution_id="upload-abc",  # same file upload
+            challenge_milestone_id="m1",
+            submission_id="cross-check-task-xyz",  # different claim/sub id
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash=tx,
+            miner_hotkey="5Miner",
+            challenge_id="ch-1",
+        )
+        assert cross_id
+        assert cross_id == first_id
+
+        # Now a bad re-use: same tx, different file upload → rejected
+        bad_file = validator_query.create_challenge_solution(
+            challenge_validation_solution_id="upload-different-file",
+            challenge_milestone_id="m1",
+            submission_id="sub-original",
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash=tx,
+            miner_hotkey="5Miner",
+            challenge_id="ch-1",
+        )
+        assert bad_file is None
+
+        # Different milestone for same tx → rejected
+        bad_mil = validator_query.create_challenge_solution(
+            challenge_validation_solution_id="upload-abc",
+            challenge_milestone_id="m2-different",
+            submission_id="sub-original",
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash=tx,
+            miner_hotkey="5Miner",
+            challenge_id="ch-1",
+        )
+        assert bad_mil is None
+
+        # Different challenge for same tx → rejected
+        bad_ch = validator_query.create_challenge_solution(
+            challenge_validation_solution_id="upload-abc",
+            challenge_milestone_id="m1",
+            submission_id="sub-original",
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash=tx,
+            miner_hotkey="5Miner",
+            challenge_id="ch-999",
+        )
+        assert bad_ch is None
+
+        # Different submission_id *and* different work → rejected (the main tx reuse case)
+        bad_sub = validator_query.create_challenge_solution(
+            challenge_validation_solution_id="upload-other",
+            challenge_milestone_id="m-other",
+            submission_id="sub-different-work",
+            solution_status=SolutionStatus.PENDING.value,
+            tx_hash=tx,
+            miner_hotkey="5Miner",
+            challenge_id="ch-other",
+        )
+        assert bad_sub is None
+
+        # The original row is untouched
+        row = validator_query.get_challenge_solution_by_id(first_id)
+        assert row.challenge_validation_solution_id == "upload-abc"
+        assert row.challenge_milestone_id == "m1"
+
+    def test_remove_by_id(self, validator_query):
         data = _insert_solution(validator_query)
-        assert validator_query.remove_solution_from_db_by_conainer_name(data["container_name"]) is True
-        assert validator_query.get_challenge_solution_location(data["container_name"]) is None
+        # Use id returned from _insert_solution (now in data)
+        assert validator_query.remove_solution_by_id(data["id"]) is True
+        assert validator_query.get_challenge_solution_by_id(data["id"]) is None
 
     def test_insert_for_maintenance_incentive_and_get_active(self, validator_query):
         assert validator_query.insert_for_maintenance_incentive("5Miner", "m1", "0xincentive") is True
@@ -148,11 +273,8 @@ class TestDBQuery:
         assert len(statuses) == 1
         assert statuses[0].tx_hash == data["tx_hash"]
 
-    def test_remove_challenge_solution(self, validator_query):
-        data = _insert_solution(validator_query, challenge_validation_solution_id="cv-remove")
-        assert validator_query.remove_challenge_solution("cv-remove") is True
-        assert validator_query.get_challenge_solution_location(data["container_name"]) is None
-
     def test_missing_rows_return_none_or_empty(self, validator_query):
-        assert validator_query.get_challenge_solution_location("missing") is None
+        # get_solution_by_tx_hash removed; test other missing cases
         assert validator_query.get_miner_submission_statuses("5Nobody") == []
+        # New stable-key updaters should gracefully return False for missing
+        assert validator_query.update_solution_status_by_id("no-such-id", "foo") is False

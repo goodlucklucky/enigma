@@ -20,16 +20,20 @@ import bittensor as bt
 from qbittensor.validator.solution.milestones import get_milestone_handlers
 
 
-def run_challenge_setup(challenge_milestone_id: str, solution_folder_path: str) -> str:
-    """Run the input setup logic for a given milestone.
+def run_challenge_setup(challenge_id: str, solution_folder_path: str, configuration: dict | None = None) -> str:
+    """Run the input setup logic for a given challenge.
 
-    Assumes the milestone has already been validated as supported via assert_milestone_supported().
+    Args:
+        challenge_id: The platform challenge id (UUID). Used to look up the
+            registered handlers for this challenge.
+        solution_folder_path: Absolute path to the challenge input directory.
+        configuration: Milestone configuration from the platform API
+            (e.g. {"difficulty": 320, "max_solution_runtime": 14400}).
+
+    Assumes the challenge has already been validated as supported via assert_milestone_supported().
     """
-    handlers = get_milestone_handlers(challenge_milestone_id)
+    handlers = get_milestone_handlers(challenge_id)
     if not handlers or not handlers.setup:
-        # This should not happen if assert_milestone_supported was called earlier.
-        raise RuntimeError(
-            f"Internal error: No challenge setup handler found for milestone '{challenge_milestone_id}' "
-            "(expected to have been checked earlier)."
-        )
-    return handlers.setup(solution_folder_path)
+        bt.logging.error(f"❌ No setup handler for challenge_id '{challenge_id}'")
+        return False
+    return handlers.setup(solution_folder_path, configuration or {})

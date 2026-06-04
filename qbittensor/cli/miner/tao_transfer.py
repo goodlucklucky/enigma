@@ -216,3 +216,51 @@ def transfer_tao_for_submission(
         )
     )
     return proof_tx
+
+
+def ensure_sufficient_balance_for_fee(
+    source_ss58: str,
+    network: str,
+    fee_tao: float,
+    buffer_tao: float = 0.0005,
+) -> None:
+    """Query the on-chain free balance for the fee-paying coldkey and ensure it is
+    sufficient to cover the submission fee plus a small buffer for transaction fees
+    and the existential deposit.
+
+    This check is performed *before* requesting an upload slot or performing the
+    storage upload of the solution .zip. If the check fails we raise a
+    click.ClickException with a clear message so that ``mine-enigma`` never
+    uploads a solution for which the payer cannot complete the fee transfer.
+
+    The buffer (default 0.0005 TAO) is a conservative allowance that covers the
+    existential deposit (~0.0000005) plus typical extrinsic fees for a small
+    Utility.batch_all containing a Balances.transfer_keep_alive + remark.
+    """
+    import click
+
+    if fee_tao is None or fee_tao <= 0:
+        raise click.ClickException("fee_tao is required and must be > 0 for the balance pre-check")
+
+    try:
+        with bt.Subtensor(network=network) as subtensor:
+            bal: bt.Balance = subtensor.get_balance(source_ss58)
+            available = bal.tao
+    except Exception as e:
+        # Fail closed: do not proceed to upload if we cannot confirm the payer has funds.
+        raise click.ClickException(
+            f"Failed to query on-chain balance for fee wallet {source_ss58} "
+            f"on network {network!r}: {e}\n\n"
+            "Aborting submission to avoid uploading without confirmed funds."
+        ) from e
+
+    total_needed = fee_tao + buffer_tao
+    if available < total_needed:
+        raise click.ClickException(
+            f"Insufficient balance in fee wallet {source_ss58} for this submission.\n"
+            f"  Available free balance : {available:.9f} TAO\n"
+            f"  Submission fee         : {fee_tao:.9f} TAO\n"
+            f"  Safety buffer (fees+ED): {buffer_tao:.9f} TAO\n"
+            f"  Total required         : {total_needed:.9f} TAO\n\n"
+            "Please add TAO to the fee-paying coldkey and try the submission again."
+        )

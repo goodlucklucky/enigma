@@ -39,6 +39,7 @@ import pytest
 
 from qbittensor.cli.miner.tao_transfer import (
     TransferProofTx,
+    ensure_sufficient_balance_for_fee,
     transfer_fee_extrinsic_subtensor,
     transfer_proof_tx_from_receipt,
     transfer_tao_for_submission,
@@ -280,4 +281,100 @@ class TestTransferTaoForSubmission:
                     fee_tao=0.5,
                     miner_hotkey="5H",
                     upload_endpoint_id="u-1",
+                )
+
+
+# -----------------------------------------------------------------------------
+# Tests for ensure_sufficient_balance_for_fee (the pre-upload guard used by mine-enigma).
+# We patch at the bt.Subtensor layer (same seam as the transfer tests).
+# -----------------------------------------------------------------------------
+
+
+class TestEnsureSufficientBalanceForFee:
+    def test_raises_on_non_positive_fee(self):
+        for bad in (None, 0.0, -0.01):
+            with pytest.raises(click.ClickException, match="fee_tao is required and must be > 0"):
+                ensure_sufficient_balance_for_fee(
+                    source_ss58="5Foo",
+                    network="finney",
+                    fee_tao=bad,
+                )
+
+    def test_raises_on_query_failure_and_fails_closed(self):
+        with patch(
+            "qbittensor.cli.miner.tao_transfer.bt.Subtensor"
+        ) as mock_cls:
+            mock_cls.return_value.__enter__.side_effect = RuntimeError("ws down")
+            with pytest.raises(click.ClickException, match="Failed to query on-chain balance"):
+                ensure_sufficient_balance_for_fee(
+                    source_ss58="5Foo",
+                    network="finney",
+                    fee_tao=0.1,
+                )
+
+    def test_raises_when_balance_below_total_needed(self):
+        # fee=0.1, buffer=0.0005 => need ~0.1005; give only 0.05
+        class FakeBal:
+            tao = 0.05
+
+        fake_sub = MagicMock()
+        fake_sub.get_balance.return_value = FakeBal()
+        fake_sub.__enter__.return_value = fake_sub
+        fake_sub.__exit__.return_value = False
+
+        with patch(
+            "qbittensor.cli.miner.tao_transfer.bt.Subtensor"
+        ) as mock_cls:
+            mock_cls.return_value.__enter__.return_value = fake_sub
+            mock_cls.return_value.__exit__.return_value = False
+
+            with pytest.raises(click.ClickException, match="Insufficient balance"):
+                ensure_sufficient_balance_for_fee(
+                    source_ss58="5Poor",
+                    network="finney",
+                    fee_tao=0.1,
+                    buffer_tao=0.0005,
+                )
+
+    def test_passes_when_balance_meets_or_exceeds_total(self):
+        class FakeBal:
+            tao = 0.101
+
+        fake_sub = MagicMock()
+        fake_sub.get_balance.return_value = FakeBal()
+
+        with patch(
+            "qbittensor.cli.miner.tao_transfer.bt.Subtensor"
+        ) as mock_cls:
+            mock_cls.return_value.__enter__.return_value = fake_sub
+            mock_cls.return_value.__exit__.return_value = False
+
+            # should not raise
+            ensure_sufficient_balance_for_fee(
+                source_ss58="5RichEnough",
+                network="finney",
+                fee_tao=0.1,
+                buffer_tao=0.0005,
+            )
+
+    def test_uses_default_buffer(self):
+        """With default buffer 0.0005, balance exactly equal to fee should fail."""
+        class FakeBal:
+            tao = 0.1
+
+        fake_sub = MagicMock()
+        fake_sub.get_balance.return_value = FakeBal()
+
+        with patch(
+            "qbittensor.cli.miner.tao_transfer.bt.Subtensor"
+        ) as mock_cls:
+            mock_cls.return_value.__enter__.return_value = fake_sub
+            mock_cls.return_value.__exit__.return_value = False
+
+            with pytest.raises(click.ClickException, match="Insufficient balance"):
+                ensure_sufficient_balance_for_fee(
+                    source_ss58="5Exact",
+                    network="finney",
+                    fee_tao=0.1,
+                    # buffer default
                 )

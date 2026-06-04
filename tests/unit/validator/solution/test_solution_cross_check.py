@@ -32,6 +32,7 @@ def cross_checker(platform_client):
             platform_client=platform_client,
             solution_container_manager=Mock(),
             database_connection=Mock(),
+            subtensor=Mock(),
         )
     checker.database_connection.db_query = Mock()
     return checker
@@ -52,7 +53,6 @@ class TestSolutionCrossChecker:
             address="5Miner",
             challenge_milestone_id="m1",
             challenge_id="ch-1",
-            challenge_preparation_id=None,
             upload_endpoint_id="upload-xyz",
             tx_hash="0xabc",
             file_download_url="https://example.com/z.zip",
@@ -80,7 +80,6 @@ class TestSolutionCrossChecker:
             address="5Miner",
             challenge_milestone_id="m1",
             challenge_id=None,
-            challenge_preparation_id=None,
             upload_endpoint_id="upload-xyz",
             tx_hash="0xdef",
             file_download_url="https://example.com/z.zip",
@@ -93,20 +92,13 @@ class TestSolutionCrossChecker:
         )
         cross_checker.platform_client.get_next_cross_check_submission.return_value = submission
 
-        with patch("qbittensor.validator.solution.solution_cross_check.execute_verified_solution") as mock_run:
-            mock_run.return_value = ("img", "cid", "/tmp/f")
-            cross_checker.run()
+        cross_checker.run()
 
-        mock_run.assert_called_once_with(
-            db_conn=cross_checker.database_connection,
-            platform_client=cross_checker.platform_client,
-            validator_label="val_label",
-            download_url=submission.file_download_url,
-            challenge_id=None,
-            challenge_milestone_id=submission.challenge_milestone_id,
-            challenge_validation_solution_id=submission.id,
+        # Should report failure and not attempt execution (challenge_id never optional in execution path)
+        cross_checker.platform_client.report_submission_status.assert_called_once_with(
             submission_id=submission.id,
-            tx_hash=submission.tx_hash,
-            miner_hotkey=submission.address,
-            telemetry_service=None,  # telemetry is optional and None in this test setup
+            status="Failure",
+            reason="Missing challenge_id for cross-check submission",
         )
+        # No execute call
+        # (mock not set up in this test, but if it were called it would fail since not patched)

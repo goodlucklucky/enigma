@@ -27,8 +27,4 @@ CROSS_CHECK_MAX_BATCH_SIZE: int = 3
 # containers/images, and kill overdue ones.
 SOLUTION_CONTAINER_MANAGER_TIMEOUT: timedelta = timedelta(minutes=5)
 
-# Maximum allowed runtime for a single solution container before it is
-# forcibly terminated. The container manager will catch these on its next tick.
-MAX_SOLUTION_RUNTIME: timedelta = timedelta(minutes=30)
-
 MAX_SOLUTIONS: int = 1

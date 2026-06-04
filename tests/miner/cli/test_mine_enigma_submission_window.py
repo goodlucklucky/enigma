@@ -16,7 +16,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import click
 import pytest
@@ -28,6 +28,7 @@ from qbittensor.cli.miner.mine_enigma import (
     _find_milestone,
     _format_milestone_status_display,
     _parse_api_datetime,
+    submit_solution,
 )
 
 
@@ -177,7 +178,7 @@ class TestFormatMilestoneStatusDisplay:
 
     def test_shows_other_status_values(self):
         assert _format_milestone_status_display({"status": "Complete"}) == "Complete"
-        assert _format_milestone_status_display({"status": "Validating"}) == "Validating"
+        assert _format_milestone_status_display({"status": "InReview"}) == "InReview"
 
 
 class TestAssertMilestoneStatusIncomplete:
@@ -194,12 +195,12 @@ class TestAssertMilestoneStatusIncomplete:
         ):
             _assert_milestone_status_incomplete({"id": "m1", "status": "Complete"})
 
-    def test_rejects_validating_status_with_retry_guidance(self):
+    def test_rejects_inreview_status_with_retry_guidance(self):
         with pytest.raises(
             click.ClickException,
-            match="potential solution is currently being validated",
+            match="potential solution is currently in review",
         ):
-            _assert_milestone_status_incomplete({"id": "m1", "status": "Validating"})
+            _assert_milestone_status_incomplete({"id": "m1", "status": "InReview"})
 
     def test_rejects_missing_status(self):
         with pytest.raises(click.ClickException, match="missing a status"):
@@ -227,3 +228,93 @@ class TestAssertMilestoneAllowsSubmission:
         }
         with patch("qbittensor.cli.miner.mine_enigma.timestamp", return_value=now):
             _assert_milestone_allows_submission(milestone)
+
+
+class TestSubmitSolutionEarlyStatusGuard:
+    """Verify that bad milestone status short-circuits submit_solution *before*
+    any balance checks, zip inspection, upload slot requests, actual uploads,
+    or fee transfers/payments. This is the core guarantee after status changes
+    on the cloud (e.g. InReview instead of Validating).
+    """
+
+    def test_rejects_inreview_before_any_balance_or_upload_or_pay(self):
+        console = MagicMock()
+        client = MagicMock()
+        client.get_challenge.return_value = {
+            "id": "ch1",
+            "milestones": [
+                {"id": "m1", "status": "InReview", "priceTao": 0.25}
+            ],
+        }
+        fee_keypair = MagicMock()
+        fee_keypair.ss58_address = "5FeePayer"
+
+        with patch(
+            "qbittensor.cli.miner.mine_enigma.ensure_sufficient_balance_for_fee"
+        ) as mock_balance, patch(
+            "qbittensor.cli.miner.mine_enigma._upload_solution_zip"
+        ) as mock_upload, patch(
+            "qbittensor.cli.miner.mine_enigma.transfer_tao_for_submission"
+        ) as mock_transfer:
+            with pytest.raises(
+                click.ClickException, match="in review"
+            ):
+                submit_solution(
+                    console=console,
+                    milestone_id="m1",
+                    solution_path="/tmp/does-not-need-to-exist.zip",
+                    challenges_client=client,
+                    miner_hotkey="5MinerHot",
+                    source_ss58="5Source",
+                    fee_keypair=fee_keypair,
+                    network="finney",
+                    challenge_id="ch1",
+                    fee_tao=0.25,  # pre-supplied, as in normal caller path
+                )
+
+            # These must never have been reached
+            mock_balance.assert_not_called()
+            mock_upload.assert_not_called()
+            mock_transfer.assert_not_called()
+            # We did consult the platform for status (early)
+            client.get_challenge.assert_called_once_with("ch1")
+
+    def test_rejects_complete_before_any_balance_or_upload_or_pay(self):
+        console = MagicMock()
+        client = MagicMock()
+        client.get_challenge.return_value = {
+            "id": "ch1",
+            "milestones": [
+                {"id": "m1", "status": "Complete", "priceTao": 0.1}
+            ],
+        }
+        fee_keypair = MagicMock()
+        fee_keypair.ss58_address = "5FeePayer"
+
+        with patch(
+            "qbittensor.cli.miner.mine_enigma.ensure_sufficient_balance_for_fee"
+        ) as mock_balance, patch(
+            "qbittensor.cli.miner.mine_enigma._upload_solution_zip"
+        ) as mock_upload, patch(
+            "qbittensor.cli.miner.mine_enigma.transfer_tao_for_submission"
+        ) as mock_transfer:
+            with pytest.raises(
+                click.ClickException, match="successfully solved"
+            ):
+                submit_solution(
+                    console=console,
+                    milestone_id="m1",
+                    solution_path="/tmp/does-not-need-to-exist.zip",
+                    challenges_client=client,
+                    miner_hotkey="5MinerHot",
+                    source_ss58="5Source",
+                    fee_keypair=fee_keypair,
+                    network="finney",
+                    challenge_id="ch1",
+                    # fee_tao omitted -> will still resolve from the fetched detail
+                )
+
+            mock_balance.assert_not_called()
+            mock_upload.assert_not_called()
+            mock_transfer.assert_not_called()
+            client.get_challenge.assert_called_once_with("ch1")

@@ -445,7 +445,7 @@ def verify_transfer_proof_for_synapse(
             f"for miner hotkey {miner_hotkey_ss58}",
         )
 
-    substrate = getattr(subtensor, "substrate", None)
+    substrate = subtensor.substrate
     if substrate is None:
         return False, "subtensor.substrate is not available for on-chain verification"
 

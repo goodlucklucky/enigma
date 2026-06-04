@@ -22,6 +22,11 @@ The fee transfer is performed **only after** the zip has been successfully uploa
 to storage (i.e. after the direct PUT/POST to the presigned URL has returned success).
 This CLI does **not** call ``POST .../challenges/milestones/{milestone_id}/submissions``
 (validator synapse handler only).
+
+Before requesting an upload slot or performing the storage upload we verify (via
+``ensure_sufficient_balance_for_fee``) that the fee-paying coldkey has a free
+balance at least as large as the submission fee + a safety buffer. If not, we
+abort with a clear error *before* any bytes are uploaded.
 """
 
 from __future__ import annotations
@@ -59,10 +64,12 @@ from rich.text import Text
 
 from qbittensor.cli.miner.utils.constants import MINER_DB_TABLE_PREFIX
 from qbittensor.cli.miner.fee_wallet import (
-    load_fee_keypair_from_keyfile,
     load_fee_keypair_from_wallet,
 )
-from qbittensor.cli.miner.tao_transfer import transfer_tao_for_submission
+from qbittensor.cli.miner.tao_transfer import (
+    ensure_sufficient_balance_for_fee,
+    transfer_tao_for_submission,
+)
 from qbittensor.utils.time import timestamp
 from qbittensor.utils.transfer_proof import TRANSFER_DEST_SS58
 
@@ -258,10 +265,10 @@ def _assert_milestone_status_incomplete(milestone: dict[str, Any]) -> None:
     status = _milestone_status(milestone)
     if status.lower() == "incomplete":
         return
-    if status.lower() == "validating":
+    if status.lower() == "inreview":
         raise click.ClickException(
             f"Milestone {milestone_id} is not open for submissions (status: {status!r}). "
-            "A potential solution is currently being validated. You may be able to try again later."
+            "A potential solution is currently in review. You may be able to try again later."
         )
     if status.lower() == "complete":
         raise click.ClickException(
@@ -535,31 +542,12 @@ def run_milestone_solution_upload(
         # User declined the transfer
         return
 
-    # By default we use the main wallet's coldkey (from --wallet.name / --wallet.path)
-    # for the fee payment. This is the simplest and most intuitive model.
-    # Advanced users can still override the payment coldkey using the legacy
-    # MINER_FEE_WALLET_NAME or MINER_FEE_COLDKEY_PATH environment variables.
-    fee_keypair = None
-
-    # Legacy / power-user override for a completely different fee coldkey
-    legacy_fee_keyfile = (
-        os.getenv("MINER_FEE_COLDKEY_PATH") or os.getenv("FEE_WALLET_PATH") or ""
-    ).strip()
-    legacy_fee_wallet = (
-        os.getenv("MINER_FEE_WALLET_NAME") or os.getenv("FEE_WALLET_NAME") or ""
-    ).strip()
-
-    if legacy_fee_keyfile:
-        console.print("Loading fee coldkey from legacy path override")
-        fee_keypair = load_fee_keypair_from_keyfile(legacy_fee_keyfile)
-    elif legacy_fee_wallet:
-        console.print("Loading fee coldkey from legacy wallet name override")
-        fee_keypair = load_fee_keypair_from_wallet(legacy_fee_wallet)
-    else:
-        # Normal path: use the primary wallet (from --wallet.name / --wallet.path) for fee payment
-        fee_keypair = load_fee_keypair_from_wallet(
-            api_auth.wallet_name, wallet_path=api_auth.wallet_path
-        )
+    # Use the coldkey from the configured wallet for fee payment.
+    # (The fee coldkey can be the same as the auth hotkey's coldkey, or a separate one
+    # loaded via fee_wallet helpers if extended.)
+    fee_keypair = load_fee_keypair_from_wallet(
+        api_auth.wallet_name, wallet_path=api_auth.wallet_path
+    )
 
     if fee_keypair is None:
         console.print(_styled_panel("Cancelled", "No fee coldkey provided.", border=f"dim {c(3)}"))
@@ -568,11 +556,21 @@ def run_milestone_solution_upload(
     source_ss58 = fee_keypair.ss58_address
     console.print(f"Fee coldkey loaded: {source_ss58}")
 
+    # Pre-check balance right after unlocking the fee coldkey (and after the user has
+    # confirmed the fee amount). This aborts before we even enter the submission
+    # function (which will still perform its own early milestone status validation
+    # + balance guard + slot request).
+    ensure_sufficient_balance_for_fee(
+        source_ss58=source_ss58,
+        network=api_auth.network,
+        fee_tao=price_tao,
+    )
+
     # Old mnemonic env var is now a hard error
     if os.getenv("MINER_SOURCE_COLDKEY_MNEMONIC"):
         raise click.ClickException(
             "MINER_SOURCE_COLDKEY_MNEMONIC is no longer supported.\n"
-            "Configure your wallet with --wallet.name / --wallet.path (or FEE_WALLET_NAME).\n"
+            "Configure your wallet with --wallet.name / --wallet.path.\n"
             "The miner hotkey is now taken from --wallet.hotkey."
         )
 
@@ -611,8 +609,19 @@ def submit_solution(
     fee_tao: float | None = None,
 ) -> dict[str, Any]:
 
-    # store solution in the database for the miner_hotkey
     """Request slot, upload zip to storage, transfer fee (as batch + remark), then persist DB row.
+
+    Milestone status validation (via _assert_milestone_allows_submission + the
+    cloud-backed milestone status such as "Incomplete" vs "InReview"/"Complete")
+    is performed *first*, immediately on entry. Only then do we resolve price
+    and run the balance pre-check (via ensure_sufficient_balance_for_fee).
+    Both checks happen *before* the upload slot request, before touching/uploading
+    the solution .zip, and before the on-chain fee transfer.
+
+    This guarantees: if the challenge/milestone cannot be accepted due to its
+    status, we never upload bytes or pay the submission fee (even in direct calls
+    to submit_solution without the outer run_milestone... guard, or after a
+    status transition on the cloud between initial UI selection and actual submit).
 
     The on-chain fee transfer is deliberately performed *after* the zip has been
     successfully uploaded to storage (i.e. after the direct PUT/POST to the presigned
@@ -621,8 +630,63 @@ def submit_solution(
     """
     if not challenge_id:
         raise click.ClickException("challenge_id is required to submit a solution.")
+
+    # The passed client is already authenticated and pointed at the challenges service.
+    auth_client = challenges_client
+
+    # Milestone status check FIRST (before price resolution, before balance query,
+    # before any zip handling, slot request, upload, or payment). This is the
+    # critical guard requested: status failures must short-circuit without
+    # upload or pay side-effects. Mirrors the early guard in run_milestone_solution_upload
+    # and the interactive selector, but ensures submit_solution is independently safe.
+    try:
+        challenge_detail = auth_client.get_challenge(challenge_id)
+        milestone_detail = _find_milestone(challenge_detail, milestone_id)
+        _assert_milestone_allows_submission(milestone_detail)
+    except click.exceptions.Exit:
+        raise
+    except click.ClickException:
+        raise
+    except Exception as e:
+        err_code = getattr(e, "error_code", None)
+        if err_code:
+            raise click.ClickException(
+                f"Failed to verify milestone submission status (error_code: {err_code}):\n{e}"
+            ) from e
+        raise click.ClickException(f"Failed to verify milestone submission status: {e}") from e
+
+    # Resolve price (we prefer to use the milestone_detail we just fetched for
+    # status validation to avoid an extra round-trip when fee_tao was not supplied).
+    # Then run the balance guard *before* we touch the local zip file or
+    # print/request anything upload-related.
+    # This makes submit_solution itself safe to call even without the outer guard.
+    if fee_tao is not None:
+        price_tao = fee_tao
+    else:
+        price = None
+        for ms in (challenge_detail.get("milestones") or []):
+            if str(ms.get("id")) == str(milestone_id):
+                price = ms.get("priceTao")
+                break
+        if price is not None:
+            price_tao = float(price)
+        else:
+            price_tao = auth_client.get_milestone_price_tao(
+                challenge_id=challenge_id, milestone_id=milestone_id
+            )
+
+    ensure_sufficient_balance_for_fee(
+        source_ss58=source_ss58,
+        network=network,
+        fee_tao=price_tao,
+    )
+
+    # Only after we know the payer can afford it (and we already performed
+    # milestone status validation at function entry) do we inspect the zip.
     zip_path = Path(solution_path)
     size = zip_path.stat().st_size
+
+    # Now safe on all fronts (milestone status + balance) — show the UI and request the slot.
     upload_path = "v1/submissions/upload"
     upload_url = f"{_api_cfg.challenges_api_url}/v1/submissions/upload"
     console.print(
@@ -634,21 +698,6 @@ def submit_solution(
             ),
         )
     )
-
-    # The passed client is already authenticated and pointed at the challenges service.
-    auth_client = challenges_client
-
-    try:
-        challenge_detail = auth_client.get_challenge(challenge_id)
-    except Exception as e:
-        err_code = getattr(e, "error_code", None)
-        if err_code:
-            raise click.ClickException(
-                f"Failed to fetch challenge details (error_code: {err_code}):\n{e}"
-            ) from e
-        raise click.ClickException(f"Failed to fetch challenge details: {e}") from e
-    milestone_detail = _find_milestone(challenge_detail, milestone_id)
-    _assert_milestone_allows_submission(milestone_detail)
 
     try:
         slot = auth_client.get_submission_upload_slot(
@@ -682,13 +731,10 @@ def submit_solution(
         # Still proceed — the upload helper may not strictly need the id
         bt.logging.warning("Upload slot response did not include an 'id'")
 
-    # Use pre-fetched amount if provided (from the confirmation step), otherwise fetch.
-    # This also avoids a second round-trip after the user has already confirmed the amount.
-    if fee_tao is not None:
-        price_tao = fee_tao
-    else:
-        price_tao = auth_client.get_milestone_price_tao(challenge_id=challenge_id, milestone_id=milestone_id)
-
+    # price_tao was resolved (and milestone status + balance were checked) before
+    # the upload slot request. No re-fetch needed here; the early validation path
+    # ensures price came from a status-checked milestone (or the explicitly passed
+    # fee_tao from the caller, which is the normal path).
     console.print(Text("Uploading bytes…", style=f"dim {c(3)}"))
     _upload_solution_zip(console, spec, zip_path)
 
@@ -1344,20 +1390,6 @@ def query_and_format_challenges(
     help="Custom path to the wallets directory.",
 )
 @click.option(
-    "--wallet-name",
-    "wallet_name_legacy",
-    default=None,
-    hidden=True,
-    help="(Deprecated) Use --wallet.name instead.",
-)
-@click.option(
-    "--wallet-hotkey",
-    "wallet_hotkey_legacy",
-    default=None,
-    hidden=True,
-    help="(Deprecated) Use --wallet.hotkey instead.",
-)
-@click.option(
     "--network",
     default=None,
     help="Bittensor network label passed to RequestManager (default: NETWORK env or finney).",
@@ -1374,21 +1406,15 @@ def main(
     wallet_name: str | None,
     wallet_hotkey: str | None,
     wallet_path: str | None,
-    wallet_name_legacy: str | None,
-    wallet_hotkey_legacy: str | None,
     network: str | None,
     netuid: int | None,
 ) -> None:
     """Welcome banner, then browse challenges response views."""
     # Environment is already loaded at module import time via get_api_config()
     # (which calls load_dotenv()). _resolve_cli_api_auth reads directly from os.getenv.
-    # Support both new dotted style and old flat style for backward compat
-    effective_wallet_name = wallet_name or wallet_name_legacy
-    effective_wallet_hotkey = wallet_hotkey or wallet_hotkey_legacy
-
     api_auth = _resolve_cli_api_auth(
-        wallet_name=effective_wallet_name,
-        wallet_hotkey=effective_wallet_hotkey,
+        wallet_name=wallet_name,
+        wallet_hotkey=wallet_hotkey,
         wallet_path=wallet_path,
         network=network,
         netuid=netuid,
