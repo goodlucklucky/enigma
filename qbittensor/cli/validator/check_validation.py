@@ -99,9 +99,9 @@ def main(submission_id: str, hotkey: str | None) -> None:
 
 def _find_validator_db(hotkey: str | None, console: Console) -> Path | None:
     """Auto-discover the validator's local DB file."""
-    db_dir = Path.home() / ".enigma"
+    db_dir = Path(__file__).parent.parent.parent.parent / "data"
     if not db_dir.exists():
-        console.print(f"[red]Error:[/red] No ~/.enigma directory found.")
+        console.print(f"[red]Error:[/red] No {db_dir} directory found.")
         console.print("Run your validator at least once so it can create its database.")
         return None
 

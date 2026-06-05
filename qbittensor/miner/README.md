@@ -2,12 +2,12 @@
 
 The miner has two cooperating parts:
 
-- A CLI (`cli/mine_enigma.py`) that lets an operator browse challenges, upload a `.zip` to storage, pay the TAO transfer fee only after the storage upload succeeds, and store a submission record locally.
+- A CLI (`cli/mine_enigma.py`) that lets an operator browse challenges, upload a `.zip` to storage, pay the TAO transfer fee only after the storage upload succeeds, and store a submission record locally (this cli tool can be run from the repo root with the `mine-enigma` command).
 - A miner neuron (`neurons/miner.py`) that serves validators over Bittensor synapses by reading that local submission record and returning a `SolutionCandidate` plus transfer proof data.
 
 ## What The CLI Does
 
-The `mine_enigma` CLI is an operator workflow for preparing a submission that the running miner can later serve to validators.
+The `mine-enigma` CLI is an operator workflow for preparing a submission that the running miner can later serve to validators.
 
 High-level flow:
 
@@ -79,7 +79,7 @@ Key columns:
 A submission follows this flow:
 
 1. **Upload (CLI)**  
-   `mine_enigma` obtains an upload slot from the platform, uploads the `.zip` directly to storage via the presigned URL, and only after the storage upload returns a successful response does it perform the required TAO fee transfer (with on-chain proof binding the payment to the upload slot). It then writes a row to the local `miner_submissions` table. The fee is never paid until the storage upload has succeeded. At this point `submitted_at` is `NULL`.
+   `mine-enigma` obtains an upload slot from the platform, uploads the `.zip` directly to storage via the presigned URL, and only after the storage upload returns a successful response does it perform the required TAO fee transfer (with on-chain proof binding the payment to the upload slot). It then writes a row to the local `miner_submissions` table. The fee is never paid until the storage upload has succeeded. At this point `submitted_at` is `NULL`.
 
 2. **Serving (running miner neuron)**  
    `neurons/miner.py` continuously polls the local DB via `SolutionPoller`.  
@@ -120,7 +120,7 @@ On validator side, `ResponseProcessor` verifies transfer proof data (message int
 ## End-to-End Operator Workflow
 
 1. Configure `.env`.
-2. Run `mine_enigma` and upload your milestone `.zip`.
+2. Run `mine-enigma` and upload your milestone `.zip`.
 3. CLI performs (in this order):
    - challenge API interaction + upload slot request
    - direct upload of the `.zip` to storage (via presigned PUT/POST)

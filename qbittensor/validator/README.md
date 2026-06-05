@@ -26,7 +26,7 @@ Full details on the solution pipeline, Docker handling, output contract, and int
 
 - **Docker** available on the host (build, run, list, stop, rm) with permissions for the validator process.
 - Sufficient disk for download/extract/solution output paths.
-- **NVIDIA GPU** with the NVIDIA Container Toolkit installed and the NVIDIA driver installed. See qbittensor/validator/utils/gpu_verification/GPU_README.md for more details.
+- **NVIDIA GPU** with the NVIDIA Container Toolkit installed and the NVIDIA driver installed. See [GPU_README.md](utils/gpu_verification/GPU_README.md) for more details.
 
 ## Entry point
 

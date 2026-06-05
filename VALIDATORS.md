@@ -25,6 +25,9 @@ foundryup
 
 The treasury scripts default to the public lite endpoint `https://lite.chain.opentensor.ai`. For higher reliability or if you hit rate limits during busy periods, you can obtain a dedicated RPC URL from a provider like [Nodies](https://www.nodies.app) and pass it via the `--rpc` / `--rpc-url` flag.
 
+### NVIDIA GPU
+To run the validator on a NVIDIA GPU, you need to have the NVIDIA Container Toolkit installed and the NVIDIA driver installed. See [GPU_README.md](qbittensor/validator/utils/gpu_verification/GPU_README.md) for more details.
+
 ## 2. Create an EVM Wallet
 
 You need a dedicated EVM wallet to interact with the Treasury smart contracts. You can create a new wallet using `cast`:
