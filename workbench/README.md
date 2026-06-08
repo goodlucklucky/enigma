@@ -69,8 +69,12 @@ python -m workbench keygen
 2. **Build** -- (Docker mode) Assembles a build context with your solution and
    the `challenges` package (provided as `enigma_challenges/` in the context), then runs `docker build`
 3. **Run** -- Executes your solver with the challenge ID and problem JSON as
-   arguments. In Docker mode, output is written to a mounted `/output` volume.
-   In direct mode, the `OUTPUT_DIR` env var points to the output directory.
+   arguments. In Docker mode (the default, matching the validator), the root
+   filesystem is read-only and no output volume is mounted. Your solver must
+   emit results exclusively via stdout using the solution output protocol
+   (logs + separator + base64 zip). The validator/workbench captures this
+   after the container exits. In direct mode, the `OUTPUT_DIR` env var is
+   provided for convenience and files may be written there.
 4. **Validate** -- Checks that required output files exist and conform to the
    expected schema (`result.json`, `stdout.log`, `solve_info.json`)
 5. **Verify** -- Compares your solution against the known answer
@@ -82,9 +86,14 @@ Your solution directory should contain:
 - **`Dockerfile`** -- (Docker mode) Builds an image with your solver and its
   dependencies. The build context will include an `enigma_challenges/` directory
   (the vendored challenges package for your solver to import types from).
+  Your image must be runnable under the validator's runtime restrictions
+  (read-only rootfs, non-root user, limited tmpfs at /tmp for scratch only,
+  no network, etc.). See the example Dockerfiles and the "Runtime constraints"
+  sections in the individual challenge READMEs.
 - **`<challenge_name>.py`** -- Your solver script. Receives `<challenge_id>`
-  and `<problem_json>` as CLI arguments. Writes results to `/output/` (Docker)
-  or `$OUTPUT_DIR` (direct).
+  and `<problem_json>` as CLI arguments. In Docker mode it must emit its final
+  artifacts via the stdout protocol (not by writing files inside the container).
+  Direct mode provides `OUTPUT_DIR` for local convenience.
 
 See `workbench/challenges/*/example_solution/` for working examples.
 

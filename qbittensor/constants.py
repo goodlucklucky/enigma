@@ -28,3 +28,8 @@ CROSS_CHECK_MAX_BATCH_SIZE: int = 3
 SOLUTION_CONTAINER_MANAGER_TIMEOUT: timedelta = timedelta(minutes=5)
 
 MAX_SOLUTIONS: int = 1
+
+# --- Docker resource pruning ---
+DOCKER_RESOURCE_PRUNE_INTERVAL: timedelta = timedelta(hours=1)
+DOCKER_BUILDER_PRUNE_UNTIL: str = "48h"
+DOCKER_IMAGE_PRUNE_UNTIL: str = "72h"

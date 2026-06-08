@@ -39,7 +39,7 @@ class TestConstants:
 
 class TestValidationErrors:
     def test_enum_members_exist(self):
-        assert ValidationErrors.INVALID_TARBALL.value
+        assert ValidationErrors.INVALID_ZIP.value
         assert ValidationErrors.DOCKER_RUN_FAILED.value
 
 

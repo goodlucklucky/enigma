@@ -387,6 +387,13 @@ class TelemetryService:
             self._enqueue_datapoint("system_cpu_count", timestamp, cpu_count)
             self._enqueue_datapoint("system_ram_bytes", timestamp, total_ram)
 
+            try:
+                disk_path = os.path.abspath(os.sep)
+                total_disk = psutil.disk_usage(disk_path).total
+                self._enqueue_datapoint("system_disk_bytes", timestamp, total_disk)
+            except Exception as disk_err:
+                bt.logging.debug(f"Could not read total disk size for startup telemetry: {disk_err}")
+
             # GPU count + models: robust (pynvml preferred, nvidia-smi fallback) so we avoid
             # reporting the opaque string "error" when the driver is present but pynvml had
             # a runtime hiccup (common in some container/perm/LD_LIBRARY_PATH setups).
@@ -422,13 +429,21 @@ class TelemetryService:
             bt.logging.warning(f"Startup metrics recording failed: {e}")
 
     def record_system_metrics(self):
-        """Record periodic system metrics (CPU/RAM usage, GPU util/memory)."""
+        """Record periodic system metrics (CPU/RAM/disk usage, GPU util/memory)."""
         try:
             timestamp = datetime.now(timezone.utc).isoformat()
             cpu_usage = psutil.cpu_percent(interval=1)
             ram_usage = psutil.virtual_memory().percent
             self._enqueue_datapoint("system_cpu_usage", timestamp, cpu_usage)
             self._enqueue_datapoint("system_ram_usage", timestamp, ram_usage)
+
+            try:
+                disk_path = os.path.abspath(os.sep)
+                disk = psutil.disk_usage(disk_path)
+                disk_usage = float(disk.percent)
+                self._enqueue_datapoint("system_disk_usage", timestamp, disk_usage)
+            except Exception as disk_err:
+                bt.logging.debug(f"Could not read disk usage for telemetry: {disk_err}")
 
             # GPU metrics
             if self.gpu_indices:

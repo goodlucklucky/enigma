@@ -292,9 +292,33 @@ def _write_extraction_diagnostics(artifacts_dir: str, container_ref: str, messag
         bt.logging.warning(f"⚠️ Failed to write extraction diagnostics file: {e}")
 
 
-def _safe_extract_zip(zf: zipfile.ZipFile, destination: str) -> None:
-    """Extract a zip while rejecting absolute paths and ``..`` traversal."""
+def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
+    """Return True if the ZipInfo indicates a symlink (best-effort across platforms)."""
+    # On Unix, high 16 bits of external_attr are the st_mode; 0o120000 is S_IFLNK.
+    mode = (info.external_attr >> 16) & 0o170000
+    if mode == 0o120000:
+        return True
+    return False
+
+
+def _safe_extract_zip(
+    zf: zipfile.ZipFile, destination: str, *, max_bytes: int | None = None
+) -> None:
+    """
+    Extract a zip while enforcing:
+      - No absolute paths or ``..`` traversal (lexical).
+      - No symlinks (reject ZipInfo symlink entries + post-extraction sweep).
+      - Optional running byte budget on *actual* decompressed bytes written.
+
+    Raises RuntimeError on any policy violation. The destination may contain
+    partial files on error; callers should clean up the workspace.
+    """
     destination_abs = os.path.abspath(destination)
+    os.makedirs(destination_abs, exist_ok=True)
+
+    total_written = 0
+    extracted_paths: list[str] = []
+
     for member in zf.infolist():
         member_path = os.path.normpath(os.path.join(destination_abs, member.filename))
         if not (
@@ -304,7 +328,45 @@ def _safe_extract_zip(zf: zipfile.ZipFile, destination: str) -> None:
             raise RuntimeError(
                 f"Refusing to extract '{member.filename}': escapes destination directory"
             )
-    zf.extractall(destination_abs)
+
+        if _is_zip_symlink(member):
+            raise RuntimeError(
+                f"Refusing to extract '{member.filename}': symlinks are not allowed in archives"
+            )
+
+        if member.is_dir():
+            os.makedirs(member_path, exist_ok=True)
+            continue
+
+        parent = os.path.dirname(member_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        with zf.open(member, "r") as src, open(member_path, "wb") as dst:
+            while True:
+                chunk = src.read(64 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                total_written += len(chunk)
+                if max_bytes is not None and total_written > max_bytes:
+                    raise RuntimeError(
+                        f"Zip extraction exceeded size limit ({total_written} > {max_bytes} bytes)"
+                    )
+
+        extracted_paths.append(member_path)
+
+    for root, dirs, files in os.walk(destination_abs):
+        for name in dirs + files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Refusing archive: symlink detected after extraction at '{os.path.relpath(full, destination_abs)}'"
+                )
 
 
 def _container_run_user() -> str | None:

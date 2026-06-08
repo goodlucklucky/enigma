@@ -26,7 +26,13 @@ from qbittensor.database.db_connection import DBConnection
 from qbittensor.validator.solution.run_solution import extract_stdout_output
 from qbittensor.validator.solution.validate_solution_output import validate_solution
 from qbittensor.utils.services.challenges import ChallengesClient
-from qbittensor.constants import SOLUTION_CONTAINER_MANAGER_TIMEOUT, MAX_SOLUTIONS
+from qbittensor.constants import (
+    SOLUTION_CONTAINER_MANAGER_TIMEOUT,
+    MAX_SOLUTIONS,
+    DOCKER_RESOURCE_PRUNE_INTERVAL,
+    DOCKER_BUILDER_PRUNE_UNTIL,
+    DOCKER_IMAGE_PRUNE_UNTIL,
+)
 from qbittensor.utils.solution_status import SolutionStatus
 import bittensor as bt
 
@@ -91,6 +97,11 @@ class SolutionContainerManager:
     def __init__(self, platform_client: ChallengesClient, database_connection: DBConnection, validator_label: str):
         self.platform_client = platform_client
         self.timer: Timer = Timer(timeout=SOLUTION_CONTAINER_MANAGER_TIMEOUT, run=self.run, run_on_start=True)
+        self.docker_prune_timer: Timer = Timer(
+            timeout=DOCKER_RESOURCE_PRUNE_INTERVAL,
+            run=self._prune_docker_resources,
+            run_on_start=False,  # let the first real tick happen after an interval
+        )
         self.database_connection = database_connection
         self.LABEL = validator_label
 
@@ -120,6 +131,10 @@ class SolutionContainerManager:
         self.database_connection.db_query.prune_old_solutions()
 
         self._prune_containers()
+
+        # Periodic conservative Docker disk cleanup (build cache + old unused images).
+        # Throttled by its own timer (see DOCKER_RESOURCE_PRUNE_INTERVAL).
+        self.docker_prune_timer.check_timer()
 
     def handle_completed_solutions(self) -> None:
         """Find completed solution containers, validate their output, and report results to the platform"""
@@ -708,6 +723,69 @@ class SolutionContainerManager:
             bt.logging.info(f"🗑️ Prune complete: {pruned_containers} containers, {pruned_images} images removed")
         except Exception as e:
             bt.logging.error(f"❌ Failed to prune containers/images: {e}")
+
+    def _prune_docker_resources(self) -> None:
+        """Conservative periodic Docker disk cleanup (build cache + unused images).
+
+        This implements the recommended "Option A" hygiene:
+            docker builder prune -f --filter "until=48h"
+            docker image prune -a -f --filter "until=72h"
+
+        The time-based filters keep recent build cache (useful while actively
+        building/running challenges) and any images created or used in the last
+        ~3 days, while reclaiming space from old solution images, test images,
+        stale base image layers (e.g. old nvidia/cuda), and accumulated build
+        cache.
+
+        This is safe to run while a challenge solution container is active:
+        - Any image referenced by a running (or recently created) container is
+          considered "used" and will not be removed by `image prune -a`.
+        - The currently-executing challenge's image stays resident.
+        - Only truly unreferenced + aged-out images and cache entries are deleted.
+
+        Runs on its own throttled timer (DOCKER_RESOURCE_PRUNE_INTERVAL) so we
+        don't spam prune commands on every 5-minute container check.
+        """
+        bt.logging.info("🧹 Starting periodic Docker resource prune (build cache + unused images)")
+
+        prune_jobs = [
+            (
+                ["docker", "builder", "prune", "-f", "--filter", f"until={DOCKER_BUILDER_PRUNE_UNTIL}"],
+                "build cache",
+            ),
+            (
+                ["docker", "image", "prune", "-a", "-f", "--filter", f"until={DOCKER_IMAGE_PRUNE_UNTIL}"],
+                "unused images",
+            ),
+        ]
+
+        for cmd, label in prune_jobs:
+            try:
+                bt.logging.debug(f"   → {' '.join(cmd)}")
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,  # generous; large dirty caches can take a bit
+                )
+                if result.returncode == 0:
+                    out = (result.stdout or "").strip()
+                    if out:
+                        # Docker prints a summary; show the most relevant tail
+                        lines = [ln for ln in out.splitlines() if ln.strip()]
+                        tail = "\n".join(lines[-8:]) if len(lines) > 8 else out
+                        bt.logging.info(f"   ✅ Pruned {label}:\n{tail}")
+                    else:
+                        bt.logging.info(f"   ✅ Pruned {label}: nothing eligible within filter window")
+                else:
+                    err = (result.stderr or result.stdout or "(no output)").strip()[:400]
+                    bt.logging.warning(f"   ⚠️ {label} prune returned {result.returncode}: {err}")
+            except subprocess.TimeoutExpired:
+                bt.logging.warning(f"   ⚠️ Timed out while pruning {label}")
+            except Exception as e:
+                bt.logging.warning(f"   ⚠️ Error pruning {label}: {e}")
+
+        bt.logging.info("🧹 Docker resource prune complete")
 
     def _clean_up_orphaned_solutions(self, container_name: str) -> None:
         """If we find a container that has no associated solution location, we should remove it to free up resources"""

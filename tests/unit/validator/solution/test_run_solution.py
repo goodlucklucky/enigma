@@ -251,9 +251,9 @@ class TestRunImageDetached:
         assert "--network" in args
         assert "none" in args
         assert "--pids-limit" in args
-        assert "128" in args
+        assert VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT in args
         assert "--ulimit" in args
-        assert "nofile=1024:1024" in args
+        assert f"nofile={VALIDATOR_DOCKER_ULIMIT_NOFILE_DEFAULT}" in args
         assert "--cap-drop" in args
         assert "ALL" in args
         assert "--security-opt" in args
@@ -321,9 +321,9 @@ class TestDockerRunSecurityArgs:
         with patch.dict("os.environ", {}, clear=True):
             args = docker_run_security_args()
         assert ["--stop-timeout", "30"] == args[:2]
-        assert ["--pids-limit", "128"] == args[2:4]
+        assert ["--pids-limit", VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT] == args[2:4]
         assert "--ulimit" in args
-        assert "nofile=1024:1024" in args
+        assert f"nofile={VALIDATOR_DOCKER_ULIMIT_NOFILE_DEFAULT}" in args
         assert ["--cap-drop", "ALL"] == args[args.index("--cap-drop"): args.index("--cap-drop") + 2]
         assert "--security-opt" in args
         assert "--read-only" in args

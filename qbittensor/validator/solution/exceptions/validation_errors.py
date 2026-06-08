@@ -19,10 +19,10 @@ from enum import Enum
 
 
 class ValidationErrors(Enum):
-    INVALID_TARBALL = "The tarball is invalid. It may be corrupted or not a tarball at all."
-    TARBALL_DOWNLOAD_FAILED = "Failed to download the tarball from the provided URL."
-    MISSING_DOCKERFILE = "The tarball is missing a Dockerfile in the root directory."
+    INVALID_ZIP = "The zip is invalid. It may be corrupted or not a zip at all."
+    ZIP_DOWNLOAD_FAILED = "Failed to download the zip from the provided URL."
+    MISSING_DOCKERFILE = "The zip is missing a Dockerfile in the root directory."
     DOCKER_BUILD_FAILED = "Docker failed to build the image from the provided Dockerfile."
     DOCKER_RUN_FAILED = "Docker failed to run the container from the built image."
     DOCKER_IMAGE_VALIDATION_FAILED = "The built Docker image failed validation checks and cannot be run."
-    INVALID_PROGRAM = "The program provided in the tarball is invalid. It may be missing required files, have syntax errors, or fail other validation checks."
+    INVALID_PROGRAM = "The program provided in the zip is invalid. It may be missing required files, have syntax errors, or fail other validation checks."

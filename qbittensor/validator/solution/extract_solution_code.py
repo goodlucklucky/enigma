@@ -22,23 +22,42 @@ import zipfile
 
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
+from qbittensor.validator.solution.constants import (
+    VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_ENV,
+    VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_DEFAULT,
+)
+from qbittensor.validator.solution.run_solution import _safe_extract_zip
+
+
+def _max_uncompressed_bytes() -> int:
+    raw = os.getenv(
+        VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_ENV,
+        str(VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_DEFAULT),
+    ).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        bt.logging.warning(
+            f"\tInvalid {VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_ENV}={raw!r}; "
+            f"using default {VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_DEFAULT} bytes."
+        )
+        return VALIDATOR_ZIP_MAX_UNCOMPRESSED_BYTES_DEFAULT
 
 
 def unzip(folder_name: str, source_filepath: str) -> None:
     """Unzip the .zip file into a new folder
 
-    Args:
-        folder_name (str): Name of the folder for this solution
     """
     destination: str = f"{folder_name}/code"
     try:
+        max_bytes = _max_uncompressed_bytes()
         with zipfile.ZipFile(source_filepath, "r") as zip_ref:
-            zip_ref.extractall(path=destination)
+            _safe_extract_zip(zip_ref, destination, max_bytes=max_bytes)
         _flatten_single_top_level_dir(destination)
         bt.logging.info("✅ Code extracted from zip")
     except Exception as e:
         bt.logging.error(f"❌ Failed to unzip the file: {e}")
-        raise InvalidSolutionError(message=str(ValidationErrors.INVALID_TARBALL))
+        raise InvalidSolutionError(message=str(ValidationErrors.INVALID_ZIP))
 
 
 def _flatten_single_top_level_dir(destination: str) -> None:
@@ -49,12 +68,22 @@ def _flatten_single_top_level_dir(destination: str) -> None:
 
     root_dir_name = entries[0]
     root_dir_path = os.path.join(destination, root_dir_name)
+
+    if os.path.islink(root_dir_path):
+        raise RuntimeError(
+            f"Refusing to flatten: top-level entry '{root_dir_name}' is a symlink"
+        )
+
     if not os.path.isdir(root_dir_path):
         return
 
     for item in os.listdir(root_dir_path):
         source = os.path.join(root_dir_path, item)
         target = os.path.join(destination, item)
+        if os.path.islink(source):
+            raise RuntimeError(
+                f"Refusing to flatten: entry '{root_dir_name}/{item}' is a symlink"
+            )
         if os.path.isdir(source):
             shutil.copytree(source, target, dirs_exist_ok=True)
         else:

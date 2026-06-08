@@ -30,8 +30,8 @@ compute_spec:
       recommended_ram: 8
 
     storage:
-      min_space: 50
-      recommended_space: 50
+      min_space: 100
+      recommended_space: 100
       type: "SSD"
       min_iops: 1000
       recommended_iops: 5000

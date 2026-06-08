@@ -42,6 +42,6 @@ def _has_dockerfile(folder_name: str) -> bool:
 
 
 def validate_code(folder_name: str) -> bool:
-    """Validate code from tarball."""
+    """Validate code from zip."""
     bt.logging.info("🛠️ Validating code")
     return _has_dockerfile(folder_name=folder_name)

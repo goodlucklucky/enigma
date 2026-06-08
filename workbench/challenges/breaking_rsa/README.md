@@ -25,6 +25,9 @@ Solutions are executed by validators under these conditions:
 - **Network:** None (`--network none`, no internet access)
 - **Platform:** `linux/amd64`
 - **Compute:** RTX PRO 6000 (96 GB VRAM), 26 cores, 96 GB RAM
+- **Filesystem:** Root filesystem is read-only. Use `/tmp` (tmpfs, currently sized to `VALIDATOR_DOCKER_TMPFS_DEFAULT` with noexec/nosuid) for any scratch space, temp files, or working directories needed at runtime.
+- **User:** Runs as a non-root user (default `miner`). Your Dockerfile should create this user and ensure your solver and any required binaries are accessible to it (see the example_solution/Dockerfile).
+- **Output contract:** In Docker/validator mode there is **no** writable `/output` volume mounted. Your solver must emit results exclusively via the stdout protocol (text logs, then the `SOLUTION_OUTPUT_SEPARATOR` line, then a base64-encoded zip of `result.json` + `solve_info.json` etc.). See `enigma_challenges/solution_output.py` (or the vendored copy at build time). The `OUTPUT_DIR` environment variable is only provided in direct (non-Docker) mode for local development convenience.
 
 ## Challenge parameters
 
@@ -47,10 +50,11 @@ Your solver receives two positional CLI arguments:
 
 ## Output
 
-Your solver must write three files to `/output/` (Docker mode) or the
-directory specified by the `OUTPUT_DIR` environment variable (direct mode):
+**Important (Docker/validator mode):** There is no writable `/output` volume inside the container. The root filesystem is read-only. Your solver must deliver artifacts exclusively by writing to **stdout** using the defined protocol (human-readable logs, followed by the `SOLUTION_OUTPUT_SEPARATOR` line on its own, followed by a base64-encoded zip containing `result.json`, `solve_info.json`, etc.). The validator captures this via `docker logs` after the container exits.
 
-### `result.json`
+The `OUTPUT_DIR` environment variable (and writing files directly to disk) is only provided in `--mode direct` (non-Docker subprocess) for local development convenience inside the workbench.
+
+### `result.json` (must be inside the emitted zip)
 
 ```json
 {
@@ -66,21 +70,13 @@ directory specified by the `OUTPUT_DIR` environment variable (direct mode):
 | `p` | int or null | First prime factor |
 | `q` | int or null | Second prime factor |
 
-### `stdout.log`
+### Other artifacts
 
-Captured standard output from your solver.
+Include `solve_info.json` (and any other files your challenge expects) inside the same base64 zip emitted after the separator.
 
-### `solve_info.json`
+`stdout.log` is captured automatically from the text logs you print before the separator (plus stderr).
 
-Timing and metadata about the solve. Include at minimum:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `challenge_id` | str | The challenge ID received as input |
-| `timestamp_utc` | str | ISO 8601 timestamp when the solve started |
-| `solution_status` | str | Final status (`"success"`, `"timeout"`, `"failed"`) |
-
-Additional fields (solve duration, method used, etc.) are encouraged.
+See the example solver and `enigma_challenges/solution_output.py` (or the comment block in the mock example Dockerfile) for the exact protocol.
 
 ## Example
 

@@ -30,7 +30,7 @@ Files written:
 
 import json
 import os
-import random
+import secrets
 
 import bittensor as bt
 
@@ -59,9 +59,9 @@ def breaking_rsa_setup(absolute_output_folder_location: str, configuration: dict
         )
 
     num_bits = int(difficulty)
-    seed = random.randint(0, 2**32 - 1)
+    seed = secrets.randbits(256)
 
-    bt.logging.info(f"🔐 Generating {num_bits}-bit semiprime (seed={seed})...")
+    bt.logging.info(f"🔐 Generating {num_bits}-bit semiprime (seed bit-length={seed.bit_length()})...")
     challenge = BreakingRSA(difficulty=num_bits, num_bits=num_bits)
     problem, verif_data = challenge.generate(seed)
     bt.logging.info(

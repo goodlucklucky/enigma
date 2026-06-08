@@ -154,6 +154,10 @@ def extract_artifacts(
     if not zipfile.is_zipfile(zip_path):
         return False, "Decoded payload is not a valid zip file."
 
+    def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
+        mode = (info.external_attr >> 16) & 0o170000
+        return mode == 0o120000
+
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             dest = os.path.abspath(output_dir)
@@ -161,7 +165,18 @@ def extract_artifacts(
                 member_path = os.path.normpath(os.path.join(dest, member.filename))
                 if not (member_path == dest or member_path.startswith(dest + os.sep)):
                     return False, f"Zip member '{member.filename}' escapes output directory."
+                if _is_zip_symlink(member):
+                    return False, f"Zip member '{member.filename}' is a symlink (not allowed)."
             zf.extractall(dest)
+            for root, dirs, files in os.walk(dest):
+                for name in list(dirs) + list(files):
+                    full = os.path.join(root, name)
+                    if os.path.islink(full):
+                        try:
+                            os.unlink(full)
+                        except Exception:
+                            pass
+                        return False, "Symlink found in extracted archive (not allowed)."
     except zipfile.BadZipFile as e:
         return False, f"Bad zip file: {e}"
     except Exception as e:

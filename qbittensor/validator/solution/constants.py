@@ -27,6 +27,11 @@ CONTAINER_SOLUTION_DIRNAME: str = "solution_artifacts"
 SOLUTION_LOG_FILENAME: str = "stdout.log"
 SOLUTION_OUTPUT_ZIP_FILENAME: str = "solution_artifacts.zip"
 
+# Docker build logs (captured with --progress=plain) are written here so they
+# can be included in the log package uploaded via log_data_key for diagnostics,
+# whether the build succeeded or failed.
+DOCKER_BUILD_LOG_FILENAME: str = "docker_build.log"
+
 # Paths inside the miner container (must match miner solution conventions).
 CONTAINER_CHALLENGE_INPUT_PATH: str = "/challenge_input"
 
@@ -51,10 +56,10 @@ CHALLENGE_INPUT_DIRNAME: str = "challenge_input_mount"
 
 # Docker run hardening for miner solution containers (see run_solution.docker_run_security_args).
 VALIDATOR_DOCKER_PIDS_LIMIT_ENV: str = "VALIDATOR_DOCKER_PIDS_LIMIT"
-VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT: str = "128"
+VALIDATOR_DOCKER_PIDS_LIMIT_DEFAULT: str = "1024"
 
 VALIDATOR_DOCKER_ULIMIT_NOFILE_ENV: str = "VALIDATOR_DOCKER_ULIMIT_NOFILE"
-VALIDATOR_DOCKER_ULIMIT_NOFILE_DEFAULT: str = "1024:1024"
+VALIDATOR_DOCKER_ULIMIT_NOFILE_DEFAULT: str = "4096:4096"
 
 VALIDATOR_DOCKER_CAP_DROP_ENV: str = "VALIDATOR_DOCKER_CAP_DROP"
 VALIDATOR_DOCKER_CAP_DROP_DEFAULT: str = "ALL"
@@ -66,7 +71,7 @@ VALIDATOR_DOCKER_READ_ONLY_ENV: str = "VALIDATOR_DOCKER_READ_ONLY"
 VALIDATOR_DOCKER_READ_ONLY_DEFAULT: bool = True
 
 VALIDATOR_DOCKER_TMPFS_ENV: str = "VALIDATOR_DOCKER_TMPFS"
-VALIDATOR_DOCKER_TMPFS_DEFAULT: str = "/tmp:noexec,nosuid,size=256m"
+VALIDATOR_DOCKER_TMPFS_DEFAULT: str = "/tmp:noexec,nosuid,size=1g"
 
 # Force non-root at ``docker run`` (overrides image USER/CMD default). Miner Dockerfiles
 # must define this account (``USER miner``) or pass ``uid[:gid]``. Empty disables.

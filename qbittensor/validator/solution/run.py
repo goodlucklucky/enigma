@@ -34,6 +34,11 @@ from .validate_zipfile import validate_zip
 from .extract_solution_code import unzip
 from .validate_code import validate_code
 from .build_docker_image import build_image
+from .constants import CONTAINER_OUTPUT_DIRNAME, DOCKER_BUILD_LOG_FILENAME
+from .validate_solution_output import (
+    establish_upload_locations_for_solution_data,
+    upload_logs_package,
+)
 from .validate_docker_image import reject_dockerfile, validate_image
 from .run_solution import prepare_challenge_input_mount_dir, run_image_detached
 from qbittensor.utils.solution_status import SolutionStatus
@@ -128,14 +133,14 @@ def run_solution_management(
         local_filepath = download_zip(url=download_url, folder_name=folder_name)
         if local_filepath is None:
             bt.logging.error("Failed to download zip file.")
-            raise InvalidSolutionError(message=ValidationErrors.TARBALL_DOWNLOAD_FAILED.value)
+            raise InvalidSolutionError(message=ValidationErrors.ZIP_DOWNLOAD_FAILED.value)
 
         # Validate zip
         bt.logging.info("Validating zip...")
         valid_zipfile = validate_zip(local_filepath)
         if not valid_zipfile:
             bt.logging.error("Zip validation failed.")
-            raise InvalidSolutionError(message=ValidationErrors.INVALID_TARBALL.value)
+            raise InvalidSolutionError(message=ValidationErrors.INVALID_ZIP.value)
 
         # Extract code from zip
         bt.logging.info("Extracting code from zip...")
@@ -154,11 +159,23 @@ def run_solution_management(
             bt.logging.error("Dockerfile policy validation failed.")
             raise InvalidSolutionError(message=ValidationErrors.INVALID_PROGRAM.value)
 
+        # Ensure the per-solution output directory exists early so that docker build
+        # logs (and later container stdout logs) can be written here and picked up
+        # by the log package upload (log_data_key) whether the build/run succeeds or fails.
+        output_dir = os.path.join(absolute_path_to_host_folder, CONTAINER_OUTPUT_DIRNAME)
+        os.makedirs(output_dir, exist_ok=True)
+        build_log_path = os.path.join(output_dir, DOCKER_BUILD_LOG_FILENAME)
+
         # Build docker image
         image_name = f"{solution_tag}_image".lower()  # Docker image names must be lowercase
         bt.logging.info(f"Building docker image: {image_name}")
-        # build_image now raises InvalidSolutionError with rich diagnostics on any failure
-        build_image(image_name=image_name, dockerfile_dir=f"{folder_name}/code")
+        # build_image now raises InvalidSolutionError with rich diagnostics on any failure.
+        # We pass build_log_path so the full --progress=plain output is persisted for upload.
+        build_image(
+            image_name=image_name,
+            dockerfile_dir=f"{folder_name}/code",
+            build_log_path=build_log_path,
+        )
 
         # Verify the image
         bt.logging.info(f"Validating docker image: {image_name}")
@@ -215,12 +232,47 @@ def run_solution_management(
                 solution_id=execution.solution_id,
                 solution_status=SolutionStatus.FAILED.value,
             )
+
+        log_data_key: str | None = None
         if platform_client:
             sub_for_report = execution.submission_id if execution is not None else (submission_id or "")
+
+            # Best-effort: if we have a workspace (created early), upload the logs package.
+            # This ensures docker build logs (and any other logs written before failure)
+            # are available via log_data_key even when the failure happened before the
+            # container ever ran (e.g. during build, code validation, etc.).
+            if absolute_path_to_host_folder:
+                try:
+                    logs_data = establish_upload_locations_for_solution_data(
+                        absolute_path_to_host_folder, "solution_logs", platform_client
+                    )
+                    if logs_data:
+                        uploaded = upload_logs_package(
+                            os.path.join(absolute_path_to_host_folder, CONTAINER_OUTPUT_DIRNAME),
+                            logs_data,
+                        )
+                        if uploaded:
+                            log_data_key = logs_data.id
+                            bt.logging.info(
+                                f"📤 Uploaded early failure logs package for submission {sub_for_report} "
+                                f"(log_data_key={log_data_key})"
+                            )
+                        else:
+                            bt.logging.warning("⚠️ Early failure logs package upload returned false")
+                    else:
+                        bt.logging.warning("⚠️ Could not establish upload location for early failure logs")
+                except Exception as upload_exc:
+                    bt.logging.warning(f"⚠️ Failed to upload early failure logs package: {upload_exc}")
+
+            bt.logging.info(
+                f"📤 Reporting Failure to platform (submission_id={sub_for_report}) "
+                f"with log_data_key={'present' if log_data_key else 'None'}"
+            )
             platform_client.report_submission_status(
                 submission_id=sub_for_report,
                 status="Failure",
                 reason=rich_reason[:2000],  # keep platform messages reasonable length
+                log_data_key=log_data_key,
             )
         else:
             bt.logging.warning("No platform_client provided — could not report failure status to platform")

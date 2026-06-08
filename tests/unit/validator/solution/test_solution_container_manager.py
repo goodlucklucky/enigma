@@ -179,7 +179,8 @@ class TestRun:
                 patch.object(container_manager, "_get_overdue_containers", return_value=["ctr1"]), \
                 patch.object(container_manager, "_terminate_overdue_containers") as mock_term, \
                 patch.object(container_manager.database_connection.db_query, "prune_old_solutions") as mock_prune, \
-                patch.object(container_manager, "_prune_containers") as mock_prune_ctrs:
+                patch.object(container_manager, "_prune_containers") as mock_prune_ctrs, \
+                patch.object(container_manager.docker_prune_timer, "check_timer") as mock_docker_prune:
 
             container_manager.run()
 
@@ -187,6 +188,7 @@ class TestRun:
             mock_term.assert_called_once_with(["ctr1"])
             mock_prune.assert_called_once()
             mock_prune_ctrs.assert_called_once()
+            mock_docker_prune.assert_called_once()
 
 
 class TestHandleCompletedSolutions:
@@ -445,3 +447,53 @@ class TestStartupRecovery:
         mock_rmtree.assert_not_called()
         container_manager.database_connection.db_query.mark_solution_cleaned.assert_called_once_with("orphan-p")
         container_manager.database_connection.db_query.update_solution_status_by_id.assert_called_once_with("orphan-p", SolutionStatus.FAILED.value)
+
+
+# =============================================================================
+# Docker resource prune (Option A conservative hygiene)
+# =============================================================================
+
+class TestDockerResourcePrune:
+    def test_prune_issues_correct_builder_and_image_commands(self, container_manager):
+        """Verify we run exactly the conservative Option A prune commands."""
+        with patch("subprocess.run") as mock_run:
+            # Make the commands "succeed" and return some typical docker output
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="Deleted build cache objects:\nTotal reclaimed space: 1.23GB\n",
+                stderr="",
+            )
+
+            container_manager._prune_docker_resources()
+
+            # Should have been called twice (builder then image)
+            assert mock_run.call_count == 2
+
+            calls = mock_run.call_args_list
+            builder_cmd = calls[0].args[0]
+            image_cmd = calls[1].args[0]
+
+            assert builder_cmd[:3] == ["docker", "builder", "prune"]
+            assert "-f" in builder_cmd
+            assert any(arg.startswith("--filter=until=") or arg == "--filter" for arg in builder_cmd)
+            # Check that our configured until value appears
+            assert any("48h" in str(arg) for arg in builder_cmd)
+
+            assert image_cmd[:3] == ["docker", "image", "prune"]
+            assert "-a" in image_cmd
+            assert "-f" in image_cmd
+            assert any("72h" in str(arg) for arg in image_cmd)
+
+    def test_prune_is_resilient_to_failures(self, container_manager):
+        """A failing prune must not raise or break the caller."""
+        with patch("subprocess.run", side_effect=Exception("docker daemon sad")):
+            # Should not propagate
+            container_manager._prune_docker_resources()
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="some error")
+            container_manager._prune_docker_resources()  # still must not raise
+
+    def test_prune_timeout_is_handled(self, container_manager):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["docker"], timeout=1)):
+            container_manager._prune_docker_resources()  # must not raise

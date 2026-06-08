@@ -27,11 +27,17 @@ RUN git clone https://gitlab.inria.fr/zimmerma/ecm.git /tmp/ecm-src \
 # Install Python dependencies
 RUN pip install --no-cache-dir gmpy2
 
+# Create non-root user for runtime (required by validator/workbench hardening:
+# --user + read-only rootfs). Solutions must be able to run as this user.
+# Use /tmp for any runtime scratch (the only writable area under --read-only).
+RUN useradd -r -s /sbin/nologin -d /app -U miner
+
 WORKDIR /app
-COPY enigma_challenges /app/enigma_challenges/
-COPY breaking_rsa.py /app/
+COPY --chown=miner:miner enigma_challenges /app/enigma_challenges/
+COPY --chown=miner:miner breaking_rsa.py /app/
 
 ENV MSIEVE_BIN=/usr/local/bin/msieve
 ENV ECM_BIN=/usr/local/bin/ecm
 
+USER miner
 ENTRYPOINT ["python", "/app/breaking_rsa.py"]

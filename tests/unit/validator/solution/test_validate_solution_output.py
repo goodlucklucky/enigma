@@ -125,7 +125,8 @@ class TestValidateSolutionCorePaths:
 
         db = Mock()
         # Pass all required stable ids explicitly
-        with patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
+        with patch("qbittensor.validator.solution.validate_solution_output.upload_logs_package", return_value=True), \
+                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(True, None)):
 
             status = validate_solution(
@@ -153,7 +154,8 @@ class TestValidateSolutionCorePaths:
         platform_client.report_submission_status.return_value = True
 
         db = Mock()
-        with patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
+        with patch("qbittensor.validator.solution.validate_solution_output.upload_logs_package", return_value=True), \
+                patch("qbittensor.validator.solution.validate_solution_output.upload_zip_to_platform", return_value=True), \
                 patch("qbittensor.validator.solution.validate_solution_output.validate_output", return_value=(False, "Output validation failed")):
 
             status = validate_solution(

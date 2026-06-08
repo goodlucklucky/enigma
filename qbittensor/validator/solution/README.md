@@ -1,12 +1,9 @@
 # Solution Management
 This outlines the process of downloading and running solutions, validating the output, and uploading the result. All of these steps should be run in a `subprocess`.
 
-## Notes
-- The .tar file MUST have specific format. Users must .tar their files together, they must not put their files into a folder then .tar that folder. We should have a '.tar test` feature on the website during upload so that we can verify their solution .tar is uploaded in the correct format!
-
 ## Steps
 ### 1. Download Solution
-- Download a tarball using the URL in the synapse
+- Download a zip using the URL in the synapse
 
 ### 2. Validate Tarball
 - Security Checks

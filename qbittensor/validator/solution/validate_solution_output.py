@@ -24,7 +24,12 @@ import requests
 import bittensor as bt
 from qbittensor.dto.challenge import ChallengeSubmissionVerifyUploadAddressResponse
 from qbittensor.utils.solution_status import SolutionStatus
-from qbittensor.validator.solution.constants import CONTAINER_OUTPUT_DIRNAME, CONTAINER_SOLUTION_DIRNAME
+from qbittensor.validator.solution.constants import (
+    CONTAINER_OUTPUT_DIRNAME,
+    CONTAINER_SOLUTION_DIRNAME,
+    DOCKER_BUILD_LOG_FILENAME,
+    SOLUTION_LOG_FILENAME,
+)
 from qbittensor.validator.solution.solution_validations.solution_validator import validate_output
 from qbittensor.database.db_connection import DBConnection
 from qbittensor.utils.services.challenges import ChallengesClient
@@ -66,12 +71,12 @@ def validate_solution(
         bt.logging.info("❌ Could not establish upload locations for solution output and logs")
         return SolutionStatus.FAILED_UPLOAD.value
 
-    bt.logging.info("📤 Uploading container stdout logs to platform")
-    logs_uploaded = upload_zip_to_platform(container_output_path, logs_data, "stdout.log")
+    bt.logging.info("📤 Uploading validator logs package (docker build + container stdout) to platform")
+    logs_uploaded = upload_logs_package(container_output_path, logs_data)
     if logs_uploaded:
-        bt.logging.info("✅ Logs upload completed successfully")
+        bt.logging.info("✅ Logs package upload completed successfully")
     else:
-        bt.logging.warning("⚠️ Logs upload did not succeed (will still attempt to report status)")
+        bt.logging.warning("⚠️ Logs package upload did not succeed (will still attempt to report status)")
 
     solution_status = perform_solution_output_validation(
         container_output_path,
@@ -265,3 +270,94 @@ def upload_zip_to_platform(
                 os.unlink(zip_path)
             except OSError:
                 pass
+
+
+def upload_logs_package(
+    container_output_path: str,
+    platform_data: ChallengeSubmissionVerifyUploadAddressResponse,
+) -> bool:
+    """
+    Create a zip containing the validator-produced logs for this submission and
+    upload it using the provided presigned platform upload slot.
+
+    The package intentionally includes:
+      - docker_build.log (always written with --progress=plain before/during build)
+      - stdout.log (container run logs, if the solution container produced any)
+      - Any *diagnostics*.txt files (e.g. extraction failures)
+
+    This becomes the artifact referenced by ``log_data_key`` so that build logs
+    and run logs are available for diagnostics on both success and failure paths.
+    """
+    import tempfile
+    import zipfile
+
+    bt.logging.info("📤 Building logs package (docker_build.log + stdout.log + diagnostics)...")
+
+    if not os.path.isdir(container_output_path):
+        bt.logging.error(
+            f"❌ Unable to build logs package: output path is not a directory '{container_output_path}'"
+        )
+        return False
+
+    # Collect candidate log files (order is not critical)
+    candidates = [
+        DOCKER_BUILD_LOG_FILENAME,
+        SOLUTION_LOG_FILENAME,
+    ]
+    # Also pick up any extraction or other diagnostics
+    try:
+        for name in os.listdir(container_output_path):
+            if name.endswith("_diagnostics.txt") or name == "extraction_diagnostics.txt":
+                if name not in candidates:
+                    candidates.append(name)
+    except OSError:
+        pass
+
+    log_files_to_zip: list[tuple[str, str]] = []  # (abs_path, arcname)
+    for fname in candidates:
+        fpath = os.path.join(container_output_path, fname)
+        if os.path.isfile(fpath):
+            log_files_to_zip.append((fpath, fname))
+
+    if not log_files_to_zip:
+        bt.logging.warning(
+            f"⚠️ No log files found under '{container_output_path}' to upload as logs package "
+            f"(looked for {candidates})"
+        )
+        # Still attempt to create an empty-ish diagnostic note? For now, treat as nothing to upload.
+        return False
+
+    # Create a temp zip containing only the selected log files at the root of the archive
+    zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="validator_logs_")
+    os.close(zip_fd)
+    try:
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for abs_path, arcname in log_files_to_zip:
+                zf.write(abs_path, arcname=arcname)
+
+        with open(zip_path, "rb") as zip_file_obj:
+            response = requests.put(
+                platform_data.url,
+                data=zip_file_obj,
+                headers={"Content-Type": "application/zip"},
+                timeout=60,
+            )
+
+        if response.status_code < 200 or response.status_code > 299:
+            bt.logging.error(
+                f"❌ Failed to upload logs package. Status code: {response.status_code}, Response: {response.text}"
+            )
+            return False
+
+        names = ", ".join(arc for _, arc in log_files_to_zip)
+        bt.logging.info(f"✅ Successfully uploaded logs package ({names}) to platform (id={platform_data.id})")
+        return True
+    except Exception as e:
+        bt.logging.error(f"❌ Exception during logs package upload: {e}")
+        return False
+    finally:
+        try:
+            if os.path.isfile(zip_path):
+                os.unlink(zip_path)
+        except OSError:
+            pass

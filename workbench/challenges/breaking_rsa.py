@@ -15,7 +15,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import random
+import secrets
 from qbittensor.challenges.breaking_rsa import (
     BreakingRSA, Problem, Solution, Verif,
 )
@@ -24,7 +24,7 @@ from qbittensor.challenges.breaking_rsa import (
 def generate_breaking_rsa(num_bits: int = 300, difficulty: int = 1, seed: int | None = None):
     """Generate a Breaking RSA challenge. Returns (problem, verif, seed_used)."""
     if seed is None:
-        seed = random.randint(0, 2**32 - 1)
+        seed = secrets.randbits(256)
     challenge = BreakingRSA(difficulty=difficulty, num_bits=num_bits)
     problem, verif = challenge.generate(seed)
     return problem, verif, seed

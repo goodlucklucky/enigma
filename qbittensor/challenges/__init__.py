@@ -37,7 +37,7 @@ class Challenge[P, S, V](ABC):
     information to be retained for verification.
 
     >>> from dataclasses import dataclass
-    >>> import random
+    >>> import secrets
     >>>
     >>> @dataclass
     >>> class Problem:
@@ -62,7 +62,7 @@ class Challenge[P, S, V](ABC):
     >>> solver = MySolver(...)
     >>>
     >>> # solve the challenge!
-    >>> seed = random.randrange(0, 2 ** 32 - 1)
+    >>> seed = secrets.randbits(256)
     >>> (problem, secrets) = challenge.generate(seed)
     >>> solution = solver.solve(problem)
     >>> # verify solution
@@ -113,7 +113,7 @@ class Solver[P, S](ABC):
     problem and solution instances; they should be made concrete for a child
     class implementing a solver for a particular challenge.
 
-    >>> import random
+    >>> import secrets
     >>>
     >>> class MySolver(Solver[Problem, Solution]):
     >>>     # ...
@@ -126,7 +126,7 @@ class Solver[P, S](ABC):
     >>> solver = MySolver(...)
     >>>
     >>> # solve the challenge!
-    >>> seed = random.randrange(0, 2 ** 32 - 1)
+    >>> seed = secrets.randbits(256)
     >>> (problem, secrets) = challenge.generate(seed)
     >>> solution = solver.solve(problem)
     >>> # verify solution

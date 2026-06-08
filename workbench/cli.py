@@ -32,7 +32,7 @@ from workbench.runner.docker_runner import (
     check_docker, build_image, run_container, DEFAULT_WALL_TIME,
 )
 from workbench.runner.direct_runner import find_entry_point, run_direct
-from workbench.validator import validate_output
+from workbench.validator import validate_output, validate_dockerfile_security
 from workbench.verifier import verify_breaking_rsa, verify_mock
 from workbench.report import print_report
 
@@ -53,6 +53,22 @@ def _warn_non_default(wall_time, allow_network):
         for w in warnings:
             click.echo(w)
         click.echo("Test with default settings before submitting to the validator.\n")
+
+
+def _preflight_dockerfile(solution: str) -> None:
+    """Check Dockerfile presence (case-insensitive) and platform security policy.
+
+    Fails fast with a clear message before attempting docker build, so the
+    developer experience matches what the validator will enforce.
+    """
+    sec = validate_dockerfile_security(solution)
+    if not sec.passed:
+        if "No Dockerfile" in (sec.message or ""):
+            click.echo(f"Error: No Dockerfile found in {solution}. Docker mode requires a Dockerfile.")
+        else:
+            click.echo(f"Error: Dockerfile rejected by platform security policy: {sec.message}")
+            click.echo("This solution will be rejected by the validator. Fix the Dockerfile and retest.")
+        sys.exit(1)
 
 
 @click.group()
@@ -84,9 +100,7 @@ def test_breaking_rsa(difficulty, solution, mode, seed, wall_time, allow_network
         if not check_docker():
             click.echo("Error: Docker is not available. Install Docker or use --mode direct.")
             sys.exit(1)
-        if not os.path.exists(os.path.join(solution, "Dockerfile")):
-            click.echo(f"Error: No Dockerfile found in {solution}. Docker mode requires a Dockerfile.")
-            sys.exit(1)
+        _preflight_dockerfile(solution)
         _warn_non_default(wall_time, allow_network)
 
     # Generate challenge — difficulty is the bit-width
@@ -183,9 +197,7 @@ def test_mock(difficulty, solution, mode, private_key, public_key, wall_time, al
         if not check_docker():
             click.echo("Error: Docker is not available. Install Docker or use --mode direct.")
             sys.exit(1)
-        if not os.path.exists(os.path.join(solution, "Dockerfile")):
-            click.echo(f"Error: No Dockerfile found in {solution}. Docker mode requires a Dockerfile.")
-            sys.exit(1)
+        _preflight_dockerfile(solution)
         _warn_non_default(wall_time, allow_network)
 
     # Resolve private key
