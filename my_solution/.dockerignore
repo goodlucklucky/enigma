@@ -1,6 +1,5 @@
 .cache
 .git
 .gitattributes
-README.md
-local_test.py
+__pycache__
 *.log
