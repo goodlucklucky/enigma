@@ -105,7 +105,7 @@ class Validator(BaseValidatorNeuron):
             telemetry_service=self.telemetry_service,
         )
         self.solution_container_manager: SolutionContainerManager = SolutionContainerManager(
-            self.platform_client, self.database_connection, VALIDATOR_LABEL
+            self.platform_client, self.database_connection, VALIDATOR_LABEL, self.telemetry_service
         )
 
         self.cross_check: SolutionCrossChecker = SolutionCrossChecker(

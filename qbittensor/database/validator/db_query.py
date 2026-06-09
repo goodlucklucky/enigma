@@ -24,6 +24,7 @@ from sqlalchemy.dialects.sqlite import insert
 from ..base_query import BaseDBQuery
 from .db_models import ChallengeSolution, MinerMaintenanceIncentive
 from qbittensor.protocol import MinerSubmissionStatus
+from qbittensor.utils.solution_status import SolutionStatus
 
 # SQLite datetime() does not support "weeks" modifier; use equivalent day count.
 OLDEST_ALLOWED_TIMESTAMP = "-21 days"  # Used to prune solutions that are older than 3 weeks.
@@ -372,6 +373,57 @@ class DBQuery(BaseDBQuery):
         except Exception as e:
             bt.logging.error(f"Error querying uncleaned solutions: {e}")
             return []
+
+    def get_running_solutions(self):
+        """Get ChallengeSolution records that are expected to be running (status=RUNNING, not cleaned).
+        These are the ones the watchdog should be monitoring for completion or timeout.
+        """
+        try:
+            with self._managed_session(read_only=True) as session:
+                return (
+                    session.query(ChallengeSolution)
+                    .filter(
+                        ChallengeSolution.solution_status == SolutionStatus.RUNNING.value,
+                        ChallengeSolution.cleaned.is_(False),
+                    )
+                    .order_by(ChallengeSolution.created_at.desc())
+                    .all()
+                )
+        except Exception as e:
+            bt.logging.error(f"Error querying running solutions: {e}")
+            return []
+
+    def get_stale_pending_or_running_solutions(self):
+        """Return RUNNING (not cleaned) + PENDING (not cleaned) rows.
+        Used by the watchdog reconciliation scan to catch rows whose containers
+        have been cleaned up externally or via other paths, so we can force them
+        to FAILED and prevent them from hanging as RUNNING forever.
+        """
+        results = []
+        try:
+            with self._managed_session(read_only=True) as session:
+                running = (
+                    session.query(ChallengeSolution)
+                    .filter(
+                        ChallengeSolution.solution_status == SolutionStatus.RUNNING.value,
+                        ChallengeSolution.cleaned.is_(False),
+                    )
+                    .all()
+                )
+                results.extend(running)
+
+                pending = (
+                    session.query(ChallengeSolution)
+                    .filter(
+                        ChallengeSolution.solution_status == SolutionStatus.PENDING.value,
+                        ChallengeSolution.cleaned.is_(False),
+                    )
+                    .all()
+                )
+                results.extend(pending)
+        except Exception as e:
+            bt.logging.error(f"Error querying stale/pending/running solutions: {e}")
+        return results
 
     def remove_solution_by_id(self, solution_id: str) -> bool:
         """Remove a challenge solution record by its primary id."""

@@ -15,7 +15,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-from typing import List
+from typing import Any, List
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -26,6 +26,7 @@ from qbittensor.database.db_connection import DBConnection
 from qbittensor.validator.solution.run_solution import extract_stdout_output
 from qbittensor.validator.solution.validate_solution_output import validate_solution
 from qbittensor.utils.services.challenges import ChallengesClient
+from qbittensor.utils.services.telemetry import TelemetryService
 from qbittensor.constants import (
     SOLUTION_CONTAINER_MANAGER_TIMEOUT,
     MAX_SOLUTIONS,
@@ -94,7 +95,13 @@ def is_docker_available() -> bool:
 
 class SolutionContainerManager:
 
-    def __init__(self, platform_client: ChallengesClient, database_connection: DBConnection, validator_label: str):
+    def __init__(
+        self,
+        platform_client: ChallengesClient,
+        database_connection: DBConnection,
+        validator_label: str,
+        telemetry_service: TelemetryService | None = None,
+    ):
         self.platform_client = platform_client
         self.timer: Timer = Timer(timeout=SOLUTION_CONTAINER_MANAGER_TIMEOUT, run=self.run, run_on_start=True)
         self.docker_prune_timer: Timer = Timer(
@@ -104,6 +111,7 @@ class SolutionContainerManager:
         )
         self.database_connection = database_connection
         self.LABEL = validator_label
+        self.telemetry_service: TelemetryService | None = telemetry_service
 
         # Early Docker availability check (non-fatal, but very loud)
         is_docker_available()
@@ -120,17 +128,34 @@ class SolutionContainerManager:
 
         number_of_running_solutions: int = self._get_number_of_running_solutions()
         bt.logging.info(f"🏗️ Found {number_of_running_solutions} containers still running")
+        if self.telemetry_service:
+            self.telemetry_service.record_event(
+                "solution_containers_running",
+                value=number_of_running_solutions,
+                attributes={"source": "docker_ps"},
+            )
 
         overdue_containers: List[str] = self._get_overdue_containers()
         if len(overdue_containers) > 0:
             bt.logging.info(f"⏰ Found {len(overdue_containers)} overdue containers to terminate")
+            if self.telemetry_service:
+                self.telemetry_service.record_event(
+                    "solution_containers_overdue_found",
+                    value=len(overdue_containers),
+                )
             self._terminate_overdue_containers(overdue_containers)
         else:
             bt.logging.debug("No overdue containers found this check")
+            if self.telemetry_service:
+                self.telemetry_service.record_event("solution_containers_overdue_found", value=0)
+
+        self._report_db_expected_running_telemetry()
 
         self.database_connection.db_query.prune_old_solutions()
 
         self._prune_containers()
+
+        self._reconcile_stale_db_rows()
 
         # Periodic conservative Docker disk cleanup (build cache + old unused images).
         # Throttled by its own timer (see DOCKER_RESOURCE_PRUNE_INTERVAL).
@@ -140,6 +165,11 @@ class SolutionContainerManager:
         """Find completed solution containers, validate their output, and report results to the platform"""
         completed_containers = self._find_completed_solutions()
         bt.logging.info(f"✅ Found {len(completed_containers)} completed containers")
+        if self.telemetry_service:
+            self.telemetry_service.record_event(
+                "solution_containers_completed_found",
+                value=len(completed_containers),
+            )
         if len(completed_containers) == 0:
             return
 
@@ -194,6 +224,20 @@ class SolutionContainerManager:
             self.database_connection.db_query.update_solution_status_by_id(
                 info.id, solution_status
             )
+
+            if self.telemetry_service:
+                outcome = "success" if solution_status == SolutionStatus.SUCCESS.value else "failure"
+                self.telemetry_service.record_event(
+                    "solution_execution_completed",
+                    value=1,
+                    miner_hotkey=info.execution.miner_hotkey if hasattr(info, "execution") else None,
+                    attributes={
+                        "submission_id": info.submission_id,
+                        "solution_id": getattr(info, "id", None) or getattr(info.execution, "solution_id", None) if hasattr(info, "execution") else None,
+                        "outcome": outcome,
+                        "status": solution_status,
+                    },
+                )
 
         self._clean_up_solutions(solutions)
 
@@ -542,6 +586,143 @@ class SolutionContainerManager:
             )
             return timedelta(0)
 
+    def _parse_docker_started_at(self, started_at: str) -> datetime:
+        """Parse Docker's StartedAt timestamp (e.g. 2024-02-21T12:34:56.123456789Z) into aware UTC datetime."""
+        s = started_at
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        if '.' in s:
+            # Truncate fractional seconds to microseconds (6 digits)
+            date_part, rest = s.split('.', 1)
+            tz_index = rest.find('+') if '+' in rest else rest.find('-')
+            if tz_index != -1:
+                frac = rest[:tz_index]
+                tz = rest[tz_index:]
+            else:
+                frac = rest
+                tz = ''
+            frac = (frac + '000000')[:6]
+            s = f"{date_part}.{frac}{tz}"
+        return datetime.fromisoformat(s)
+
+    def _report_db_expected_running_telemetry(self) -> None:
+        """Report telemetry for solutions the DB expects to still be running (for observability
+        without needing full validator logs). Emits a count + per-solution events with runtime.
+        """
+        if not self.telemetry_service:
+            return
+        try:
+            running = self.database_connection.db_query.get_running_solutions()
+            now = datetime.now(timezone.utc)
+
+            self.telemetry_service.record_event(
+                "solution_containers_expected_running",
+                value=len(running),
+                attributes={"source": "db"},
+            )
+
+            for sol in running:
+                # Prefer DB created_at for age (when we started tracking)
+                db_age = 0.0
+                if sol.created_at:
+                    ca = sol.created_at
+                    if ca.tzinfo is None:
+                        ca = ca.replace(tzinfo=timezone.utc)
+                    db_age = (now - ca).total_seconds()
+
+                runtime_seconds = db_age
+                container_name = sol.container_name or ""
+                # If we have a real container, try to get precise StartedAt from Docker (like overdue logic)
+                if container_name and not str(container_name).startswith("pending:"):
+                    try:
+                        res = subprocess.run(
+                            ["docker", "inspect", "--format", "{{.State.StartedAt}}", container_name],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                        )
+                        raw = res.stdout.strip()
+                        if raw:
+                            started = self._parse_docker_started_at(raw)
+                            runtime_seconds = (now - started).total_seconds()
+                    except Exception:
+                        pass  # fall back to db_age
+
+                attrs: dict[str, Any] = {
+                    "solution_id": sol.id,
+                    "submission_id": sol.submission_id,
+                    "tx_hash": sol.tx_hash,
+                    "miner_hotkey": sol.miner_hotkey,
+                    "challenge_milestone_id": sol.challenge_milestone_id,
+                    "container_name": container_name,
+                    "max_runtime_seconds": sol.max_solution_runtime_seconds,
+                    "db_age_seconds": db_age,
+                }
+                self.telemetry_service.record_event(
+                    "solution_container_running",
+                    value=runtime_seconds,
+                    miner_hotkey=sol.miner_hotkey,
+                    attributes=attrs,
+                )
+        except Exception as e:
+            bt.logging.warning(f"Failed to report DB expected running telemetry: {e}")
+
+    def _finalize_solution_terminal(
+        self,
+        sol,
+        status: str = SolutionStatus.FAILED.value,
+        reason: str = "Solution terminated (container lost, overdue, or cleaned up)",
+        attempt_extraction: bool = False,
+    ) -> None:
+        """Ensures that whenever we decide a previously in-flight (RUNNING/PENDING) solution
+        is terminal because its container is gone or was deliberately killed, we always:
+        - Update the local DB status
+        - Mark it cleaned
+        - Report Failure to the platform (with reason)
+        - Record telemetry
+        """
+        if not sol:
+            return
+
+        if (attempt_extraction
+                and getattr(sol, "container_name", None)
+                and not str(sol.container_name).startswith("pending:")
+                and getattr(sol, "absolute_path_to_solution", None)):
+            try:
+                extract_stdout_output(sol.container_name, sol.absolute_path_to_solution)
+            except Exception as e:
+                bt.logging.warning(f"Failed to extract output during terminal finalize for {getattr(sol, 'id', '?')}: {e}")
+
+        try:
+            self.database_connection.db_query.update_solution_status_by_id(sol.id, status)
+            self.database_connection.db_query.mark_solution_cleaned(sol.id)
+        except Exception as e:
+            bt.logging.error(f"Failed to update DB status/cleaned for terminal solution {getattr(sol, 'id', '?')}: {e}")
+
+        if self.platform_client and getattr(sol, "submission_id", None):
+            try:
+                self.platform_client.report_submission_status(
+                    submission_id=sol.submission_id,
+                    status="Failure",
+                    reason=reason,
+                )
+                bt.logging.info(f"📤 Reported Failure to platform for submission {sol.submission_id} (reason: {reason})")
+            except Exception as e:
+                bt.logging.warning(f"⚠️ Platform report failed for {sol.submission_id}: {e}")
+
+        if self.telemetry_service:
+            self.telemetry_service.record_event(
+                "solution_terminal_finalized",
+                value=1,
+                miner_hotkey=getattr(sol, "miner_hotkey", None),
+                attributes={
+                    "solution_id": getattr(sol, "id", None),
+                    "submission_id": getattr(sol, "submission_id", None),
+                    "status": status,
+                    "reason": reason,
+                },
+            )
+
     def _get_overdue_containers(self) -> List[str]:
         """
         Get all of the containers that match our solution label that have been running for too long and need to be terminated
@@ -549,25 +730,6 @@ class SolutionContainerManager:
         overdue: List[str] = []
         running = self._get_running_containers()
         now = datetime.now(timezone.utc)
-
-        def _parse_started_at(started_at: str) -> datetime:
-            # Docker returns e.g. 2024-02-21T12:34:56.123456789Z
-            s = started_at
-            if s.endswith('Z'):
-                s = s[:-1] + '+00:00'
-            if '.' in s:
-                # Truncate fractional seconds to microseconds (6 digits)
-                date_part, rest = s.split('.', 1)
-                tz_index = rest.find('+') if '+' in rest else rest.find('-')
-                if tz_index != -1:
-                    frac = rest[:tz_index]
-                    tz = rest[tz_index:]
-                else:
-                    frac = rest
-                    tz = ''
-                frac = (frac + '000000')[:6]
-                s = f"{date_part}.{frac}{tz}"
-            return datetime.fromisoformat(s)
 
         for cid in running:
             if not self._container_has_validator_label(cid):
@@ -585,7 +747,7 @@ class SolutionContainerManager:
                 started_at_raw = res.stdout.strip()
                 if not started_at_raw:
                     continue
-                started_at = _parse_started_at(started_at_raw)
+                started_at = self._parse_docker_started_at(started_at_raw)
                 runtime = now - started_at
                 max_runtime = self._get_max_runtime_for_container(cid)
                 if runtime > max_runtime:
@@ -614,6 +776,7 @@ class SolutionContainerManager:
             # and its image_id. No fallback needed; all containers created after labeling change
             # will have the solution_id label.
             stable = self._get_stable_keys_from_container(cid)
+            sol = None
             db_image = None
             if stable.get("solution_id"):
                 sol = self.database_connection.db_query.get_challenge_solution_by_id(stable["solution_id"])
@@ -637,12 +800,28 @@ class SolutionContainerManager:
                     bt.logging.warning(f"⚠️ Stop may have failed for {cid}: {(stop_result.stderr or stop_result.stdout).strip()}")
             except Exception as e:
                 bt.logging.error(f"❌ Error stopping container {cid}: {e}")
+
+            if sol and getattr(sol, "absolute_path_to_solution", None):
+                try:
+                    extract_stdout_output(cid, sol.absolute_path_to_solution)
+                    bt.logging.info(f"📦 Attempted output extraction for overdue container {cid} (logs/artifacts captured locally if available)")
+                except Exception as e:
+                    bt.logging.warning(f"⚠️ Could not extract output for overdue container {cid}: {e}")
+
             try:
                 bt.logging.info(f"🗑️ Removing overdue container {cid}")
                 rm_result = subprocess.run(["docker", "rm", "-v", cid], check=False, capture_output=True, text=True)
                 if rm_result.returncode == 0:
                     bt.logging.info(f"🗑️ Removed overdue container {cid}")
                     terminated += 1
+
+                    # Delegate to central helper — guarantees local DB + platform report are done together
+                    self._finalize_solution_terminal(
+                        sol,
+                        status=SolutionStatus.FAILED.value,
+                        reason=f"Validator terminated container as overdue (exceeded max_solution_runtime_seconds={getattr(sol, 'max_solution_runtime_seconds', '?')})",
+                        attempt_extraction=False,  # extraction was already attempted above
+                    )
                 else:
                     bt.logging.warning(f"⚠️ Failed to remove container {cid}: {(rm_result.stderr or rm_result.stdout).strip()}")
             except Exception as e:
@@ -660,6 +839,62 @@ class SolutionContainerManager:
                     bt.logging.error(f"❌ Error removing image {image_to_remove}: {e}")
 
         bt.logging.info(f"🛑 Overdue termination complete: {terminated} containers terminated, {images_removed} images removed")
+
+    def _reconcile_stale_db_rows(self) -> None:
+        """Safety net / periodic scan for DB rows that are still RUNNING (or PENDING) but whose
+        container no longer exists in Docker (was pruned, externally cleaned, or the overdue
+        path didn't fully transition the row for some reason).
+        """
+        if not self.database_connection:
+            return
+        try:
+            candidates = self.database_connection.db_query.get_stale_pending_or_running_solutions() or []
+
+            now = datetime.now(timezone.utc)
+            for sol in candidates:
+                if not sol or not getattr(sol, "id", None):
+                    continue
+
+                container_name = getattr(sol, "container_name", "") or ""
+                is_pending_placeholder = container_name.startswith("pending:") if container_name else True
+
+                container_missing = True
+                if not is_pending_placeholder and container_name:
+                    try:
+                        res = subprocess.run(
+                            ["docker", "inspect", "--format", "{{.State.Status}}", container_name],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        if res.returncode == 0 and res.stdout.strip():
+                            container_missing = False
+                    except Exception:
+                        container_missing = True
+
+                if container_missing:
+                    age = 0.0
+                    if getattr(sol, "updated_at", None):
+                        ua = sol.updated_at
+                        if getattr(ua, "tzinfo", None) is None:
+                            ua = ua.replace(tzinfo=timezone.utc)
+                        age = (now - ua).total_seconds()
+
+                    # Only reconcile if it's been "missing" for a while (avoid racing a just-started one)
+                    if age > 300:  # 5 minutes grace
+                        bt.logging.info(
+                            f"🧹 Reconciling stale {sol.solution_status} solution {sol.id} "
+                            f"(container {container_name or 'N/A'} no longer present, age={int(age)}s) → FAILED + cleaned"
+                        )
+                        # Delegate to central helper
+                        self._finalize_solution_terminal(
+                            sol,
+                            status=SolutionStatus.FAILED.value,
+                            reason="Container no longer exists (cleaned up by validator or externally); reconciled by watchdog to prevent stuck RUNNING state.",
+                            attempt_extraction=True,
+                        )
+        except Exception as e:
+            bt.logging.warning(f"Stale DB row reconciliation scan failed: {e}")
 
     def _prune_containers(self) -> None:
         """Remove exited containers with our label and their images when image names match this validator."""
@@ -699,6 +934,21 @@ class SolutionContainerManager:
                     if rm_result.returncode == 0:
                         bt.logging.info(f"🗑️ Pruned container {cid}")
                         pruned_containers += 1
+
+                        try:
+                            stable = self._get_stable_keys_from_container(cid)
+                            if stable.get("solution_id"):
+                                sol = self.database_connection.db_query.get_challenge_solution_by_id(stable["solution_id"])
+                                if sol and sol.solution_status in (SolutionStatus.RUNNING.value, SolutionStatus.PENDING.value):
+                                    # Delegate to central helper (adds platform report that was previously missing)
+                                    self._finalize_solution_terminal(
+                                        sol,
+                                        status=SolutionStatus.FAILED.value,
+                                        reason="Prune safety: container was exited but DB row was still in-flight",
+                                        attempt_extraction=False,
+                                    )
+                        except Exception as e:
+                            bt.logging.debug(f"Prune reconciliation note for {cid}: {e}")
                     else:
                         bt.logging.warning(f"⚠️ Failed to prune container {cid}: {(rm_result.stderr or rm_result.stdout).strip()}")
                 except Exception as e:
@@ -827,13 +1077,22 @@ class SolutionContainerManager:
                     f"⚠️ Refusing to remove orphan image {image_ref}; name does not match validator label prefix"
                 )
 
-            # Remove any stale DB row preferring by solution id from labels.
-            # (We no longer fall back to container_name lookup; for pre-labeling orphan
-            # containers we simply leave any stale DB row -- it will be aged out by prune
-            # or is harmless. This keeps all DB mutations by stable id only.)
+            # If we have a solution_id from labels, use the central finalizer so we get
+            # consistent DB status + platform report (prefer marking FAILED over raw delete
+            # for audit/history). Only fall back to remove if we couldn't resolve a sol row.
             stable = self._get_stable_keys_from_container(container_name)
             if stable.get("solution_id"):
-                self.database_connection.db_query.remove_solution_by_id(stable["solution_id"])
+                sol = self.database_connection.db_query.get_challenge_solution_by_id(stable["solution_id"])
+                if sol:
+                    self._finalize_solution_terminal(
+                        sol,
+                        status=SolutionStatus.FAILED.value,
+                        reason="Orphaned container cleaned up (no associated workspace found)",
+                        attempt_extraction=False,
+                    )
+                    return  # finalize already did DB work
+                else:
+                    self.database_connection.db_query.remove_solution_by_id(stable["solution_id"])
             else:
                 bt.logging.debug(
                     f"No solution_id label on orphan container {container_name}; "
@@ -892,6 +1151,15 @@ class SolutionContainerManager:
                 cleaned_something = False
 
                 container_name = sol.container_name
+                if container_name and str(container_name).startswith("pending:"):
+                    if sol.absolute_path_to_solution and not os.path.exists(sol.absolute_path_to_solution):
+                        bt.logging.info(f"    FS path already gone for {sol.id}, marking cleaned")
+                        cleaned_something = True
+                    if cleaned_something:
+                        self.database_connection.db_query.mark_solution_cleaned(sol.id)
+                        recovered += 1
+                    continue
+
                 state = self._get_container_state(container_name) if container_name else None
 
                 if container_name and state == "running" and self._container_has_validator_label(container_name):
@@ -945,11 +1213,15 @@ class SolutionContainerManager:
 
                 # Mark cleaned for the orphaned/lost case; also fail in-flight statuses
                 if cleaned_something:
-                    self.database_connection.db_query.mark_solution_cleaned(sol.id)
                     if sol.solution_status in (SolutionStatus.RUNNING.value, SolutionStatus.PENDING.value):
-                        self.database_connection.db_query.update_solution_status_by_id(
-                            sol.id, SolutionStatus.FAILED.value
+                        self._finalize_solution_terminal(
+                            sol,
+                            status=SolutionStatus.FAILED.value,
+                            reason="Validator recovered lost in-flight solution on startup (container no longer present)",
+                            attempt_extraction=True,
                         )
+                    else:
+                        self.database_connection.db_query.mark_solution_cleaned(sol.id)
                     recovered += 1
                 else:
                     bt.logging.warning(f"    Could not clean anything for {sol.id}, leaving uncleaned for now")

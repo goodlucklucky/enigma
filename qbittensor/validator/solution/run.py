@@ -232,6 +232,7 @@ def run_solution_management(
                 solution_id=execution.solution_id,
                 solution_status=SolutionStatus.FAILED.value,
             )
+            db_conn.db_query.mark_solution_cleaned(execution.solution_id)
 
         log_data_key: str | None = None
         if platform_client:
@@ -436,7 +437,7 @@ def execute_verified_solution(
 
         if telemetry_service:
             telemetry_service.record_event(
-                "solution_execution_completed",
+                "solution_container_launched",
                 value=elapsed,
                 miner_hotkey=miner_hotkey,
                 attributes={
@@ -455,7 +456,7 @@ def execute_verified_solution(
 
         if telemetry_service:
             telemetry_service.record_event(
-                "solution_execution_completed",
+                "solution_container_launched",
                 value=elapsed,
                 miner_hotkey=miner_hotkey,
                 attributes={

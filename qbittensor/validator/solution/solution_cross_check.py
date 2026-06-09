@@ -153,7 +153,7 @@ class SolutionCrossChecker:
         if self.telemetry_service:
             outcome = "success" if (image_name and container_id) else "failure"
             self.telemetry_service.record_event(
-                "cross_check_execution_completed",
+                "cross_check_container_launched",
                 value=duration,
                 miner_hotkey=submission.address,
                 attributes={

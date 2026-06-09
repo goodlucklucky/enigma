@@ -42,6 +42,7 @@ def container_manager():
             platform_client=Mock(),
             database_connection=Mock(),
             validator_label="val_label",
+            telemetry_service=None,
         )
     mgr.database_connection.db_query = Mock()
     return mgr
@@ -497,3 +498,114 @@ class TestDockerResourcePrune:
     def test_prune_timeout_is_handled(self, container_manager):
         with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["docker"], timeout=1)):
             container_manager._prune_docker_resources()  # must not raise
+
+
+# =============================================================================
+# Tests for consolidated terminal finalization helper (ensures DB + platform always together)
+# =============================================================================
+
+class TestFinalizeSolutionTerminal:
+    def test_finalize_calls_db_update_mark_and_platform_report(self, container_manager):
+        sol = SimpleNamespace(
+            id="sol-finalize",
+            submission_id="sub-finalize",
+            miner_hotkey="hk-fin",
+            container_name="ctr-fin",
+            absolute_path_to_solution="/ws/fin",
+        )
+        container_manager.platform_client = Mock()
+        container_manager.telemetry_service = Mock()
+
+        container_manager._finalize_solution_terminal(
+            sol,
+            status=SolutionStatus.FAILED.value,
+            reason="test reason overdue",
+            attempt_extraction=True,
+        )
+
+        container_manager.database_connection.db_query.update_solution_status_by_id.assert_called_once_with(
+            "sol-finalize", SolutionStatus.FAILED.value
+        )
+        container_manager.database_connection.db_query.mark_solution_cleaned.assert_called_once_with("sol-finalize")
+        container_manager.platform_client.report_submission_status.assert_called_once()
+        call_kwargs = container_manager.platform_client.report_submission_status.call_args.kwargs
+        assert call_kwargs["submission_id"] == "sub-finalize"
+        assert call_kwargs["status"] == "Failure"
+        assert "test reason overdue" in call_kwargs["reason"]
+
+        container_manager.telemetry_service.record_event.assert_called_once()
+        # extraction should have been attempted (we don't assert the exact call here as it's patched in other tests)
+
+    def test_finalize_is_noop_when_no_sol(self, container_manager):
+        container_manager._finalize_solution_terminal(None)
+        container_manager.database_connection.db_query.update_solution_status_by_id.assert_not_called()
+        container_manager.platform_client.report_submission_status.assert_not_called()
+
+
+# Update existing overdue test to also assert platform report via the helper
+class TestOverdueContainersUpdated:
+    def test_terminate_calls_finalize_for_db_and_platform(self, container_manager):
+        overdue = ["ctr1"]
+        fake_sol = SimpleNamespace(
+            id="sol-overdue",
+            submission_id="sub-overdue",
+            miner_hotkey="hk-o",
+            container_name="ctr1",
+            absolute_path_to_solution="/ws/o",
+            max_solution_runtime_seconds=3600,
+            image_id="val_img_overdue",
+        )
+        container_manager.database_connection.db_query.get_challenge_solution_by_id.return_value = fake_sol
+        container_manager.platform_client = Mock()
+        container_manager.telemetry_service = Mock()
+
+        with patch.object(container_manager, "_container_has_validator_label", return_value=True), \
+                patch.object(container_manager, "_inspect_container_config_image", return_value="val_label_img"), \
+                patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True), \
+                patch.object(container_manager, "_get_stable_keys_from_container", return_value={"solution_id": "sol-overdue"}), \
+                patch("subprocess.run") as mock_run, \
+                patch.object(container_manager, "_finalize_solution_terminal") as mock_finalize:
+
+            # Make rm succeed
+            def side_effect(cmd, **kwargs):
+                if isinstance(cmd, list) and "rm" in " ".join(cmd):
+                    return MagicMock(returncode=0, stdout="", stderr="")
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            mock_run.side_effect = side_effect
+
+            container_manager._terminate_overdue_containers(overdue)
+
+            mock_finalize.assert_called_once()
+            args, kwargs = mock_finalize.call_args
+            assert args[0] is fake_sol
+            assert "overdue" in kwargs.get("reason", "").lower()
+
+
+# Extend recovery test to assert platform report via helper (the previous test already checks DB)
+class TestStartupRecoveryUpdated:
+    def test_lost_container_path_uses_finalize(self, container_manager):
+        lost_sol = SimpleNamespace(
+            id="lost-finalize", container_name="val_lost2", absolute_path_to_solution="/lost2",
+            solution_status=SolutionStatus.RUNNING.value, image_id="img2",
+            submission_id="sub-lost2", miner_hotkey="hk-l2",
+        )
+        container_manager.database_connection.db_query.get_uncleaned_solutions.side_effect = [
+            [lost_sol], [lost_sol]
+        ]
+        container_manager.platform_client = Mock()
+
+        with patch.object(container_manager, "handle_completed_solutions"), \
+             patch.object(container_manager, "_get_container_state", return_value=None), \
+             patch.object(container_manager, "_container_has_validator_label", return_value=True), \
+             patch.object(container_manager, "_image_ref_owned_by_validator", return_value=True), \
+             patch("subprocess.run"), \
+             patch("shutil.rmtree"), \
+             patch("qbittensor.validator.solution.solution_container_manager.os.path.exists", return_value=True), \
+             patch.object(container_manager, "_finalize_solution_terminal") as mock_finalize:
+
+            container_manager.recover_and_clean_on_startup()
+
+            mock_finalize.assert_called_once()
+            assert mock_finalize.call_args[0][0] is lost_sol
+            assert "startup" in mock_finalize.call_args[1].get("reason", "").lower()
