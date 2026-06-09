@@ -72,3 +72,22 @@ class MinerMaintenanceIncentive(Base):
 
     def __str__(self):
         return self.__repr__()
+
+
+class VerifiedTxHash(Base):
+    __tablename__ = "verified_tx_hashes"
+
+    tx_hash = Column(String(100), primary_key=True)
+    success = Column(Boolean, nullable=False)
+    error_message = Column(String(500), nullable=True)
+    verified_at = Column(DateTime, default=func.now())
+    miner_hotkey = Column(String(100), nullable=True)
+
+    def __repr__(self):
+        return (
+            f"<VerifiedTxHash(tx_hash='{self.tx_hash}', success={self.success}, "
+            f"error_message={self.error_message!r})>"
+        )
+
+    def __str__(self):
+        return self.__repr__()

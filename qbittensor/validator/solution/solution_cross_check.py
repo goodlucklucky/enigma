@@ -73,7 +73,19 @@ class SolutionCrossChecker:
             )
 
         # Verify proof ourselves on first sight for cross-check items.
-        if not self.database_connection.db_query.has_seen_tx_hash(submission.tx_hash):
+        # First check our local verified_tx_hashes cache (populated from prior normal processing
+        # or previous cross-checks). If present, reuse the result and avoid expensive on-chain
+        # historical lookup (which requires archive nodes for old blocks).
+        cached_ok, cached_err = self.database_connection.db_query.get_verified_tx_result(submission.tx_hash)
+        if cached_ok is not None:
+            proof_ok, proof_err = cached_ok, cached_err
+            bt.logging.info(
+                f"✅ Reusing cached transfer proof verification for tx_hash {submission.tx_hash} "
+                f"(result={'success' if proof_ok else 'failure'}) from verified_tx_hashes"
+            )
+        else:
+            # Not in cache — perform full verification (and it will be cached by the normal path
+            # or we record it here for future cross-checks).
             transfer_proof = TransferProof.from_platform_submission(submission)
 
             try:
@@ -88,6 +100,15 @@ class SolutionCrossChecker:
                 )
             except Exception as e:
                 proof_ok, proof_err = False, f"Verification call failed: {e}"
+
+            # Cache the result (whether success or failure) so future cross-checks for this tx
+            # can avoid re-verification.
+            self.database_connection.db_query.record_verified_tx(
+                tx_hash=submission.tx_hash,
+                success=proof_ok,
+                error_message=str(proof_err)[:500] if proof_err else None,
+                miner_hotkey=submission.address,
+            )
 
             if not proof_ok:
                 bt.logging.error(
@@ -107,6 +128,15 @@ class SolutionCrossChecker:
                     f"✅ Successfully verified previously unseen cross-check tx_hash "
                     f"{submission.tx_hash} for milestone {submission.challenge_milestone_id}"
                 )
+
+        if not proof_ok:
+            # For cached failure results, still report and skip (consistent with fresh verification)
+            self.platform_client.report_submission_status(
+                submission_id=submission.id,
+                status="Failure",
+                reason=proof_err or "Transfer proof verification failed for cross-check submission (cached result)",
+            )
+            return
 
         bt.logging.info("📸 Inserting row for miner maintenance incentive (cross-check path)")
         self.database_connection.db_query.insert_for_maintenance_incentive(

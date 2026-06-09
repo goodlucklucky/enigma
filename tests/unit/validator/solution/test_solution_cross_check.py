@@ -35,6 +35,11 @@ def cross_checker(platform_client):
             subtensor=Mock(),
         )
     checker.database_connection.db_query = Mock()
+    # New cache lookup in run(): return a prior successful verification so tests
+    # that feed a submission take the fast path and reach their original assertions
+    # (execute + incentive insert, or the missing-challenge_id early report).
+    # Returning (None, None) would cause the else branch (real verify_transfer_proof call).
+    checker.database_connection.db_query.get_verified_tx_result.return_value = (True, None)
     return checker
 
 

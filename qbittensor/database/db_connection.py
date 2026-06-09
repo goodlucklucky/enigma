@@ -199,12 +199,13 @@ class DBConnection:
                     MinerSubmissionStatus.__table__,
                 ]
             elif self.database_name_prefix == "challenge_solutions":
-                from .validator.db_models import ChallengeSolution, MinerMaintenanceIncentive
+                from .validator.db_models import ChallengeSolution, MinerMaintenanceIncentive, VerifiedTxHash
 
-                expected_tables = ["challenge_solutions", "miner_maintenance_incentives"]
+                expected_tables = ["challenge_solutions", "miner_maintenance_incentives", "verified_tx_hashes"]
                 tables = [
                     ChallengeSolution.__table__,
                     MinerMaintenanceIncentive.__table__,
+                    VerifiedTxHash.__table__,
                 ]
             else:
                 tables = list(Base.metadata.tables.values())
@@ -275,7 +276,7 @@ class DBConnection:
 
             # Define what we expect for this prefix
             if self.database_name_prefix == "challenge_solutions":
-                expected = {"challenge_solutions", "miner_maintenance_incentives"}
+                expected = {"challenge_solutions", "miner_maintenance_incentives", "verified_tx_hashes"}
             elif self.database_name_prefix == "miner_submissions":
                 expected = {"miner_submissions", "miner_submission_statuses"}
             else:

@@ -75,9 +75,53 @@ class ResponseProcessor:
             # Extract the miner hotkey
             miner_hotkey: str = self.metagraph.hotkeys[uid]
 
-            # Early replay gate
+            # Early replay gate.
+            # We still honor this even with the verified_tx_hashes cache (which allows
+            # cheap short-circuit of re-verification for cross-checks and avoids repeated
+            # work on known-bad txs). The cache is tx-only; the actual tx <-> file upload
+            # (challenge_validation_solution_id) + challenge/milestone uniqueness is
+            # established and enforced by ChallengeSolution rows (see insert_challenge_solution)
+            # and by the platform on submit_solution.
             if self.database_connection.db_query.has_seen_tx_hash(synapse.tx_hash):
-                bt.logging.info(f"⏭️  tx_hash {synapse.tx_hash} already processed (incentive already credited). Skipping.")
+                # When we have a local binding for this tx, explicitly check the incoming
+                # claimed file upload / work identifiers against the previously bound ones.
+                # This ensures we still detect and loudly log attempts to reuse a tx for a
+                # different file upload, even though the verified cache may contribute to
+                # the "seen" decision for some txs.
+                binding = self.database_connection.db_query.get_tx_binding_info(synapse.tx_hash)
+                attempted_upload = None
+                attempted_milestone = None
+                if getattr(synapse, "solution_candidate", None):
+                    attempted_upload = synapse.solution_candidate.upload_endpoint_id
+                    attempted_milestone = synapse.solution_candidate.challenge_milestone_id
+
+                if binding:
+                    bound_upload = binding.get("challenge_validation_solution_id")
+                    bound_milestone = binding.get("challenge_milestone_id")
+                    if (
+                        bound_upload
+                        and attempted_upload
+                        and bound_upload != attempted_upload
+                    ):
+                        bt.logging.error(
+                            "🚨 TX + FILE UPLOAD UNIQUENESS VIOLATION: "
+                            f"tx_hash={synapse.tx_hash} is already bound on this validator to "
+                            f"upload_endpoint_id={bound_upload} (milestone={bound_milestone}, "
+                            f"challenge={binding.get('challenge_id')}). "
+                            f"This synapse claims upload_endpoint_id={attempted_upload} "
+                            f"(milestone={attempted_milestone}). "
+                            "A tx_hash must not be reused for a different file upload / submission / "
+                            "challenge / milestone. Skipping (platform and insert_challenge_solution "
+                            "provide additional enforcement)."
+                        )
+                    else:
+                        bt.logging.info(
+                            f"⏭️  tx_hash {synapse.tx_hash} already processed for matching work item. Skipping."
+                        )
+                else:
+                    bt.logging.info(
+                        f"⏭️  tx_hash {synapse.tx_hash} already processed (e.g. prior failed verification via cache). Skipping."
+                    )
                 continue
 
             # Guard: some synapses may arrive without a solution candidate
@@ -168,6 +212,13 @@ class ResponseProcessor:
                         f"⚠️ Failed to record maintenance incentive for tx_hash {synapse.tx_hash} — "
                         "miner may not receive weight credit for this payment."
                     )
+
+                # Cache the successful verification so cross-checks can avoid re-verifying
+                self.database_connection.db_query.record_verified_tx(
+                    tx_hash=synapse.tx_hash,
+                    success=True,
+                    miner_hotkey=miner_hotkey,
+                )
             elif synapse.solution_candidate is not None and not proof_ok:
                 bt.logging.error(f"❌ Transfer proof verification failed for tx hash {synapse.tx_hash}: {proof_err}")
 
@@ -182,6 +233,14 @@ class ResponseProcessor:
                             "error": str(proof_err)[:200] if proof_err else None,
                         },
                     )
+
+                # Cache the failed verification (including for future cross-checks)
+                self.database_connection.db_query.record_verified_tx(
+                    tx_hash=synapse.tx_hash,
+                    success=False,
+                    error_message=str(proof_err)[:500] if proof_err else None,
+                    miner_hotkey=miner_hotkey,
+                )
                 continue
             else:
                 continue

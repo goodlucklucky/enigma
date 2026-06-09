@@ -22,7 +22,7 @@ from sqlalchemy import func
 from sqlalchemy.dialects.sqlite import insert
 
 from ..base_query import BaseDBQuery
-from .db_models import ChallengeSolution, MinerMaintenanceIncentive
+from .db_models import ChallengeSolution, MinerMaintenanceIncentive, VerifiedTxHash
 from qbittensor.protocol import MinerSubmissionStatus
 from qbittensor.utils.solution_status import SolutionStatus
 
@@ -552,8 +552,13 @@ class DBQuery(BaseDBQuery):
         """
         Returns True if this validator has already processed this fee transaction.
 
-        We check both the fast-path maintenance incentive table and the full
-        solutions table. This is intentionally two cheap indexed lookups.
+        We check the maintenance incentive table, the full solutions table,
+        and the verified_tx_hashes cache. This is intentionally cheap indexed lookups.
+
+        Note: The verified cache entry alone typically indicates a prior verification
+        (success or failure) without a local work-item binding. Bindings that establish
+        tx <-> specific file upload / challenge / milestone uniqueness live in the
+        challenge_solutions (and incentive) rows; see get_tx_binding_info.
         """
         try:
             with self._managed_session(read_only=True) as session:
@@ -565,9 +570,82 @@ class DBQuery(BaseDBQuery):
                 if session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first() is not None:
                     return True
 
+                # Also consider prior verification attempts (success or failure) in the new cache
+                if session.query(VerifiedTxHash).filter_by(tx_hash=tx_hash).first() is not None:
+                    return True
+
                 return False
         except Exception:
             # Conservative: if we can't check, assume we haven't seen it
             # (upstream code will handle duplicates safely via on_conflict_do_nothing)
             bt.logging.warning(f"Error checking has_seen_tx_hash for {tx_hash}, assuming not seen")
             return False
+
+    def get_tx_binding_info(self, tx_hash: str) -> dict | None:
+        """
+        Return the work-item binding information for a tx_hash if a ChallengeSolution row
+        exists for it. This is the local record that ties a specific payment (tx) to a
+        specific file upload (challenge_validation_solution_id / upload_endpoint_id) plus
+        challenge and milestone.
+
+        Used to detect attempts to reuse the same tx for a *different* file upload / work
+        item even after adding the verified_tx_hashes verification cache (which is tx-only
+        and does not store upload identifiers).
+
+        Returns None if there is no local solution row for the tx (e.g. the tx was only
+        seen for a failed verification, or never successfully bound on this validator).
+        """
+        try:
+            with self._managed_session(read_only=True) as session:
+                row = session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first()
+                if not row:
+                    return None
+                return {
+                    "challenge_validation_solution_id": row.challenge_validation_solution_id,
+                    "challenge_id": row.challenge_id,
+                    "challenge_milestone_id": row.challenge_milestone_id,
+                    "submission_id": row.submission_id,
+                }
+        except Exception:
+            bt.logging.warning(f"Error fetching tx binding info for {tx_hash}")
+            return None
+
+    def get_verified_tx_result(self, tx_hash: str) -> tuple[bool | None, str | None]:
+        """
+        Returns (success, error_message) if this tx_hash was previously verified by this
+        validator (via the verified_tx_hashes cache). Returns (None, None) if never verified.
+        Used to short-circuit re-verification on cross-checks.
+        """
+        try:
+            with self._managed_session(read_only=True) as session:
+                row = session.query(VerifiedTxHash).filter_by(tx_hash=tx_hash).first()
+                if row:
+                    return bool(row.success), row.error_message
+                return None, None
+        except Exception as e:
+            bt.logging.error(f"Error getting verified tx result for {tx_hash}: {e}")
+            return None, None
+
+    def record_verified_tx(self, tx_hash: str, success: bool, error_message: str | None = None, miner_hotkey: str | None = None):
+        """Insert or update the verification result for a tx_hash (cache for future cross-checks)."""
+        try:
+            with self._managed_session() as session:
+                stmt = insert(VerifiedTxHash).values(
+                    tx_hash=tx_hash,
+                    success=success,
+                    error_message=error_message,
+                    miner_hotkey=miner_hotkey,
+                    verified_at=func.now(),
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["tx_hash"],
+                    set_={
+                        "success": success,
+                        "error_message": error_message,
+                        "miner_hotkey": miner_hotkey,
+                        "verified_at": func.now(),
+                    },
+                )
+                session.execute(stmt)
+        except Exception as e:
+            bt.logging.error(f"Error recording verified tx {tx_hash}: {e}")

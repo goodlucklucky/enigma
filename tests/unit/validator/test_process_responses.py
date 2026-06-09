@@ -49,6 +49,7 @@ def processor(platform_client):
     db = Mock()
     db.db_query = Mock()
     db.db_query.has_seen_tx_hash.return_value = False
+    db.db_query.get_tx_binding_info.return_value = None
 
     return ResponseProcessor(
         request_manager=Mock(),
@@ -111,6 +112,9 @@ class TestResponseProcessorAdditionalPaths:
     @patch("qbittensor.validator.synapse.process_responses.verify_transfer_proof_for_synapse")
     def test_skips_replay_tx_hash(self, mock_verify, processor):
         processor.database_connection.db_query.has_seen_tx_hash.return_value = True
+        # Provide a return for the binding check used on seen-tx skips (for mismatch detection
+        # between tx and file upload). None means no local binding row (generic skip path).
+        processor.database_connection.db_query.get_tx_binding_info.return_value = None
         processor.process_synapses([_make_synapse()], validator_busy=False)
         mock_verify.assert_not_called()
 
