@@ -50,6 +50,7 @@ def processor(platform_client):
     db.db_query = Mock()
     db.db_query.has_seen_tx_hash.return_value = False
     db.db_query.get_tx_binding_info.return_value = None
+    db.db_query.get_verified_tx_result.return_value = (None, None)
 
     return ResponseProcessor(
         request_manager=Mock(),
@@ -111,10 +112,14 @@ class TestResponseProcessor:
 class TestResponseProcessorAdditionalPaths:
     @patch("qbittensor.validator.synapse.process_responses.verify_transfer_proof_for_synapse")
     def test_skips_replay_tx_hash(self, mock_verify, processor):
+        # has_seen_tx_hash now only returns True for actual local bindings (ChallengeSolution
+        # or maintenance incentive). A binding with no upload mismatch causes the clean skip.
         processor.database_connection.db_query.has_seen_tx_hash.return_value = True
-        # Provide a return for the binding check used on seen-tx skips (for mismatch detection
-        # between tx and file upload). None means no local binding row (generic skip path).
-        processor.database_connection.db_query.get_tx_binding_info.return_value = None
+        processor.database_connection.db_query.get_tx_binding_info.return_value = {
+            "challenge_validation_solution_id": "some-upload",
+            "challenge_milestone_id": "some-milestone",
+            "challenge_id": "some-challenge",
+        }
         processor.process_synapses([_make_synapse()], validator_busy=False)
         mock_verify.assert_not_called()
 

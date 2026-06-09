@@ -216,9 +216,8 @@ def run_migrations_for_db(engine: Engine, database_name_prefix: str) -> None:
         runner = MigrationRunner(scope="validator")
         runner.run(engine)
     elif database_name_prefix == "miner_submissions":
-        # For now we explicitly do nothing for miner DBs (per approved plan).
-        # The framework is ready if we ever need miner migrations in the future.
-        logger.debug("Miner database migrations skipped (not required for this release).")
+        runner = MigrationRunner(scope="miner")
+        runner.run(engine)
     else:
         # Unknown / future DB types – run nothing but don't crash
         logger.debug(f"No migration scope defined for database prefix '{database_name_prefix}'")

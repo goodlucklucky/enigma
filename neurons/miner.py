@@ -66,9 +66,10 @@ class Miner(BaseMinerNeuron):
         """Processes an incoming SolutionSynapse from a validator.
 
         This is the main entrypoint for the miner when receiving work from validators.
-        It records submission statuses, checks if the validator is busy, polls the local
-        database for a ready solution, attaches a signed transfer proof, and returns the
-        enriched synapse.
+        It records submission statuses from the validator, polls the local database for a
+        ready solution (even if the validator reports it is currently busy, so the solution
+        can be claimed on the platform for maintenance incentive), attaches a signed
+        transfer proof, and returns the enriched synapse.
         """
         bt.logging.info("⏩ Running forward pass for miner")
 
@@ -93,8 +94,9 @@ class Miner(BaseMinerNeuron):
                 )
 
         if synapse.validator_busy:
-            bt.logging.info("⚠️ Validator is currently busy, not checking for a new solution")
-            return synapse
+            bt.logging.info(
+                "ℹ️ Validator reported busy (max concurrent solutions); still offering solution."
+            )
 
         miner_submission: MinerSubmission | None = self.solution_poller.poll_for_validator(validator_hotkey)
 

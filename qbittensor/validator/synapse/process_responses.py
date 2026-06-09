@@ -75,19 +75,23 @@ class ResponseProcessor:
             # Extract the miner hotkey
             miner_hotkey: str = self.metagraph.hotkeys[uid]
 
-            # Early replay gate.
-            # We still honor this even with the verified_tx_hashes cache (which allows
-            # cheap short-circuit of re-verification for cross-checks and avoids repeated
-            # work on known-bad txs). The cache is tx-only; the actual tx <-> file upload
-            # (challenge_validation_solution_id) + challenge/milestone uniqueness is
-            # established and enforced by ChallengeSolution rows (see insert_challenge_solution)
+            # Early replay / binding gate.
+            # We check for local work-item bindings (ChallengeSolution + maintenance incentive).
+            # The verified_tx_hashes cache is *not* used here for skipping offers — it is
+            # a tx-only cache used only to short-circuit transfer proof re-verification
+            # (see get_verified_tx_result below and the cross-check path).
+            #
+            # Real tx <-> specific file upload (challenge_validation_solution_id) + challenge/milestone
+            # uniqueness is established by ChallengeSolution rows (see insert_challenge_solution / get_tx_binding_info)
             # and by the platform on submit_solution.
+            #
+            # tx cache + maintenance incentive are recorded once on successful proof verification
+            # (even for 202/busy claims). ChallengeSolution is only created on actual local execution
+            # (platform 201 response or cross-check via /next).
             if self.database_connection.db_query.has_seen_tx_hash(synapse.tx_hash):
-                # When we have a local binding for this tx, explicitly check the incoming
-                # claimed file upload / work identifiers against the previously bound ones.
-                # This ensures we still detect and loudly log attempts to reuse a tx for a
-                # different file upload, even though the verified cache may contribute to
-                # the "seen" decision for some txs.
+                # We have a local binding for this tx. Check the incoming claimed file upload /
+                # work identifiers against the previously bound ones. This catches attempts to
+                # reuse a tx for a different upload even after the verified cache was added.
                 binding = self.database_connection.db_query.get_tx_binding_info(synapse.tx_hash)
                 attempted_upload = None
                 attempted_milestone = None
@@ -118,10 +122,18 @@ class ResponseProcessor:
                         bt.logging.info(
                             f"⏭️  tx_hash {synapse.tx_hash} already processed for matching work item. Skipping."
                         )
-                else:
-                    bt.logging.info(
-                        f"⏭️  tx_hash {synapse.tx_hash} already processed (e.g. prior failed verification via cache). Skipping."
-                    )
+                    continue
+                # No binding row (rare if has_seen only looks at bindings). Fall through to normal processing.
+                # We will still use the verified cache for verification short-circuit below.
+
+            # Separate cheap check: if we have a *cached failure* for this tx (from prior direct
+            # processing or cross-check), skip re-processing the offer. Success-only cache entries
+            # (e.g. from a prior busy/202 claim with no local ChallengeSolution) do not cause a skip here.
+            cached_ok, cached_err = self.database_connection.db_query.get_verified_tx_result(synapse.tx_hash)
+            if cached_ok is False:
+                bt.logging.info(
+                    f"⏭️  tx_hash {synapse.tx_hash} has a prior cached verification failure. Skipping."
+                )
                 continue
 
             # Guard: some synapses may arrive without a solution candidate
@@ -180,12 +192,32 @@ class ResponseProcessor:
             )
             expected_transfer_amount_rao = str(int(bt.Balance.from_tao(price_tao).rao))
 
-            proof_ok, proof_err = verify_transfer_proof_for_synapse(
-                transfer_proof,
-                miner_hotkey,
-                self.subtensor,
-                expected_transfer_amount_rao=expected_transfer_amount_rao,
-            )
+            # Short-circuit transfer proof verification using the verified_tx_hashes cache
+            # when we have a prior result (populated from previous direct processing or cross-checks).
+            # This is the narrow use of the tx cache — it avoids expensive on-chain historical lookups
+            # without causing a full early skip of the offer (see the binding gate above).
+            cached_ok, cached_err = self.database_connection.db_query.get_verified_tx_result(synapse.tx_hash)
+            if cached_ok is not None:
+                proof_ok, proof_err = cached_ok, cached_err
+                bt.logging.debug(
+                    f"Reusing cached transfer proof verification for tx={synapse.tx_hash} "
+                    f"(result={'success' if proof_ok else 'failure'})"
+                )
+            else:
+                proof_ok, proof_err = verify_transfer_proof_for_synapse(
+                    transfer_proof,
+                    miner_hotkey,
+                    self.subtensor,
+                    expected_transfer_amount_rao=expected_transfer_amount_rao,
+                )
+                # Record (success or failure) so future direct offers and cross-checks can short-circuit.
+                # This + maintenance incentive are the "record once" items on proof success.
+                self.database_connection.db_query.record_verified_tx(
+                    tx_hash=synapse.tx_hash,
+                    success=proof_ok,
+                    error_message=str(proof_err)[:500] if proof_err else None,
+                    miner_hotkey=miner_hotkey,
+                )
 
             if proof_ok:
                 bt.logging.info("✅ Transfer proof verification passed, continuing with solution processing...")
@@ -213,12 +245,8 @@ class ResponseProcessor:
                         "miner may not receive weight credit for this payment."
                     )
 
-                # Cache the successful verification so cross-checks can avoid re-verifying
-                self.database_connection.db_query.record_verified_tx(
-                    tx_hash=synapse.tx_hash,
-                    success=True,
-                    miner_hotkey=miner_hotkey,
-                )
+                # Note: verified_tx was already recorded above (either from cache hit or fresh verification).
+                # ChallengeSolution is *not* created here — only on 201 response or cross-check /next.
             elif synapse.solution_candidate is not None and not proof_ok:
                 bt.logging.error(f"❌ Transfer proof verification failed for tx hash {synapse.tx_hash}: {proof_err}")
 
@@ -234,13 +262,7 @@ class ResponseProcessor:
                         },
                     )
 
-                # Cache the failed verification (including for future cross-checks)
-                self.database_connection.db_query.record_verified_tx(
-                    tx_hash=synapse.tx_hash,
-                    success=False,
-                    error_message=str(proof_err)[:500] if proof_err else None,
-                    miner_hotkey=miner_hotkey,
-                )
+                # verified_tx was already recorded above for this failure case.
                 continue
             else:
                 continue
@@ -269,7 +291,8 @@ class ResponseProcessor:
             try:
                 bt.logging.info(
                     f"🚀 Submitting solution to platform (cloud) for tx={synapse.tx_hash} "
-                    f"miner={miner_hotkey} milestone={solution_candidate.challenge_milestone_id}"
+                    f"miner={miner_hotkey} milestone={solution_candidate.challenge_milestone_id} "
+                    f"(validator_busy={validator_busy})"
                 )
 
                 if self.telemetry_service:
@@ -291,20 +314,31 @@ class ResponseProcessor:
                 )
 
                 if response is None:
-                    # 202 (already exists / busy claim) or auth/4xx/5xx handled inside client
-                    bt.logging.info(
-                        f"ℹ️  Platform returned no response object for tx={synapse.tx_hash} "
-                        "(202 duplicate/busy or error — see prior logs). Continuing."
-                    )
+                    # 202 means either:
+                    # - duplicate / already claimed, or
+                    # - we sent validator_busy=True and the platform correctly recorded the
+                    #   submission + NOT_RUN rows for this validator (for later re-offer via /next).
+                    if validator_busy:
+                        bt.logging.info(
+                            f"⏸️  Validator busy — successfully recorded platform claim for tx={synapse.tx_hash} "
+                            "(submission created with NOT_RUN for this validator). "
+                            "Will not execute this cycle; platform will re-offer via /next when capacity exists."
+                        )
+                    else:
+                        bt.logging.info(
+                            f"ℹ️  Platform returned no response object for tx={synapse.tx_hash} "
+                            "(202 duplicate or error — see prior logs). Continuing."
+                        )
 
                     if self.telemetry_service:
+                        outcome = "busy_claim_recorded" if validator_busy else "202_or_error"
                         self.telemetry_service.record_event(
                             "platform_submission",
-                            value=0,
+                            value=0 if not validator_busy else 1,
                             miner_hotkey=miner_hotkey,
                             attributes={
                                 "tx_hash": synapse.tx_hash,
-                                "outcome": "202_or_error",
+                                "outcome": outcome,
                             },
                         )
                     continue
@@ -321,6 +355,10 @@ class ResponseProcessor:
                         },
                     )
 
+                # This path is only reached if the platform returned a full response object
+                # (e.g. 201) even though we sent validator_busy=True. With current platform
+                # behavior, busy claims return 202 (handled in the response is None block above).
+                # We keep the block for robustness and to preserve the "do not execute" guarantee.
                 if validator_busy:
                     bt.logging.info(
                         f"⏸️  Validator busy — successfully claimed tx_hash {synapse.tx_hash} on platform "

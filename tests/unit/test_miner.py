@@ -335,16 +335,41 @@ class TestMinerForward:
         mock_miner._mock_db_query.insert_miner_submission_status.assert_called_once()
         assert result is synapse
 
-    def test_returns_early_when_validator_busy(self, mock_miner):
+    def test_proceeds_to_poll_even_when_validator_busy(self, mock_miner):
+        """Miner now offers solutions even when the validator reports busy.
+
+        This allows the validator to claim the work on the platform (maintenance incentive)
+        with validator_busy=True; the platform will re-offer later instead of local execution.
+        """
         synapse = SolutionSynapse(validator_busy=True)
         dendrite = Mock()
         dendrite.hotkey = "5ValidatorHotkey"
         object.__setattr__(synapse, "dendrite", dendrite)
 
-        result = self._run_forward(mock_miner, synapse)
-        assert result is synapse
-        # Poller should not have been called
-        mock_miner._mock_poller.poll.assert_not_called()
+        # Arrange a ready submission so we exercise the full offer path while busy.
+        submission = SimpleNamespace(
+            tx_hash="0xdeadbeef-busy",
+            transfer_block_hash="0xblock",
+            transfer_from_ss58="5From",
+            transfer_to_ss58="5To",
+            transfer_amount_rao="1000000",
+            upload_endpoint_id="upload-busy",
+            challenge_milestone_id="milestone-busy",
+            challenge_id="challenge-busy",
+            upload_id="upload-busy",
+            miner_hotkey="5MinerHotkeyBusy",
+        )
+        mock_miner._mock_poller.poll_for_validator.return_value = submission
+
+        with patch("qbittensor.utils.transfer_proof.build_transfer_proof_message", return_value="signed_proof"), \
+                patch("neurons.miner.build_transfer_proof_message", return_value="signed_proof"):
+            result = self._run_forward(mock_miner, synapse)
+
+        # Poller must have been called (we no longer early-return on busy).
+        mock_miner._mock_poller.poll_for_validator.assert_called_once_with("5ValidatorHotkey")
+        # We should have attached the candidate instead of returning the empty synapse.
+        assert result.solution_candidate is not None
+        assert result.tx_hash == "0xdeadbeef-busy"
 
     def test_returns_early_when_no_submission_ready(self, mock_miner):
         synapse = SolutionSynapse(validator_busy=False)

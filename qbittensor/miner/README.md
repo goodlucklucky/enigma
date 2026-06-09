@@ -100,8 +100,9 @@ A submission follows this flow:
 `neurons/miner.py` handles incoming `SolutionSynapse` requests:
 
 1. Read validator hotkey from `synapse.dendrite.hotkey`.
-2. If `synapse.validator_busy` is true, return early.
-3. Query local DB for next row not yet sent to this validator (`get_next_miner_submission`).
+2. Record any `submission_statuses` the validator sent back (for maintenance incentive tracking).
+3. Query local DB for next row not yet sent to this validator (`get_next_miner_submission_for_validator`).
+   - We offer a solution even if the validator reports `validator_busy=True`. This allows the validator to claim the work on the platform (for the miner's maintenance incentive) even while at capacity. The validator will submit with `validator_busy=True`; the platform will re-offer the work later via `/submissions/next` instead of the validator running it immediately.
 4. Convert DB row -> `SolutionCandidate`.
 5. Build transfer proof message and sign it with miner hotkey.
 6. Populate synapse fields:
@@ -113,7 +114,7 @@ A submission follows this flow:
    - `transfer_amount_rao`
    - `transfer_proof_message`
    - `transfer_proof_signature_hex`
-7. Mark row submitted for that validator (`mark_miner_submission_as_submitted`) so the same validator does not get duplicate delivery.
+7. Mark row submitted for that validator (via OFFERED status) so the same validator does not get duplicate delivery through the normal direct query path. (Platform cross-check re-offers are a separate mechanism.)
 
 On validator side, `ResponseProcessor` verifies transfer proof data (message integrity, signature, hotkey/coldkey ownership, transfer destination/amount, and on-chain extrinsic inclusion) before accepting the candidate.
 

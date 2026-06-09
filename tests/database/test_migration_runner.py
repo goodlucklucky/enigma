@@ -22,7 +22,7 @@ These tests verify:
 - The runner creates the schema_migrations table.
 - It correctly discovers and applies numbered migrations.
 - It is idempotent (safe to run multiple times).
-- Validator vs miner scope behavior.
+- Validator and miner scopes now both participate (miner for data cleanups and future evolution).
 """
 
 import tempfile
@@ -71,8 +71,8 @@ class TestMigrationRunner:
                 # Should still only have the migrations that exist, no duplicates
                 assert rows[0][0] >= 1
 
-    def test_miner_scope_does_not_create_migration_table(self):
-        """Per approved plan, we do not require miner migrations at this time."""
+    def test_miner_scope_runs_migrations_and_creates_schema_migrations_table(self):
+        """Miner DBs now participate in the migration system (data cleanups, future schema changes)."""
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "test_miner.db"
             engine = create_engine(f"sqlite:///{db_path}")
@@ -83,8 +83,16 @@ class TestMigrationRunner:
                 tables = [r[0] for r in conn.execute(
                     text('SELECT name FROM sqlite_master WHERE type="table"')
                 )]
-                # We expect the framework to have done nothing for miner scope
-                assert "schema_migrations" not in tables
+                # The runner should now create the schema_migrations tracking table for miner scope.
+                assert "schema_migrations" in tables
+
+                # Our 0001 cleanup migration (remove stale OFFERED statuses) should have been applied.
+                rows = list(conn.execute(
+                    text("SELECT version, description FROM schema_migrations ORDER BY version")
+                ))
+                assert len(rows) >= 1
+                assert rows[0][0] == 1
+                assert "OFFERED" in rows[0][1] or "offered" in rows[0][1].lower() or "stale" in rows[0][1].lower()
 
     def test_unknown_scope_is_safe(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -550,28 +550,29 @@ class DBQuery(BaseDBQuery):
 
     def has_seen_tx_hash(self, tx_hash: str) -> bool:
         """
-        Returns True if this validator has already processed this fee transaction.
+        Returns True if this validator has a local work-item binding for this tx.
 
-        We check the maintenance incentive table, the full solutions table,
-        and the verified_tx_hashes cache. This is intentionally cheap indexed lookups.
+        We only check the maintenance incentive table and the ChallengeSolution table
+        (the tables that tie a tx to a specific upload/challenge/milestone and represent
+        actual processing or incentive recording).
 
-        Note: The verified cache entry alone typically indicates a prior verification
-        (success or failure) without a local work-item binding. Bindings that establish
-        tx <-> specific file upload / challenge / milestone uniqueness live in the
-        challenge_solutions (and incentive) rows; see get_tx_binding_info.
+        The verified_tx_hashes cache is intentionally excluded here. It is a tx-only
+        cache used to short-circuit expensive transfer proof re-verification (see
+        get_verified_tx_result / record_verified_tx and the cross-check + direct paths).
+        Presence in the verified cache alone does not mean we have "processed" the work
+        item for replay protection in the direct miner-synapse path.
+
+        The real tx <-> file upload uniqueness is established by ChallengeSolution rows
+        (see get_tx_binding_info) and by the platform on submit_solution.
         """
         try:
             with self._managed_session(read_only=True) as session:
-                # Fast path: maintenance incentives
+                # Maintenance incentives recorded on successful proof (even for busy/202 claims)
                 if session.query(MinerMaintenanceIncentive).filter_by(tx_hash=tx_hash).first() is not None:
                     return True
 
-                # Fallback: check actual processed solutions
+                # Actual processed solutions (local execution or cross-check)
                 if session.query(ChallengeSolution).filter_by(tx_hash=tx_hash).first() is not None:
-                    return True
-
-                # Also consider prior verification attempts (success or failure) in the new cache
-                if session.query(VerifiedTxHash).filter_by(tx_hash=tx_hash).first() is not None:
                     return True
 
                 return False
