@@ -27,15 +27,18 @@ from qbittensor.validator.solution.constants import (
 )
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
-from .run_solution import _run_docker_command
+from .docker_ops import DockerOps
 
 
 def _inspect_image_size_bytes(image_name: str) -> int | None:
     """Return image size in bytes from ``docker image inspect``, or None on failure."""
     cmd = ["docker", "image", "inspect", image_name, "--format", "{{.Size}}"]
     try:
-        result = _run_docker_command(cmd, description="docker image inspect for size", check=True)
-        return int(result.stdout.strip())
+        ops = DockerOps()
+        size_str = ops.image_inspect(image_name, "{{.Size}}")
+        if size_str is None:
+            return None
+        return int(size_str)
     except InvalidSolutionError:
         # Docker not available or command failed — treat as uninspectable
         return None
@@ -48,11 +51,7 @@ def _inspect_image_size_bytes(image_name: str) -> int | None:
 
 
 def _delete_image(image_name: str) -> None:
-    subprocess.run(
-        ["docker", "rmi", "-f", image_name],
-        capture_output=True,
-        check=False,
-    )
+    DockerOps().rmi(image_name, force=True)
 
 
 def build_image(image_name: str, dockerfile_dir: str = ".", build_log_path: Optional[str] = None) -> bool:
@@ -72,14 +71,15 @@ def build_image(image_name: str, dockerfile_dir: str = ".", build_log_path: Opti
     if build_log_path:
         bt.logging.info(f"\tBuild log: {build_log_path}")
 
-    build_cmd = ["docker", "build", "--progress=plain", "-t", image_name, dockerfile_dir]
+    build_cmd = ["build", "--progress=plain", "-t", image_name, dockerfile_dir]
 
     build_output_lines: list[str] = []
+    ops = DockerOps()
 
     try:
         # Stream the build so we get live progress in validator logs and can
         # persist the complete transcript to the build log file on disk.
-        proc = subprocess.Popen(
+        proc = ops.popen(
             build_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

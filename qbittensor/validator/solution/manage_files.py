@@ -16,10 +16,11 @@
 # DEALINGS IN THE SOFTWARE.
 
 import bittensor as bt
+import os
 from pathlib import Path
 import shutil
 import time
-from .constants import CHALLENGE_SOLTION_PREFIX
+from .constants import CHALLENGE_SOLTION_PREFIX, SOLUTIONS_BASE_DIR
 
 
 """
@@ -30,26 +31,41 @@ FOLDER_NAME = ""
 # FOLDER_PREFIX: str = CHALLENGE_SOLTION_PREFIX
 
 
-def setup(validator_label: str, challenge_validation_solution_id: str) -> tuple[str, str]:
-    """Setup folder for solution management
+def setup(validator_label: str, challenge_validation_solution_id: str, base_dir: str | None = None) -> tuple[str, str]:
+    """Setup folder for solution management under a data directory.
+
+    All solution workspaces are now created under a base directory (default:
+    data/solutions) so they do not pollute the repository root and can be
+    easily gitignored.
 
     Args:
         validator_label (str): Label for the validator
         challenge_validation_solution_id (str): ID for the challenge validation solution
+        base_dir (str | None): Base directory for solutions. Defaults to SOLUTIONS_BASE_DIR.
 
     Returns:
-        tuple[str, str]: The solution tag and folder name
+        tuple[str, str]: The solution tag (basename) and the full path to the folder.
     """
+    if base_dir is None:
+        env_data = os.environ.get("ENIGMA_DATA_DIR")
+        if env_data:
+            base_dir = os.path.join(os.path.expanduser(env_data), "solutions")
+        else:
+            base_dir = SOLUTIONS_BASE_DIR
+
     bt.logging.info("🛠️ Setting up file structure")
     seconds_since_epoch = int(time.time())
-    folder_name = f"{validator_label}_{challenge_validation_solution_id}_{seconds_since_epoch}"
+    folder_basename = f"{validator_label}_{challenge_validation_solution_id}_{seconds_since_epoch}"
+    full_folder = os.path.join(base_dir, folder_basename)
+
     try:
-        Path(folder_name).mkdir(exist_ok=True)
-        bt.logging.info(f"\t✅ Created folder '{folder_name}'")
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
+        Path(full_folder).mkdir(exist_ok=True)
+        bt.logging.info(f"\t✅ Created folder '{full_folder}'")
     except Exception as e:
         bt.logging.error(f"\t❌ Failed to create file structure: {e}")
 
-    return folder_name, folder_name
+    return folder_basename, full_folder
 
 
 def cleanup(folder_name: str) -> None:

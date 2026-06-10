@@ -53,8 +53,7 @@ def mock_miner(mock_config):
     We patch both the canonical post-consolidation locations (qbittensor.*) and the
     neurons.* re-exports. This is required because neurons/miner.py performs
     `from qbittensor... import Foo` and then uses the name locally. The neurons.*
-    patches ensure the name in that module's dict is replaced. This is transitional
-    debt from the platform API consolidation (RequestManager, TelemetryService, etc.).
+    patches ensure the name in that module's dict is replaced.
     """
     with (
         patch("qbittensor.base.neuron.bt.Wallet") as mock_wallet,
@@ -63,9 +62,6 @@ def mock_miner(mock_config):
         patch("qbittensor.base.miner.bt.Axon") as mock_axon,
         patch("qbittensor.base.neuron.BaseNeuron.sync") as mock_sync,
         patch("qbittensor.base.neuron.check_config"),
-        patch("qbittensor.utils.request.request_manager.RequestManager") as mock_request_manager,
-        patch("qbittensor.utils.services.telemetry.TelemetryService") as mock_telemetry_service,
-        patch("neurons.miner.TelemetryService"),
         patch("qbittensor.database.db_connection.DBConnection") as mock_db_connection,
         patch("neurons.miner.DBConnection"),
         patch("qbittensor.miner.solution_polling.SolutionPoller") as mock_solution_poller_cls,
@@ -93,10 +89,6 @@ def mock_miner(mock_config):
         mock_metagraph.return_value.n = 3
 
         mock_axon.return_value = Mock()
-
-        # Telemetry & RequestManager (not heavily used in handler tests)
-        mock_telemetry_service.return_value = Mock()
-        mock_request_manager.return_value = Mock()
 
         # DB layer - the miner exposes .db_query after init
         mock_db = Mock()

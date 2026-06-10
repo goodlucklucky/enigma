@@ -43,7 +43,6 @@ from qbittensor.validator.solution.constants import (
     VALIDATOR_DOCKER_MINER_USER_DEFAULT,
 )
 from qbittensor.validator.solution.run_solution import (
-    _run_docker_command,
     docker_run_security_args,
     extract_stdout_output,
     prepare_challenge_input_mount_dir,
@@ -91,12 +90,13 @@ class TestExtractStdoutOutput:
         zip_bytes = _make_zip({"result.json": '{"hello": "world"}', "output.txt": "Hello"})
         stdout = _build_stdout_with_payload(b"line1\nline2\n", zip_bytes)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = stdout
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is True
 
-        cmd = mock_run.call_args.args[0]
-        assert cmd == ["docker", "logs", "ctr"]
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
 
         log_path = workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_LOG_FILENAME
         assert log_path.is_file()
@@ -118,9 +118,13 @@ class TestExtractStdoutOutput:
         b64_payload = base64.b64encode(zip_bytes) + b"\n"
         stdout = b"logs\n" + SOLUTION_OUTPUT_SEPARATOR + b64_payload
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = stdout
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is True
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
+
         zip_path = workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_OUTPUT_ZIP_FILENAME
         assert zip_path.read_bytes() == zip_bytes
 
@@ -128,21 +132,27 @@ class TestExtractStdoutOutput:
         ws2 = tmp_path / "workspace2"
         ws2.mkdir()
         stdout_logs_have_sep = SOLUTION_OUTPUT_SEPARATOR + b"logs\n" + SOLUTION_OUTPUT_SEPARATOR + b64_payload
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=stdout_logs_have_sep, returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = stdout_logs_have_sep
+            mock_docker_cls.return_value = mock_ops
             # First separator splits at offset 0 → logs are empty,
             # payload starts with "logs\n<separator><b64>" which is not valid base64.
             assert extract_stdout_output("ctr", str(ws2)) is False
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
         log_path = ws2 / CONTAINER_OUTPUT_DIRNAME / SOLUTION_LOG_FILENAME
         assert log_path.read_bytes() == b""
 
     def test_missing_separator_writes_logs_only(self, tmp_path):
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=b"oops no marker\n", returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = b"oops no marker\n"
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is True
 
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
         log_path = workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_LOG_FILENAME
         assert log_path.is_file()
         assert log_path.read_bytes() == b"oops no marker\n"
@@ -158,10 +168,13 @@ class TestExtractStdoutOutput:
         workspace.mkdir()
         not_a_zip = b"this-is-not-a-zip"
         stdout = _build_stdout_with_payload(b"log\n", not_a_zip)
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = stdout
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is False
 
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
         log_path = workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_LOG_FILENAME
         assert log_path.read_bytes() == b"log\n"
         zip_path = workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_OUTPUT_ZIP_FILENAME
@@ -178,10 +191,13 @@ class TestExtractStdoutOutput:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         stdout = _build_stdout_with_payload(b"log\n", b"!!!not-base64!!!", encode=False)
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = stdout
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is False
 
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
         log_path = workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_LOG_FILENAME
         assert log_path.read_bytes() == b"log\n"
         assert not (workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_OUTPUT_ZIP_FILENAME).exists()
@@ -193,10 +209,13 @@ class TestExtractStdoutOutput:
         zip_bytes = _make_zip({"output.txt": "Hello"})
         stdout = _build_stdout_with_payload(b"x" * 32, zip_bytes)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = stdout
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is False
 
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
         log_path = workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_LOG_FILENAME
         # Logs file holds only the truncated prefix; no artifact extraction at all.
         assert len(log_path.read_bytes()) == 16
@@ -205,10 +224,11 @@ class TestExtractStdoutOutput:
     def test_docker_logs_failure_returns_false(self, tmp_path):
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        with patch(
-            "subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "docker logs", stderr=b"no such container"),
-        ):
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            err = subprocess.CalledProcessError(1, "docker logs", stderr=b"no such container")
+            mock_ops.logs.side_effect = err
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is False
         assert not (workspace / CONTAINER_OUTPUT_DIRNAME / SOLUTION_LOG_FILENAME).exists()
 
@@ -221,10 +241,13 @@ class TestExtractStdoutOutput:
             zf.writestr("../escape.txt", "pwn")
         stdout = _build_stdout_with_payload(b"log\n", evil.getvalue())
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
+        with patch("qbittensor.validator.solution.run_solution.DockerOps") as mock_docker_cls:
+            mock_ops = MagicMock()
+            mock_ops.logs.return_value = stdout
+            mock_docker_cls.return_value = mock_ops
             assert extract_stdout_output("ctr", str(workspace)) is False
 
+        mock_ops.logs.assert_called_once_with("ctr", check=True)
         assert not (workspace.parent / "escape.txt").exists()
 
 
@@ -305,7 +328,7 @@ class TestRunImageDetached:
                 )
 
         args = mock_run.call_args.args[0]
-        mount_args = [args[i+1] for i in range(len(args)) if args[i] == "-v"]
+        mount_args = [args[i + 1] for i in range(len(args)) if args[i] == "-v"]
         challenge_mounts = [m for m in mount_args if CONTAINER_CHALLENGE_INPUT_PATH in m]
         assert len(challenge_mounts) == 1
         mount_spec = challenge_mounts[0]
@@ -448,62 +471,8 @@ class TestDockerRunSecurityArgs:
         assert "Command:" in msg
 
 
-class TestRunDockerCommand:
-    """Tests for the shared _run_docker_command helper that centralizes
-    error capture and rich InvalidSolutionError messaging.
-    """
-
-    def test_success_returns_completed_process(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout="ok\n", stderr="", returncode=0)
-            result = _run_docker_command(["docker", "--version"])
-            assert result.stdout == "ok\n"
-            mock_run.assert_called_once()
-
-    def test_file_not_found_raises_rich_invalid_solution_error(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError("no docker")):
-            with pytest.raises(InvalidSolutionError) as exc:
-                _run_docker_command(["docker", "run", "foo"], description="docker run test")
-        msg = str(exc.value)
-        assert "Docker CLI not found" in msg
-        assert "docker run test" in msg
-        assert "Is Docker installed" in msg
-
-    def test_called_process_error_127_includes_full_diagnostics(self):
-        err = subprocess.CalledProcessError(127, ["docker", "run", "img"])
-        err.stderr = "docker: command not found\n"
-        err.stdout = ""
-        with patch("subprocess.run", side_effect=err):
-            with pytest.raises(InvalidSolutionError) as exc:
-                _run_docker_command(
-                    ["docker", "run", "img"],
-                    description="docker run for container ctr",
-                )
-        msg = str(exc.value)
-        assert "exit status 127" in msg
-        assert "docker run for container ctr" in msg
-        assert "Command: docker run img" in msg
-        assert "Exit code: 127" in msg
-        assert "docker: command not found" in msg
-
-    def test_called_process_error_other_code_includes_stdout_and_stderr(self):
-        err = subprocess.CalledProcessError(1, ["docker", "build", "."])
-        err.stderr = "build failed: no space left on device"
-        err.stdout = "Step 1/3 : FROM python"
-        with patch("subprocess.run", side_effect=err):
-            with pytest.raises(InvalidSolutionError) as exc:
-                _run_docker_command(["docker", "build", "."], description="docker build")
-        msg = str(exc.value)
-        assert "failed with exit code 1" in msg
-        assert "docker build" in msg
-        assert "build failed: no space left on device" in msg
-        assert "Step 1/3 : FROM python" in msg
-
-    def test_success_path_does_not_raise(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="success", stderr="")
-            result = _run_docker_command(["docker", "ps"], check=True)
-            assert result.returncode == 0
+# DockerOps unit tests (using only subprocess patches) have been moved to
+# the dedicated file: tests/unit/validator/solution/test_docker_ops.py
 
 
 @pytest.mark.integration

@@ -59,6 +59,15 @@ def check_config(cls, config: "bt.Config"):
     if not os.path.exists(config.neuron.full_path):
         os.makedirs(config.neuron.full_path, exist_ok=True)
 
+    # Ensure the configurable data dir (for DBs and solution workspaces) exists.
+    data_dir = getattr(config.neuron, "data_dir", os.environ.get("ENIGMA_DATA_DIR", "data"))
+    data_dir = os.path.expanduser(data_dir)
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir, exist_ok=True)
+    solutions_dir = os.path.join(data_dir, "solutions")
+    if not os.path.exists(solutions_dir):
+        os.makedirs(solutions_dir, exist_ok=True)
+
     if not config.neuron.dont_save_events:
         # Add custom event logger for the events.
         events_logger = setup_events_logger(
@@ -153,6 +162,13 @@ def add_miner_args(cls, parser):
         action="store_true",
         help="If set, miners will accept queries from non registered entities. (Dangerous!)",
         default=False,
+    )
+
+    parser.add_argument(
+        "--neuron.data_dir",
+        type=str,
+        help="Base directory for databases and per-solution/submission workspaces. Can also be set via ENIGMA_DATA_DIR env var.",
+        default=os.environ.get("ENIGMA_DATA_DIR", "data"),
     )
 
     parser.add_argument(
@@ -258,6 +274,13 @@ def add_validator_args(cls, parser):
         type=int,
         help="Target seconds to attempt contacting every miner at least once (throttles the full round instead of blasting as fast as possible). Default 600s = ~10 minutes per full pass.",
         default=600,
+    )
+
+    parser.add_argument(
+        "--neuron.data_dir",
+        type=str,
+        help="Base directory for databases and per-solution/submission workspaces. Can also be set via ENIGMA_DATA_DIR env var.",
+        default=os.environ.get("ENIGMA_DATA_DIR", "data"),
     )
 
 

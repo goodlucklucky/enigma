@@ -21,7 +21,7 @@ import re
 import bittensor as bt
 from pathlib import Path
 
-from .run_solution import _run_docker_command
+from .docker_ops import DockerOps
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
 
@@ -205,12 +205,12 @@ def _image_exists(image_name: str) -> bool:
     """
     cmd = ["docker", "image", "inspect", image_name]
     try:
-        result = _run_docker_command(cmd, description="docker image inspect (existence check)", check=False)
-        exists = result.returncode == 0
+        ops = DockerOps()
+        # We only care about existence; using image_inspect will run the command safely.
+        result_str = ops.image_inspect(image_name, "{{.Id}}")
+        exists = result_str is not None
         if not exists:
             bt.logging.error(f"\t❌ Image '{image_name}' does not exist")
-            if result.stderr.strip():
-                bt.logging.error(f"\t   stderr: {result.stderr.strip()}")
         return exists
     except Exception as e:
         bt.logging.error(f"\t❌ Error while checking if image '{image_name}' exists: {e}")

@@ -15,7 +15,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -53,6 +53,12 @@ class TestSolutionCrossChecker:
     def test_run_starts_cross_check_solution(self, cross_checker):
         cross_checker.solution_container_manager.validator_is_busy.return_value = False
 
+        # Make the mock support the new launching() context manager protocol
+        launch_ctx = MagicMock()
+        launch_ctx.__enter__.return_value = None
+        launch_ctx.__exit__.return_value = None
+        cross_checker.solution_container_manager.launching.return_value = launch_ctx
+
         submission = ChallengeSubmissionRead(
             id="cc-1",
             address="5Miner",
@@ -76,6 +82,7 @@ class TestSolutionCrossChecker:
 
         mock_run.assert_called_once()
         cross_checker.database_connection.db_query.insert_for_maintenance_incentive.assert_called_once()
+        cross_checker.solution_container_manager.launching.assert_called_once()
 
     def test_run_cross_check_without_challenge_id(self, cross_checker):
         cross_checker.solution_container_manager.validator_is_busy.return_value = False

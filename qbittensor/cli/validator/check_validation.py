@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import click
@@ -98,18 +99,41 @@ def main(submission_id: str, hotkey: str | None) -> None:
 
 
 def _find_validator_db(hotkey: str | None, console: Console) -> Path | None:
-    """Auto-discover the validator's local DB file."""
-    db_dir = Path(__file__).parent.parent.parent.parent / "data"
-    if not db_dir.exists():
-        console.print(f"[red]Error:[/red] No {db_dir} directory found.")
-        console.print("Run your validator at least once so it can create its database.")
-        return None
+    """Auto-discover the validator's local DB file.
 
-    candidates = sorted(db_dir.glob("challenge_solutions_*.db"))
+    Respects ENIGMA_DATA_DIR (set via --neuron.data_dir on the validator, or env)
+    so DBs in a configurable base directory are discoverable. Falls back to the
+    source-tree ./data for legacy/default runs.
+    """
+    search_dirs: list[Path] = []
+
+    env_data = os.environ.get("ENIGMA_DATA_DIR")
+    if env_data:
+        search_dirs.append(Path(env_data).expanduser().resolve())
+
+    # Legacy location relative to the package (when running from source tree with default data dir)
+    legacy_dir = Path(__file__).parent.parent.parent.parent / "data"
+    if not any(str(legacy_dir) == str(d) for d in search_dirs):
+        search_dirs.append(legacy_dir)
+
+    candidates: list[Path] = []
+    for d in search_dirs:
+        if d.exists():
+            candidates.extend(sorted(d.glob("challenge_solutions_*.db")))
+
+    # Dedup while preserving order
+    seen: set[Path] = set()
+    unique_candidates: list[Path] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique_candidates.append(c)
+    candidates = unique_candidates
 
     if not candidates:
-        console.print(f"[red]Error:[/red] No validator DB found in {db_dir}")
-        console.print("Run the validator first.")
+        searched = ", ".join(str(d) for d in search_dirs)
+        console.print(f"[red]Error:[/red] No validator DB found in {searched}")
+        console.print("Run the validator at least once (with your chosen --neuron.data_dir / ENIGMA_DATA_DIR) so it can create its database.")
         return None
 
     if hotkey:
@@ -118,7 +142,7 @@ def _find_validator_db(hotkey: str | None, console: Console) -> Path | None:
         if matches:
             return matches[0]
         console.print(f"[red]Error:[/red] No DB found for hotkey prefix '{prefix}'")
-        console.print("Available DBs:")
+        console.print("Available DBs (searched configured data dir + legacy):")
         for p in candidates:
             console.print(f"  - {p.name}")
         return None

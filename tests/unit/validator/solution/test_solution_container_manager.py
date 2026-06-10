@@ -28,6 +28,7 @@ from qbittensor.validator.solution.solution_container_manager import (
     SolutionPostProcessInfo,
     is_docker_available,
 )
+from qbittensor.validator.solution.solution_capacity import SolutionCapacity
 
 
 @pytest.fixture
@@ -90,6 +91,82 @@ class TestValidatorIsBusy:
     def test_not_busy_below_max(self, container_manager):
         with patch.object(container_manager, "_get_number_of_running_solutions", return_value=0):
             assert container_manager.validator_is_busy() is False
+
+    def test_busy_when_in_flight_even_if_docker_says_zero(self, container_manager):
+        """The in-flight marker must make us busy immediately (no gap after claim)."""
+        with patch.object(container_manager, "_get_number_of_running_solutions", return_value=0):
+            container_manager.note_launching_solution()
+            assert container_manager.validator_is_busy() is True
+
+    def test_in_flight_is_released_on_note_completed(self, container_manager):
+        with patch.object(container_manager, "_get_number_of_running_solutions", return_value=0):
+            container_manager.note_launching_solution()
+            assert container_manager.validator_is_busy() is True
+            container_manager.note_launch_completed()
+            assert container_manager.validator_is_busy() is False
+
+
+class TestSolutionCapacity:
+    """Direct unit tests for the extracted small capacity tracker."""
+
+    def test_is_busy_respects_max_and_in_flight(self):
+        cap = SolutionCapacity(max_solutions=1)
+        assert cap.is_busy(docker_running_count=0) is False
+        cap.note_launching_solution()
+        assert cap.is_busy(docker_running_count=0) is True
+        assert cap.in_flight_count == 1
+
+    def test_note_completed_decrements_and_does_not_go_negative(self):
+        cap = SolutionCapacity(max_solutions=1)
+        cap.note_launching_solution()
+        cap.note_launch_completed()
+        assert cap.in_flight_count == 0
+        cap.note_launch_completed()  # should be a no-op
+        assert cap.in_flight_count == 0
+
+    def test_docker_count_plus_in_flight(self):
+        cap = SolutionCapacity(max_solutions=1)
+        assert cap.is_busy(0) is False
+        assert cap.is_busy(1) is True
+        cap.note_launching_solution()
+        assert cap.is_busy(0) is True  # in-flight alone is enough
+
+
+class TestLaunchingContextManager:
+    def test_context_manager_marks_and_releases(self, container_manager):
+        with patch.object(container_manager, "_get_number_of_running_solutions", return_value=0):
+            assert container_manager.validator_is_busy() is False
+            with container_manager.launching():
+                assert container_manager.validator_is_busy() is True
+            assert container_manager.validator_is_busy() is False
+
+    def test_context_manager_releases_on_exception(self, container_manager):
+        with patch.object(container_manager, "_get_number_of_running_solutions", return_value=0):
+            try:
+                with container_manager.launching():
+                    assert container_manager.validator_is_busy() is True
+                    raise RuntimeError("boom")
+            except RuntimeError:
+                pass
+            assert container_manager.validator_is_busy() is False
+
+    def test_context_manager_works_when_manager_has_no_capacity_yet(self):
+        # Edge case for very early construction in some tests
+        with patch("qbittensor.validator.solution.solution_container_manager.MAX_SOLUTIONS", 1):
+            # We create a fresh one without going through the normal fixture
+            # (the fixture already patches recovery)
+            with patch("qbittensor.validator.solution.solution_container_manager.Timer"), \
+                 patch.object(SolutionContainerManager, "recover_and_clean_on_startup", lambda self: None):
+                mgr = SolutionContainerManager(
+                    platform_client=Mock(),
+                    database_connection=Mock(),
+                    validator_label="test",
+                )
+            mgr.database_connection.db_query = Mock()
+            with patch.object(mgr, "_get_number_of_running_solutions", return_value=0):
+                with mgr.launching():
+                    assert mgr.validator_is_busy() is True
+                assert mgr.validator_is_busy() is False
 
 
 class TestExtractOutputsFromCompletedContainers:
@@ -497,7 +574,12 @@ class TestDockerResourcePrune:
 
     def test_prune_timeout_is_handled(self, container_manager):
         with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["docker"], timeout=1)):
-            container_manager._prune_docker_resources()  # must not raise
+            container_manager._prune_docker_resources()  # still must not raise
+
+
+# DockerOps-specific unit tests have been moved to their own file:
+# tests/unit/validator/solution/test_docker_ops.py
+# (kept separate so DockerOps can be tested in isolation with only subprocess mocks)
 
 
 # =============================================================================

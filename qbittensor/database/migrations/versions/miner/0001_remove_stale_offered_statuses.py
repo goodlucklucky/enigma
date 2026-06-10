@@ -30,7 +30,7 @@ DESCRIPTION = "Remove pre-archive OFFERED statuses"
 CUTOFF_ISO = "2026-06-09 20:00:00"
 
 
-def upgrade(engine):
+def upgrade(engine, telemetry_service=None):
     """Delete OFFERED miner_submission_statuses rows older than the cutoff."""
     with engine.connect() as conn:
         # Only act if the table exists (fresh miner DBs have no data to clean).
@@ -54,7 +54,7 @@ def upgrade(engine):
         conn.commit()
 
 
-def downgrade(engine):
+def downgrade(engine, telemetry_service=None):
     """Downgrade is not supported (we intentionally discard the old OFFERED markers)."""
     # Intentionally a no-op. Re-inserting the deleted OFFERED rows would require
     # knowledge of which (validator, tx, milestone) tuples had been offered before

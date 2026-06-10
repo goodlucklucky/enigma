@@ -31,6 +31,7 @@ from qbittensor.dto.challenge import (
 from qbittensor.validator.solution.run import execute_verified_solution
 from qbittensor.database.db_connection import DBConnection
 from qbittensor.utils.services.challenges import ChallengesClient
+from qbittensor.validator.solution.solution_container_manager import SolutionContainerManager
 
 from qbittensor.utils.transfer_proof import verify_transfer_proof_for_synapse
 from qbittensor.utils.services.telemetry import TelemetryService
@@ -48,6 +49,7 @@ class ResponseProcessor:
         subtensor: bt.Subtensor,
         platform_client: ChallengesClient,
         telemetry_service: TelemetryService | None = None,
+        solution_container_manager: SolutionContainerManager | None = None,
     ):
 
         # Setup object references
@@ -59,6 +61,7 @@ class ResponseProcessor:
         self.subtensor: bt.Subtensor = subtensor
         self.platform_client: ChallengesClient = platform_client
         self.telemetry_service: TelemetryService | None = telemetry_service
+        self.solution_container_manager: SolutionContainerManager | None = solution_container_manager
 
     def process_synapses(self, synapses: List[SolutionSynapse] | None, validator_busy: bool) -> None:
         """Process inbound synapses from miners"""
@@ -355,33 +358,60 @@ class ResponseProcessor:
                         },
                     )
 
-                # This path is only reached if the platform returned a full response object
-                # (e.g. 201) even though we sent validator_busy=True. With current platform
-                # behavior, busy claims return 202 (handled in the response is None block above).
-                # We keep the block for robustness and to preserve the "do not execute" guarantee.
+                # This path is only reached if the platform returned a full response object (with
+                # submission id + download url) even though our local snapshot said we were busy.
+                # Platform create() for brand new subs now respects isBusy and returns null (202).
+                # tryClaim paths (late reports on existing subs) previously could still promote to
+                # Running for a busy caller on all-NotRun primaries or cross-checks. We now prevent
+                # that in tryClaim, but keep this block + explicit NotRun report for robustness and
+                # to clean any pre-fix or racy promotions. Preserves the "do not execute when busy" rule.
                 if validator_busy:
                     bt.logging.info(
                         f"⏸️  Validator busy — successfully claimed tx_hash {synapse.tx_hash} on platform "
-                        "(will not execute this cycle). Platform will re-offer via /next when capacity exists."
+                        "(will not execute this cycle). Reporting NotRun to free the slot; will be re-offered via /next when capacity exists."
                     )
+                    # Platform may have set our row to Running (e.g. late-claim/tryClaim on eligible sub even
+                    # when we reported busy). Immediately report NotRun so it does not become a phantom
+                    # "Running" with zero containers. This keeps cloud capacity view accurate (we enforce
+                    # only 1 concurrent via MAX_SOLUTIONS=1 + docker ps) and returns the work to NotRun
+                    # backlog for a future idle validator (including us) to pick via cross-check /next.
+                    if response is not None:
+                        submission_id = getattr(response, "id", None)
+                        if submission_id:
+                            self.platform_client.report_submission_status(
+                                submission_id=submission_id,
+                                status="NotRun",
+                                reason="Validator was at capacity (busy=true) when this claim was processed; execution skipped. Reset to NotRun so platform can re-offer via /submissions/next to an idle validator.",
+                            )
                     continue
 
                 # Extract the download url and run the solution
                 download_url: str = response.file_download_url
 
-                image_name, container_id, folder_name = execute_verified_solution(
-                    db_conn=self.database_connection,
-                    platform_client=self.platform_client,
-                    validator_label=self.validator_label,
-                    download_url=download_url,
-                    challenge_id=challenge_id,
-                    challenge_milestone_id=solution_candidate.challenge_milestone_id,
-                    challenge_validation_solution_id=solution_candidate.upload_endpoint_id,
-                    submission_id=response.id,
-                    tx_hash=synapse.tx_hash,
-                    miner_hotkey=miner_hotkey,
-                    telemetry_service=self.telemetry_service,
-                )
+                # Use the launching() context manager when available. This makes the
+                # commitment to a slot visible immediately (for busy snapshots and
+                # future /next checks) and ensures we always release it.
+                if self.solution_container_manager is not None:
+                    launch_ctx = self.solution_container_manager.launching()
+                else:
+                    # Fallback for tests / old construction that didn't pass the manager
+                    from contextlib import nullcontext
+                    launch_ctx = nullcontext()
+
+                with launch_ctx:
+                    image_name, container_id, folder_name = execute_verified_solution(
+                        db_conn=self.database_connection,
+                        platform_client=self.platform_client,
+                        validator_label=self.validator_label,
+                        download_url=download_url,
+                        challenge_id=challenge_id,
+                        challenge_milestone_id=solution_candidate.challenge_milestone_id,
+                        challenge_validation_solution_id=solution_candidate.upload_endpoint_id,
+                        submission_id=response.id,
+                        tx_hash=synapse.tx_hash,
+                        miner_hotkey=miner_hotkey,
+                        telemetry_service=self.telemetry_service,
+                    )
 
                 bt.logging.info(f"Started solution with image name {image_name} and container id {container_id}. Solution files are located in {folder_name}")
                 solution_started = True

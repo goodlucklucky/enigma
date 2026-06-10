@@ -16,13 +16,10 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import os
 import time
 import typing
 from types import SimpleNamespace
-
-from qbittensor.utils.env import get_api_config
-
-_api_cfg = get_api_config()
 
 import bittensor as bt
 
@@ -30,7 +27,6 @@ import bittensor as bt
 from qbittensor.database.db_connection import DBConnection
 from qbittensor.database.miner.db_query import DBQueryMiner
 from qbittensor.base.miner import BaseMinerNeuron
-from qbittensor.utils.services.telemetry import TelemetryService
 from qbittensor.miner.solution_polling import SolutionPoller
 from qbittensor.database.miner.db_models import MinerSubmission
 from qbittensor.dto.challenge import SolutionCandidate
@@ -46,18 +42,16 @@ class Miner(BaseMinerNeuron):
         # Call to super ctor
         super(Miner, self).__init__(config=config)
 
-        # TelemetryService owns its own RequestManager (pointed at the telemetry service).
-        self.telemetry_service: TelemetryService = TelemetryService(
-            keypair=self.wallet.hotkey,
-            base_url=_api_cfg.telemetry_api_url,
-            tensorauth_url=_api_cfg.tensorauth_url,
-            netuid=self.config.netuid,
-            service_name=f"bittensor.sn{self.config.netuid}.miner",
-            network=self.subtensor.network,
-        )
+        # Make data_dir from config (or --neuron.data_dir) available via ENIGMA_DATA_DIR
+        # so DB resolution and any solution/submission workspaces pick it up consistently.
+        data_dir = getattr(self.config.neuron, "data_dir", None)
+        if data_dir:
+            os.environ["ENIGMA_DATA_DIR"] = os.path.expanduser(data_dir)
+        effective_data_dir = os.environ.get("ENIGMA_DATA_DIR") or data_dir or "data"
+        bt.logging.info(f"📁 Using data directory base: {effective_data_dir} (databases + submission workspaces)")
 
         # Build solution poller
-        db_conn = DBConnection(database_name_prefix=MINER_DB_TABLE_PREFIX, hotkey=self.wallet.hotkey.ss58_address)
+        db_conn = DBConnection(database_name_prefix=MINER_DB_TABLE_PREFIX, hotkey=self.wallet.hotkey.ss58_address, data_dir=data_dir)
         self.db_query: DBQueryMiner = db_conn.db_query_miner
         bt.logging.info(f"🗄️  Miner using DB: {db_conn.DB_PATH}")
         self.solution_poller: SolutionPoller = SolutionPoller(db_query=self.db_query)

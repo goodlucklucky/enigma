@@ -37,8 +37,8 @@ class TestManageFiles:
         monkeypatch.chdir(tmp_path)
         with patch("qbittensor.validator.solution.manage_files.time.time", return_value=12345):
             tag, folder = manage_files.setup("label", "sol-id")
-        assert tag == folder
-        assert folder == "label_sol-id_12345"
+        assert tag == "label_sol-id_12345"
+        assert folder == "data/solutions/label_sol-id_12345"
         assert (tmp_path / folder).is_dir()
 
     def test_cleanup_removes_folder(self, tmp_path):
@@ -46,6 +46,21 @@ class TestManageFiles:
         folder.mkdir()
         manage_files.cleanup(str(folder))
         assert not folder.exists()
+
+    def test_setup_respects_enigma_data_dir_env(self, tmp_path, monkeypatch):
+        """When ENIGMA_DATA_DIR is set (from --neuron.data_dir), workspaces go under <data>/solutions/."""
+        custom_base = tmp_path / "custom_data"
+        monkeypatch.setenv("ENIGMA_DATA_DIR", str(custom_base))
+        # No chdir needed; setup will compute absolute under the env value + /solutions
+        with patch("qbittensor.validator.solution.manage_files.time.time", return_value=12345):
+            tag, folder = manage_files.setup("label", "sol-id")
+        assert tag == "label_sol-id_12345"
+        # folder will be absolute when env provides an absolute base
+        expected = custom_base / "solutions" / "label_sol-id_12345"
+        assert Path(folder).resolve() == expected.resolve()
+        assert Path(folder).is_dir()
+        # Also ensure it did not pollute a "data/" relative to cwd
+        assert not (tmp_path / "data").exists()
 
 
 class TestDownloadZip:

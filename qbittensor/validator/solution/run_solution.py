@@ -27,6 +27,7 @@ import bittensor as bt
 
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
+from .docker_ops import DockerOps
 from .solution_context import SolutionExecution
 from .constants import (
     CHALLENGE_INPUT_DIRNAME,
@@ -131,11 +132,10 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
 
     max_bytes = _stdout_max_bytes()
     try:
-        result = subprocess.run(
-            ["docker", "logs", container_ref],
-            capture_output=True,
-            check=True,
-        )
+        ops = DockerOps()
+        # Use dedicated logs() method (which uses run_command internally but with proper API)
+        raw_stdout_str = ops.logs(container_ref, check=True)
+        raw_stdout = raw_stdout_str.encode("utf-8", errors="replace") if isinstance(raw_stdout_str, str) else (raw_stdout_str or b"")
     except subprocess.CalledProcessError as e:
         stderr = ((e.stderr or e.stdout or b"").decode("utf-8", errors="replace")).strip()
         bt.logging.error(
@@ -143,12 +143,12 @@ def extract_stdout_output(container_ref: str, host_workspace: str) -> bool:
         )
         _write_extraction_diagnostics(artifacts_dir, container_ref, f"docker logs failed: {stderr}")
         return False
-    except OSError as e:
+    except Exception as e:
         bt.logging.error(f"❌ Failed to invoke docker logs for '{container_ref}': {e}")
         _write_extraction_diagnostics(artifacts_dir, container_ref, f"Failed to invoke docker logs: {e}")
         return False
 
-    raw_stdout = result.stdout or b""
+    raw_stdout = raw_stdout or b""
     if len(raw_stdout) > max_bytes:
         bt.logging.error(
             f"❌ Container '{container_ref}' produced {len(raw_stdout)} bytes of stdout, "
@@ -435,65 +435,6 @@ def docker_run_security_args() -> list[str]:
     return args
 
 
-def _run_docker_command(
-    cmd: list[str],
-    description: str = "docker command",
-    check: bool = True,
-) -> subprocess.CompletedProcess:
-    """
-    Centralized helper for running Docker CLI commands.
-
-    - Always captures stdout/stderr as text.
-    - On failure (non-zero exit or 'docker' not found), raises InvalidSolutionError
-      with a rich, platform-friendly message containing the full command,
-      exit code, stderr, and stdout.
-    - This ensures we always get actionable diagnostics sent to the cloud.
-    """
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=check,
-        )
-        return result
-
-    except FileNotFoundError as e:
-        msg = (
-            f"Docker CLI not found while running {description}. "
-            "The 'docker' executable is not available in the PATH of the validator process. "
-            "Is Docker installed and properly integrated (especially on WSL)?"
-        )
-        bt.logging.error(f"❌ {msg} | command={' '.join(cmd)} | {e}")
-        raise InvalidSolutionError(message=msg) from e
-
-    except subprocess.CalledProcessError as e:
-        returncode = e.returncode
-        stderr = (e.stderr or "").strip() or "(no stderr captured)"
-        stdout = (e.stdout or "").strip() or "(no stdout captured)"
-
-        if returncode == 127:
-            detail = f"Docker command not found (exit status 127) while running {description}"
-        else:
-            detail = f"{description} failed with exit code {returncode}"
-
-        bt.logging.error(
-            f"❌ {detail}\n"
-            f"   Command: {' '.join(cmd)}\n"
-            f"   stderr:\n{stderr}\n"
-            f"   stdout:\n{stdout}"
-        )
-
-        platform_msg = (
-            f"{detail}\n\n"
-            f"Command: {' '.join(cmd)}\n"
-            f"Exit code: {returncode}\n\n"
-            f"stderr:\n{stderr}\n\n"
-            f"stdout:\n{stdout}"
-        )
-        raise InvalidSolutionError(message=platform_msg) from e
-
-
 def run_image_detached(
     image_name: str,
     container_name: str,
@@ -539,11 +480,11 @@ def run_image_detached(
     cmd.append(image_name)
 
     try:
-        result = _run_docker_command(
-            cmd,
+        ops = DockerOps(validator_label=validator_label)
+        container_id = ops.run(
+            cmd[1:],  # strip the leading "docker" because DockerOps.run() prepends it
             description=f"docker run for container {container_name}",
         )
-        container_id = result.stdout.strip()
 
         bt.logging.info(
             f"🚀 Container '{container_name}' started in background (ID: {container_id}) "
@@ -552,7 +493,7 @@ def run_image_detached(
         return container_id
 
     except InvalidSolutionError:
-        # Already has rich diagnostics from the helper
+        # Already has rich diagnostics from DockerOps
         raise
 
     except Exception as e:

@@ -39,6 +39,7 @@ from .validate_solution_output import (
     establish_upload_locations_for_solution_data,
     upload_logs_package,
 )
+from .docker_ops import DockerOps
 from .validate_docker_image import reject_dockerfile, validate_image
 from .run_solution import prepare_challenge_input_mount_dir, run_image_detached
 from qbittensor.utils.solution_status import SolutionStatus
@@ -126,11 +127,11 @@ def run_solution_management(
 
         # Setup
         bt.logging.info(f"Setting up folder for solution id: {challenge_validation_solution_id}")
-        solution_tag, folder_name = setup(validator_label, challenge_validation_solution_id=challenge_validation_solution_id)
-        absolute_path_to_host_folder = os.path.abspath(folder_name)
+        solution_tag, folder_path = setup(validator_label, challenge_validation_solution_id=challenge_validation_solution_id)
+        absolute_path_to_host_folder = os.path.abspath(folder_path)
 
         # Download zip
-        local_filepath = download_zip(url=download_url, folder_name=folder_name)
+        local_filepath = download_zip(url=download_url, folder_name=folder_path)
         if local_filepath is None:
             bt.logging.error("Failed to download zip file.")
             raise InvalidSolutionError(message=ValidationErrors.ZIP_DOWNLOAD_FAILED.value)
@@ -144,18 +145,18 @@ def run_solution_management(
 
         # Extract code from zip
         bt.logging.info("Extracting code from zip...")
-        unzip(folder_name=folder_name, source_filepath=local_filepath)
+        unzip(folder_name=folder_path, source_filepath=local_filepath)
 
         # Validate code
         bt.logging.info("Validating code...")
-        code_is_valid = validate_code(folder_name=folder_name)
+        code_is_valid = validate_code(folder_name=folder_path)
         if not code_is_valid:
             bt.logging.error("Code validation failed.")
             raise InvalidSolutionError(message=ValidationErrors.INVALID_PROGRAM.value)
 
         # Validate Dockerfile security policy
         bt.logging.info("Validating Dockerfile policy...")
-        if not reject_dockerfile(folder_name=folder_name):
+        if not reject_dockerfile(folder_name=folder_path):
             bt.logging.error("Dockerfile policy validation failed.")
             raise InvalidSolutionError(message=ValidationErrors.INVALID_PROGRAM.value)
 
@@ -173,7 +174,7 @@ def run_solution_management(
         # We pass build_log_path so the full --progress=plain output is persisted for upload.
         build_image(
             image_name=image_name,
-            dockerfile_dir=f"{folder_name}/code",
+            dockerfile_dir=f"{folder_path}/code",
             build_log_path=build_log_path,
         )
 
@@ -282,7 +283,7 @@ def run_solution_management(
         if not did_start_solution:
             clean_up_failed_solution(image_name=image_name, container_id=container_id, folder_name=absolute_path_to_host_folder)
 
-    return image_name, container_id, folder_name
+    return image_name, container_id, folder_path
 
 
 def clean_up_failed_solution(image_name: str | None, container_id: str | None, folder_name: str | None) -> None:
@@ -290,27 +291,21 @@ def clean_up_failed_solution(image_name: str | None, container_id: str | None, f
     cleaned = 0
     total = sum(1 for x in (container_id, image_name, folder_name) if x)
 
+    docker = DockerOps()
+
     if container_id is not None:
-        remove_container_result = subprocess.run(["docker", "rm", "-fv", container_id], check=False, capture_output=True, text=True)
-        if remove_container_result.returncode == 0:
+        if docker.rm(container_id, volumes=True):
             bt.logging.info(f"🗑️ Removed container {container_id}")
             cleaned += 1
         else:
-            bt.logging.warning(
-                f"⚠️ Failed to remove container {container_id}: "
-                f"{(remove_container_result.stderr or remove_container_result.stdout).strip()}"
-            )
+            bt.logging.warning(f"⚠️ Failed to remove container {container_id}")
 
     if image_name is not None:
-        remove_image_result = subprocess.run(["docker", "rmi", "-f", image_name], check=False, capture_output=True, text=True)
-        if remove_image_result.returncode == 0:
+        if docker.rmi(image_name, force=True):
             bt.logging.info(f"🗑️ Removed image {image_name}")
             cleaned += 1
         else:
-            bt.logging.warning(
-                f"⚠️ Failed to remove image {image_name}: "
-                f"{(remove_image_result.stderr or remove_image_result.stdout).strip()}"
-            )
+            bt.logging.warning(f"⚠️ Failed to remove image {image_name}")
 
     if folder_name is not None:
         remove_folder_result = subprocess.run(["rm", "-rf", folder_name], check=False, capture_output=True, text=True)

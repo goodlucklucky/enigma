@@ -34,6 +34,17 @@ class TestResolveDbDir:
         monkeypatch.delenv("ENIGMA_REPO_ROOT", raising=False)
         assert _resolve_db_dir() == (tmp_path / "custom_data").resolve()
 
+    def test_data_dir_override_param_takes_precedence(self, tmp_path, monkeypatch):
+        """Explicit data_dir arg to _resolve and DBConnection should win over env."""
+        monkeypatch.setenv("ENIGMA_DATA_DIR", str(tmp_path / "from_env"))
+        override = tmp_path / "from_override"
+        assert _resolve_db_dir(data_dir_override=str(override)) == override.resolve()
+
+        # DBConnection should use the passed data_dir for its DB_DIR
+        conn = DBConnection("miner_submissions", "5TestHotkey", data_dir=str(override))
+        db_path = Path(conn.DB_PATH)
+        assert db_path.parent == override.resolve() or db_path.parent.parent == override.resolve() or str(override) in str(db_path)
+
     def test_enigma_repo_root_override(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
         repo.mkdir()

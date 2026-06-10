@@ -23,7 +23,7 @@ from typing import Tuple
 import os
 from threading import RLock
 
-data_dir = "data"
+data_dir = os.environ.get("ENIGMA_DATA_DIR", "data")
 
 
 class DatabaseManager:

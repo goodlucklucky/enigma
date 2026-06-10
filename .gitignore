@@ -172,8 +172,9 @@ broadcast
 # Solution Files
 sn63solution_*
 
-# Database Files
-data/*
+# Data directory (databases, per-solution workspaces under data/solutions/, etc.)
+# These can be large and must not be committed.
+data/
 
 # Proposals
 proposals

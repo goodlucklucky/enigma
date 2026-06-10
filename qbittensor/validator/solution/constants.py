@@ -17,6 +17,12 @@
 
 CHALLENGE_SOLTION_PREFIX: str = "sn63solution"
 
+# Fallback base directory under which per-solution workspaces are created
+# (when ENIGMA_DATA_DIR env / --neuron.data_dir is not set).
+# Workspaces end up under <base>/solutions/...
+# These directories can become large and must never be committed to git.
+SOLUTIONS_BASE_DIR: str = "data/solutions"
+
 # Host subfolder under each per-solution workspace where the validator materializes
 # the miner's stdout-delivered payload (see run_solution.extract_stdout_output):
 #   <workspace>/output/stdout.log              — text logs (everything before the separator)

@@ -29,6 +29,7 @@ from qbittensor.validator.solution.constants import (
     VALIDATOR_DOCKER_GPUS_DEFAULT,
     VALIDATOR_DOCKER_GPUS_ENV,
 )
+from qbittensor.validator.solution.docker_ops import DockerOps
 
 _GPU_VERIFICATION_DIR = Path(__file__).resolve().parent
 _DEFAULT_IMAGE_NAME = "enigma-validator-gpu-verification"
@@ -44,12 +45,7 @@ def _gpu_passthrough() -> str:
 
 
 def _remove_gpu_verification_image(image_name: str) -> None:
-    subprocess.run(
-        ["docker", "rmi", "-f", image_name],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
+    DockerOps().rmi(image_name, force=True)
 
 
 def test_gpu_container(
@@ -74,13 +70,9 @@ def test_gpu_container(
     image_built = False
     try:
         bt.logging.info(f"Building GPU verification image '{image_name}' from {build_dir}")
+        ops = DockerOps()
         try:
-            subprocess.run(
-                ["docker", "build", "-t", image_name, build_dir],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            ops.build_image(build_dir, tags=[image_name])
         except subprocess.CalledProcessError as exc:
             bt.logging.error(f"GPU image build failed (exit {exc.returncode})")
             if exc.stderr:
@@ -91,12 +83,7 @@ def test_gpu_container(
 
         bt.logging.info(f"Running GPU verification container (gpus={gpus_arg!r})")
         try:
-            run_result = subprocess.run(
-                ["docker", "run", "--rm", "--gpus", gpus_arg, image_name],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            run_result = ops.run_container(image_name, gpus=gpus_arg, rm=True)
         except subprocess.CalledProcessError as exc:
             bt.logging.error(f"GPU container run failed (exit {exc.returncode})")
             combined = (exc.stdout or "") + (exc.stderr or "")

@@ -224,7 +224,7 @@ def run_migrations_for_db(engine: Engine, database_name_prefix: str, telemetry_s
         runner = MigrationRunner(scope="validator", telemetry_service=telemetry_service)
         runner.run(engine)
     elif database_name_prefix == "miner_submissions":
-        runner = MigrationRunner(scope="miner")
+        runner = MigrationRunner(scope="miner", telemetry_service=telemetry_service)
         runner.run(engine)
     else:
         # Unknown / future DB types – run nothing but don't crash

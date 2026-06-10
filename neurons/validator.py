@@ -17,6 +17,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 import asyncio
+import os
 from typing import Any, List
 import time
 
@@ -54,6 +55,14 @@ class Validator(BaseValidatorNeuron):
     def __init__(self, config=None):
         super(Validator, self).__init__(config=config)
 
+        # Make data_dir from config (or --neuron.data_dir) available via ENIGMA_DATA_DIR
+        # so DB resolution and solution workspace paths pick it up consistently.
+        data_dir = getattr(self.config.neuron, "data_dir", None)
+        if data_dir:
+            os.environ["ENIGMA_DATA_DIR"] = os.path.expanduser(data_dir)
+        effective_data_dir = os.environ.get("ENIGMA_DATA_DIR") or data_dir or "data"
+        bt.logging.info(f"📁 Using data directory base: {effective_data_dir} (databases + solution workspaces)")
+
         # Each high-level client owns its own RequestManager (per the design).
         # This eliminates the old shared RM with multiple service URLs.
         self.telemetry_service = TelemetryService(
@@ -76,6 +85,7 @@ class Validator(BaseValidatorNeuron):
             database_name_prefix="challenge_solutions",
             hotkey=my_hotkey,
             telemetry_service=self.telemetry_service,
+            data_dir=data_dir,
         )
         bt.logging.info(f"🗄️  Validator using DB: {self.database_connection.DB_PATH}")
 
@@ -98,6 +108,13 @@ class Validator(BaseValidatorNeuron):
 
         challenges_rm = self.platform_client.request_manager
 
+        # Create the container manager first so we can pass it to the response processor.
+        # This lets the direct (miner synapse) path call note_launching_solution()
+        # immediately when it commits to running a submission.
+        self.solution_container_manager: SolutionContainerManager = SolutionContainerManager(
+            self.platform_client, self.database_connection, VALIDATOR_LABEL, self.telemetry_service
+        )
+
         self.response_processor: ResponseProcessor = ResponseProcessor(
             challenges_rm,
             self.metagraph,
@@ -107,9 +124,7 @@ class Validator(BaseValidatorNeuron):
             self.subtensor,
             self.platform_client,
             telemetry_service=self.telemetry_service,
-        )
-        self.solution_container_manager: SolutionContainerManager = SolutionContainerManager(
-            self.platform_client, self.database_connection, VALIDATOR_LABEL, self.telemetry_service
+            solution_container_manager=self.solution_container_manager,
         )
 
         self.cross_check: SolutionCrossChecker = SolutionCrossChecker(

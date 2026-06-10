@@ -108,8 +108,11 @@ def _project_root_from_cwd() -> Path | None:
     return _first_project_root_walking_up(Path.cwd())
 
 
-def _resolve_db_dir() -> Path:
+def _resolve_db_dir(data_dir_override: str | None = None) -> Path:
     """``<project-root>/data`` where project root is detected structurally (name-agnostic)."""
+    if data_dir_override:
+        return Path(data_dir_override).expanduser().resolve()
+
     data_dir = os.environ.get("ENIGMA_DATA_DIR")
     if data_dir:
         return Path(data_dir).expanduser().resolve()
@@ -155,10 +158,10 @@ class DBConnection:
 
     # `database_name` is either "challenge_solutions" or "miner_submissions"
 
-    def __init__(self, database_name_prefix: str, hotkey: str, telemetry_service: "TelemetryService | None" = None):
+    def __init__(self, database_name_prefix: str, hotkey: str, telemetry_service: "TelemetryService | None" = None, data_dir: str | None = None):
         self.database_name_prefix = database_name_prefix
         self.telemetry_service: "TelemetryService | None" = telemetry_service
-        DB_DIR = _resolve_db_dir()
+        DB_DIR = _resolve_db_dir(data_dir_override=data_dir)
         DB_NAME = f'{database_name_prefix}_{hotkey[0:5]}.db'
         os.makedirs(DB_DIR, exist_ok=True)
 

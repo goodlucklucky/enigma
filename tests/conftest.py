@@ -46,14 +46,14 @@ def tmp_data_dir(tmp_path, monkeypatch):
 def validator_db(tmp_data_dir):
     from qbittensor.database.db_connection import DBConnection
 
-    return DBConnection("challenge_solutions", "5TestHotkeyForDb")
+    return DBConnection("challenge_solutions", "5TestHotkeyForDb", data_dir=str(tmp_data_dir))
 
 
 @pytest.fixture
 def miner_db(tmp_data_dir):
     from qbittensor.database.db_connection import DBConnection
 
-    return DBConnection("miner_submissions", "5TestHotkeyForDb")
+    return DBConnection("miner_submissions", "5TestHotkeyForDb", data_dir=str(tmp_data_dir))
 
 
 def _docker_available() -> bool:
