@@ -83,6 +83,18 @@ class SolutionCrossChecker:
                 f"✅ Reusing cached transfer proof verification for tx_hash {submission.tx_hash} "
                 f"(result={'success' if proof_ok else 'failure'}) from verified_tx_hashes"
             )
+            if self.telemetry_service:
+                self.telemetry_service.record_event(
+                    "transfer_proof_verified",
+                    value=1 if proof_ok else 0,
+                    miner_hotkey=submission.address,
+                    attributes={
+                        "tx_hash": submission.tx_hash,
+                        "result": "success" if proof_ok else "failure",
+                        "error": str(proof_err)[:200] if proof_err else None,
+                        "source": "cache",
+                    },
+                )
         else:
             # Not in cache — perform full verification (and it will be cached by the normal path
             # or we record it here for future cross-checks).
@@ -109,6 +121,19 @@ class SolutionCrossChecker:
                 error_message=str(proof_err)[:500] if proof_err else None,
                 miner_hotkey=submission.address,
             )
+
+            if self.telemetry_service:
+                self.telemetry_service.record_event(
+                    "transfer_proof_verified",
+                    value=1 if proof_ok else 0,
+                    miner_hotkey=submission.address,
+                    attributes={
+                        "tx_hash": submission.tx_hash,
+                        "result": "success" if proof_ok else "failure",
+                        "error": str(proof_err)[:200] if proof_err else None,
+                        "source": "fresh",
+                    },
+                )
 
             if not proof_ok:
                 bt.logging.error(

@@ -15,6 +15,8 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
@@ -27,7 +29,12 @@ from .validator.db_query import DBQuery
 from .miner.db_query import DBQueryMiner
 
 # Generic migration runner
+from typing import TYPE_CHECKING
+
 from .migrations.runner import run_migrations_for_db
+
+if TYPE_CHECKING:
+    from qbittensor.utils.services.telemetry import TelemetryService
 
 
 def _package_fallback_project_root() -> Path:
@@ -148,8 +155,9 @@ class DBConnection:
 
     # `database_name` is either "challenge_solutions" or "miner_submissions"
 
-    def __init__(self, database_name_prefix: str, hotkey: str):
+    def __init__(self, database_name_prefix: str, hotkey: str, telemetry_service: "TelemetryService | None" = None):
         self.database_name_prefix = database_name_prefix
+        self.telemetry_service: "TelemetryService | None" = telemetry_service
         DB_DIR = _resolve_db_dir()
         DB_NAME = f'{database_name_prefix}_{hotkey[0:5]}.db'
         os.makedirs(DB_DIR, exist_ok=True)
@@ -186,7 +194,7 @@ class DBConnection:
             # Run the generic migration system first.
             # This is the new standard path for all schema evolution.
             # For validator DBs this will apply any pending migrations.
-            run_migrations_for_db(engine, self.database_name_prefix)
+            run_migrations_for_db(engine, self.database_name_prefix, telemetry_service=self.telemetry_service)
 
             # Only create tables for this DB — shared Base.metadata includes every
             # imported model (miner + challenge), which would otherwise create all of them.

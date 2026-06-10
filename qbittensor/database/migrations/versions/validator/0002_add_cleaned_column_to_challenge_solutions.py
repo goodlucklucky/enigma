@@ -33,7 +33,7 @@ VERSION = 2
 DESCRIPTION = "Add 'cleaned' boolean column to challenge_solutions"
 
 
-def upgrade(engine):
+def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
     """Add the cleaned column.
 
     - For brand new DBs: the table will be created later by create_all() with the column (default false for new rows).

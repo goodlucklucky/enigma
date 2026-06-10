@@ -72,7 +72,11 @@ class Validator(BaseValidatorNeuron):
         my_hotkey = self.wallet.hotkey.ss58_address
         VALIDATOR_LABEL: str = f"{CHALLENGE_SOLTION_PREFIX}_{my_hotkey[0:5]}"
 
-        self.database_connection: DBConnection = DBConnection(database_name_prefix="challenge_solutions", hotkey=my_hotkey)
+        self.database_connection: DBConnection = DBConnection(
+            database_name_prefix="challenge_solutions",
+            hotkey=my_hotkey,
+            telemetry_service=self.telemetry_service,
+        )
         bt.logging.info(f"🗄️  Validator using DB: {self.database_connection.DB_PATH}")
 
         # Early Docker sanity check (very important for solution execution)

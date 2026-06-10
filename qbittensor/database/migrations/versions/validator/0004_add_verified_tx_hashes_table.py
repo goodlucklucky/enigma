@@ -45,7 +45,7 @@ VERSION = 4
 DESCRIPTION = "Add verified_tx_hashes table (local verification cache for tx proofs)"
 
 
-def upgrade(engine):
+def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
     """Create the table (if missing) and backfill known successful tx_hashes."""
     with engine.connect() as conn:
         # Idempotent table creation using raw SQL for SQLite compatibility and safety.

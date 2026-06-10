@@ -15,6 +15,8 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+from __future__ import annotations
+
 """
 Generic, versioned database migration runner for Enigma.
 
@@ -29,8 +31,6 @@ Design goals:
 This system is intended to be the standard way all future schema changes are delivered.
 """
 
-from __future__ import annotations
-
 import importlib
 import logging
 import pkgutil
@@ -38,9 +38,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy import Column, Integer, String, DateTime, text, func
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+if TYPE_CHECKING:
+    from qbittensor.utils.services.telemetry import TelemetryService
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +93,16 @@ class MigrationRunner:
         runner.run(engine)
     """
 
-    def __init__(self, scope: str = "validator"):
+    def __init__(self, scope: str = "validator", telemetry_service: "TelemetryService | None" = None):
         """
         Args:
             scope: Logical scope of migrations ("validator" or "miner").
                    Used to select which package of migrations to load.
+            telemetry_service: Optional telemetry service for dumping data during
+                               special migrations (e.g. pre-update snapshots of verified tx cache).
         """
         self.scope = scope.lower()
+        self.telemetry_service: "TelemetryService | None" = telemetry_service
         self._migrations: list[Migration] | None = None
 
     def _get_migrations_package(self) -> str:
@@ -181,7 +189,7 @@ class MigrationRunner:
             logger.info(f"[{self.scope}] Applying migration {migration.version}: {migration.description}")
 
             try:
-                migration.upgrade(engine)
+                migration.upgrade(engine, telemetry_service=self.telemetry_service)
 
                 with Session() as session:
                     session.add(
@@ -206,14 +214,14 @@ class MigrationRunner:
 # --------------------------------------------------------------------------- #
 
 
-def run_migrations_for_db(engine: Engine, database_name_prefix: str) -> None:
+def run_migrations_for_db(engine: Engine, database_name_prefix: str, telemetry_service: "TelemetryService | None" = None) -> None:
     """
     Decide which migration scope to run based on the database being opened.
 
     This is the function called from DBConnection during startup.
     """
     if database_name_prefix == "challenge_solutions":
-        runner = MigrationRunner(scope="validator")
+        runner = MigrationRunner(scope="validator", telemetry_service=telemetry_service)
         runner.run(engine)
     elif database_name_prefix == "miner_submissions":
         runner = MigrationRunner(scope="miner")
