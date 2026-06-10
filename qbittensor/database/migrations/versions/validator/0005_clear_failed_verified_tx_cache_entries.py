@@ -50,7 +50,7 @@ VERSION = 5
 DESCRIPTION = "Clear cached verification failures so they can be re-verified with archive/Subscan support"
 
 
-def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
+def upgrade(engine, telemetry_service=None):
     """Delete all previously-cached failure records (success=0).
 
     Failures are deleted rather than force-updated to success=1 because:

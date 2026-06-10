@@ -63,6 +63,7 @@ DESCRIPTION = "Force success on pre-2026-06-10 verified_tx_hashes failures to un
 
 CUTOFF = "2026-06-10"
 
+
 def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
     """Force success=True on old failure rows, with a note in error_message.
     Before updating, dump the affected rows via telemetry for audit.
@@ -112,6 +113,7 @@ def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
             )
         )
         conn.commit()
+
 
 def downgrade(engine):
     """Downgrade is not supported (we intentionally force-successed old entries for re-run usability)."""

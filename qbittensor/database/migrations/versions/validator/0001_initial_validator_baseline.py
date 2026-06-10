@@ -31,7 +31,7 @@ VERSION = 1
 DESCRIPTION = "Establish migration system and baseline for validator DB"
 
 
-def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
+def upgrade(engine, telemetry_service=None):
     """
     This migration is effectively a no-op for table structure.
 

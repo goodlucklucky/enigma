@@ -34,7 +34,7 @@ VERSION = 3
 DESCRIPTION = "Add 'max_solution_runtime_seconds' integer column to challenge_solutions"
 
 
-def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
+def upgrade(engine, telemetry_service=None):
     """Add the max_solution_runtime_seconds column (nullable, no backfill)."""
     with engine.connect() as conn:
         # Check if the table even exists yet (for fresh DBs, migrations run before create_all)
