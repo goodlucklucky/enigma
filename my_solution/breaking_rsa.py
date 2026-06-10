@@ -9,23 +9,19 @@
 #     relation scratch under /ramwork into Linux memfd_create RAM files. THIS is
 #     what bypasses the validator's small (~1 GB) /tmp — not the precompile.
 #
-# Pipeline: Stage 0 (trial division / perfect square / bounded Pollard rho) →
-# Stage 1 (ECM pretest: cheap insurance against a weak or unbalanced modulus) →
-# Stage 2 (CADO-NFS GNFS through the RAM-shim — the real engine).
+# Pipeline: Stage 2 only — CADO-NFS GNFS through the RAM-shim.
 #
 # Input: the live validator mounts /challenge_input/challenge_input.json
 # ({difficulty, num, num_bits}); the workbench passes (challenge_id,
 # problem_json) as argv. Output: logs, a magic separator, then a base64 zip of
 # result.json + solve_info.json (see enigma_challenges.solution_output).
 #
-# Env: WALL_TIME, DEADLINE_MARGIN, ECM_BIN, ECM_PRETEST_CAP, CADO_NFS,
-#      CADO_THREADS, RAMNFS_BROKER, RAMNFS_SHIM, RAMNFS_SOCK, RAMNFS_WORKDIR,
-#      MIN_FACTOR_BITS, RHO_BUDGET.
+# Env: WALL_TIME, DEADLINE_MARGIN, CADO_NFS, CADO_THREADS,
+#      RAMNFS_BROKER, RAMNFS_SHIM, RAMNFS_SOCK, RAMNFS_WORKDIR.
 
 from datetime import datetime, timezone
 import glob
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -36,7 +32,7 @@ import time
 from typing import *
 
 import gmpy2
-from gmpy2 import mpz, gcd
+from gmpy2 import mpz
 
 from enigma_challenges.breaking_rsa import Problem, Solution
 from enigma_challenges.solution_output import build_solution_zip, write_solution_output
@@ -76,99 +72,6 @@ def _cpu_count() -> int:
     return n
 
 
-def _min_factor_digits(num_bits: int) -> int:
-    """Decimal digits of the smaller factor of a balanced semiprime: at most
-    ~num_bits/2 bits. MIN_FACTOR_BITS overrides the half-of-N assumption."""
-    fb = _env_int("MIN_FACTOR_BITS", 0) or (num_bits + 1) // 2
-    return max(1, int(fb * math.log10(2)))
-
-
-def _verify_pair(f: int, n: mpz) -> Optional[Tuple[int, int]]:
-    """Ordered prime pair if f is a valid prime factor of N, else None."""
-    f = int(f)
-    if f <= 1 or f >= n or n % f != 0:
-        return None
-    co = int(n // f)
-    if gmpy2.is_prime(mpz(f)) and gmpy2.is_prime(mpz(co)):
-        return (f, co) if f <= co else (co, f)
-    return None
-
-
-# --- Stage 0: cheap exact methods --------------------------------------------
-
-def _trial_division(n: mpz, bound: int = 1_000_000) -> Optional[int]:
-    if n % 2 == 0:
-        return 2
-    d = 3
-    while d <= bound and d * d <= n:
-        if n % d == 0:
-            return int(d)
-        d += 2
-    return None
-
-
-def _pollard_rho_brent(n: mpz, budget: int) -> Optional[int]:
-    """Brent's improvement on Pollard's rho. The budget counts ACTUAL modmuls
-    (not outer iterations) so it terminates promptly on a hard semiprime instead
-    of looping while r doubles unbounded."""
-    if n % 2 == 0:
-        return 2
-    iters = 0
-    for c in range(1, 12):
-        y, r, q, d = mpz(2), 1, mpz(1), mpz(1)
-        c_m, x, ys = mpz(c), mpz(0), mpz(0)
-        while d == 1 and iters < budget:
-            x = y
-            for _ in range(r):
-                y = (y * y + c_m) % n
-            k = 0
-            while k < r and d == 1 and iters < budget:
-                ys = y
-                m = min(128, r - k)
-                for _ in range(m):
-                    y = (y * y + c_m) % n
-                    q = (q * abs(x - y)) % n
-                d = gcd(q, n)
-                k += m
-                iters += m
-            r *= 2
-        if d == n:
-            backtrack = 0
-            while backtrack < budget:
-                ys = (ys * ys + c_m) % n
-                d = gcd(abs(x - ys), n)
-                backtrack += 1
-                if d > 1:
-                    break
-        if 1 < d < n:
-            return int(d)
-        if iters >= budget:
-            break
-    return None
-
-
-def _stage0(n: mpz, min_factor_digits: int, log) -> Optional[Tuple[int, int]]:
-    log("Stage 0: trial division + perfect square + bounded Pollard rho")
-    f = _trial_division(n)
-    if f:
-        log(f"Stage 0: trial division found factor {f}")
-        return _verify_pair(f, n) or (f, int(n // f))
-    r = gmpy2.isqrt(n)
-    if r * r == n:
-        log("Stage 0: N is a perfect square")
-        return int(r), int(r)
-    # Pollard rho only reaches small factors; skip it when the smaller factor is
-    # known to be far larger than rho's practical range.
-    if min_factor_digits <= 20:
-        f = _pollard_rho_brent(n, _env_int("RHO_BUDGET", 2_000_000))
-        if f:
-            log(f"Stage 0: Pollard's rho found factor {f}")
-            return _verify_pair(f, n) or (int(f), int(n // f))
-    return None
-
-
-# --- Stage 1: ECM pretest ----------------------------------------------------
-
 def _find_bin(env_key: str, candidates: List[str]) -> Optional[str]:
     env = os.environ.get(env_key, "").strip()
     if env and os.path.isfile(env):
@@ -176,31 +79,6 @@ def _find_bin(env_key: str, candidates: List[str]) -> Optional[str]:
     for c in candidates:
         if os.path.isfile(c):
             return c
-    return None
-
-
-def _run_ecm_pretest(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
-    ecm = _find_bin("ECM_BIN", ["/usr/local/bin/ecm", "/usr/bin/ecm"])
-    if not ecm:
-        log("Stage 1: ECM binary not found; skipping")
-        return None
-    cap = _env_int("ECM_PRETEST_CAP", 60)
-    budget = max(5, min(cap, int((deadline - time.time()) * 0.05)))
-    log(f"Stage 1: ECM pretest, budget={budget}s")
-    try:
-        proc = subprocess.run([ecm, "-q", "11e6"], input=f"{int(n)}\n",
-                              capture_output=True, text=True, timeout=budget)
-    except subprocess.TimeoutExpired:
-        log("Stage 1: ECM pretest found nothing (timed out)")
-        return None
-    except Exception as e:  # noqa: BLE001
-        log(f"Stage 1: ECM error: {e}")
-        return None
-    for tok in re.findall(r"\b\d{6,}\b", proc.stdout or ""):
-        pair = _verify_pair(int(tok), n)
-        if pair:
-            log(f"Stage 1: ECM found factor {pair[0]}")
-            return pair
     return None
 
 
@@ -375,15 +253,7 @@ def _kill(proc: subprocess.Popen) -> None:
 def factor_semiprime(n_int: int, num_bits: int, deadline: float,
                      log) -> Tuple[Optional[int], Optional[int], str]:
     n = mpz(n_int)
-    min_digits = _min_factor_digits(num_bits)
-    log(f"Factoring {num_bits}-bit ({len(str(n_int))}-digit) semiprime; "
-        f"smaller factor ~{min_digits} digits")
-    res = _stage0(n, min_digits, log)
-    if res:
-        return res[0], res[1], "stage0"
-    res = _run_ecm_pretest(n, deadline, log)
-    if res:
-        return res[0], res[1], "ecm"
+    log(f"Factoring {num_bits}-bit ({len(str(n_int))}-digit) semiprime")
     res = _run_cado(n, deadline, log)
     if res:
         return res[0], res[1], "cado_gnfs"

@@ -1,8 +1,6 @@
 // Breaking RSA solver — all-C/C++ orchestrator.
 //
-// Replaces the Python orchestrator: parses the challenge, runs Stage 0 (trial
-// division / perfect square / Pollard rho) and an ECM pretest in C++ with GMP,
-// then drives CADO-NFS (GNFS) with a RAM-backed working directory, verifies the
+// Drives CADO-NFS (GNFS) with a RAM-backed working directory, verifies the
 // factorization, and emits the solution-output protocol (logs, magic separator,
 // base64 zip of result.json + solve_info.json) — all without Python on our side.
 //
@@ -11,9 +9,9 @@
 // CADO's own memfd-aware I/O (set RAMNFS_MODE=patched). Both keep scratch in the
 // 85 GB RAM, bypassing the validator's 1 GB /tmp.
 //
-// Env: WALL_TIME, DEADLINE_MARGIN, ECM_BIN, ECM_PRETEST_CAP, CADO_NFS,
-//      CADO_THREADS, RAMNFS_BROKER, RAMNFS_SHIM, RAMNFS_SOCK, RAMNFS_WORKDIR,
-//      RAMNFS_MODE (shim|patched), MIN_FACTOR_BITS, RHO_BUDGET.
+// Env: WALL_TIME, DEADLINE_MARGIN, CADO_NFS, CADO_THREADS,
+//      RAMNFS_BROKER, RAMNFS_SHIM, RAMNFS_SOCK, RAMNFS_WORKDIR,
+//      RAMNFS_MODE (shim|patched).
 
 #include <gmpxx.h>
 #include <zlib.h>
@@ -77,68 +75,7 @@ static bool json_int_field(const std::string &s, const std::string &key, std::st
     return true;
 }
 
-// --- Stage 0 ----------------------------------------------------------------
-
-static bool trial_division(const mpz_class &n, mpz_class &f) {
-    if (mpz_even_p(n.get_mpz_t())) { f = 2; return true; }
-    mpz_class d = 3, dd;
-    while (d <= 1000000) {
-        dd = d * d;
-        if (dd > n) break;
-        if (mpz_divisible_p(n.get_mpz_t(), d.get_mpz_t())) { f = d; return true; }
-        d += 2;
-    }
-    return false;
-}
-
-static bool pollard_rho(const mpz_class &n, long budget, mpz_class &f) {
-    if (mpz_even_p(n.get_mpz_t())) { f = 2; return true; }
-    long iters = 0;
-    for (int c = 1; c < 12 && iters < budget; c++) {
-        mpz_class y = 2, x, ys, q = 1, d = 1, cm = c, t;
-        long r = 1;
-        while (d == 1 && iters < budget) {
-            x = y;
-            for (long k = 0; k < r; k++) { y = (y * y + cm) % n; }
-            long k = 0;
-            while (k < r && d == 1 && iters < budget) {
-                ys = y;
-                long m = (r - k < 128) ? (r - k) : 128;
-                for (long i = 0; i < m; i++) {
-                    y = (y * y + cm) % n;
-                    t = x - y; if (t < 0) t = -t;
-                    q = (q * t) % n;
-                }
-                mpz_gcd(d.get_mpz_t(), q.get_mpz_t(), n.get_mpz_t());
-                k += m; iters += m;
-            }
-            r *= 2;
-        }
-        if (d == n) {
-            long bt = 0;
-            while (bt < budget) {
-                ys = (ys * ys + cm) % n;
-                t = x - ys; if (t < 0) t = -t;
-                mpz_gcd(d.get_mpz_t(), t.get_mpz_t(), n.get_mpz_t());
-                bt++;
-                if (d > 1) break;
-            }
-        }
-        if (d > 1 && d < n) { f = d; return true; }
-    }
-    return false;
-}
-
 static bool is_prime(const mpz_class &x) { return mpz_probab_prime_p(x.get_mpz_t(), 30) != 0; }
-
-// Verify f is a proper prime factor; set ordered (p<=q).
-static bool verify_pair(const mpz_class &f, const mpz_class &n, mpz_class &p, mpz_class &q) {
-    if (f <= 1 || f >= n || !mpz_divisible_p(n.get_mpz_t(), f.get_mpz_t())) return false;
-    mpz_class co = n / f;
-    if (!is_prime(f) || !is_prime(co)) return false;
-    if (f <= co) { p = f; q = co; } else { p = co; q = f; }
-    return true;
-}
 
 // --- run a child process, capture stdout ------------------------------------
 
@@ -178,38 +115,6 @@ static void kill_proc(Proc &p) {
         if (p.pid > 0) { kill(-p.pid, SIGKILL); waitpid(p.pid, nullptr, 0); p.pid = -1; }
     }
     if (p.out_fd >= 0) { close(p.out_fd); p.out_fd = -1; }
-}
-
-// --- ECM pretest (cheap insurance vs a weak/unbalanced modulus) --------------
-
-static bool ecm_pretest(const mpz_class &n, double deadline, mpz_class &p, mpz_class &q) {
-    std::string ecm = env_str("ECM_BIN", "/usr/local/bin/ecm");
-    if (access(ecm.c_str(), X_OK) != 0) { logmsg("Stage 1: ECM not found; skipping"); return false; }
-    long cap = env_long("ECM_PRETEST_CAP", 60);
-    double rem = deadline - (double)time(nullptr);
-    long budget = (long)(rem * 0.05); if (budget > cap) budget = cap; if (budget < 5) budget = 5;
-    logmsg("Stage 1: ECM pretest, budget=" + std::to_string(budget) + "s");
-    // echo N | ecm -q 11e6   (single curve); bound wall by alarm via timeout(1)
-    std::string cmd = "echo " + n.get_str() + " | timeout " + std::to_string(budget) +
-                      " " + ecm + " -q 11e6";
-    FILE *f = popen(cmd.c_str(), "r");
-    if (!f) return false;
-    std::string out; char buf[4096]; size_t r;
-    while ((r = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, r);
-    pclose(f);
-    // scan integer tokens for a factor
-    size_t i = 0;
-    while (i < out.size()) {
-        if (isdigit((unsigned char)out[i])) {
-            size_t j = i; while (j < out.size() && isdigit((unsigned char)out[j])) j++;
-            if (j - i >= 6) {
-                mpz_class cand(out.substr(i, j - i));
-                if (verify_pair(cand, n, p, q)) { logmsg("Stage 1: ECM found a factor"); return true; }
-            }
-            i = j;
-        } else i++;
-    }
-    return false;
 }
 
 // --- CADO-NFS via the RAM-backed workdir ------------------------------------
@@ -422,26 +327,8 @@ int main(int argc, char **argv) {
 
     mpz_class p, q; bool ok = false; std::string method;
 
-    // Stage 0
-    logmsg("Stage 0: trial division + perfect square + bounded Pollard rho");
-    mpz_class f;
-    if (trial_division(n, f) && verify_pair(f, n, p, q)) { ok = true; method = "stage0"; }
-    if (!ok) {
-        mpz_class r;
-        if (mpz_root(r.get_mpz_t(), n.get_mpz_t(), 2) != 0) { // perfect square
-            if (verify_pair(r, n, p, q)) { ok = true; method = "stage0"; }
-        }
-    }
-    long min_factor_bits = env_long("MIN_FACTOR_BITS", 0); if (min_factor_bits == 0) min_factor_bits = (num_bits + 1) / 2;
-    if (!ok && min_factor_bits <= 64) {
-        if (pollard_rho(n, env_long("RHO_BUDGET", 2000000), f) && verify_pair(f, n, p, q)) { ok = true; method = "stage0"; }
-    }
-
-    // Stage 1: ECM pretest
-    if (!ok && ecm_pretest(n, deadline, p, q)) { ok = true; method = "ecm"; }
-
     // Stage 2: CADO GNFS
-    if (!ok && run_cado(n, deadline, p, q)) { ok = true; method = "cado_gnfs"; }
+    if (run_cado(n, deadline, p, q)) { ok = true; method = "cado_gnfs"; }
 
     double solve_time = (double)time(nullptr) - start;
     // final verification

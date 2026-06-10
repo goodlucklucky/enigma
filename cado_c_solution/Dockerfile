@@ -8,21 +8,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \
     build-essential g++ gcc make \
-    autoconf automake libtool m4 perl \
     libgmp-dev libhwloc15 libhwloc-dev libgomp1 \
-    zlib1g-dev git \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # CADO-NFS master's Python orchestrator (cado-nfs.py) still needs flask + requests.
 RUN pip install --no-cache-dir --break-system-packages flask requests
-
-# GMP-ECM for the Stage 1 ECM pretest.
-RUN git clone --depth 1 https://gitlab.inria.fr/zimmerma/ecm.git /tmp/ecm-src \
-    && cd /tmp/ecm-src \
-    && autoreconf -i && ./configure CFLAGS="-O2" \
-    && make -j"$(nproc)" && make install && ldconfig \
-    && cp ecm /usr/local/bin/ecm \
-    && rm -rf /tmp/ecm-src
 
 # Precompiled CADO-NFS (avoids the long source build).
 COPY cado-nfs.tar.gz /tmp/
@@ -49,8 +40,7 @@ RUN g++ -O2 -std=c++17 /app/breaking_rsa.cpp -o /app/breaking_rsa -lgmpxx -lgmp 
 # ubuntu:24.04 ships a UID-1000 "ubuntu" user; remove it so --user miner is UID 1000.
 RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -s /usr/sbin/nologin miner
 
-ENV ECM_BIN=/usr/local/bin/ecm \
-    CADO_NFS=/opt/cado-nfs/build/release/cado-nfs.py \
+ENV CADO_NFS=/opt/cado-nfs/build/release/cado-nfs.py \
     RAMNFS_BROKER=/opt/ramnfs/broker \
     RAMNFS_SHIM=/opt/ramnfs/shim.so \
     RAMNFS_SOCK=/tmp/ramnfs.sock \
@@ -60,7 +50,6 @@ ENV ECM_BIN=/usr/local/bin/ecm \
     TMPDIR=/tmp \
     WALL_TIME=14400 \
     DEADLINE_MARGIN=120 \
-    ECM_PRETEST_CAP=60 \
     PYTHONUNBUFFERED=1
 
 USER miner
