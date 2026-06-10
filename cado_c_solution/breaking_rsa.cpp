@@ -82,20 +82,31 @@ static bool is_prime(const mpz_class &x) { return mpz_probab_prime_p(x.get_mpz_t
 struct Proc { pid_t pid = -1; int out_fd = -1; };
 
 // Fork/exec argv with optional extra env vars (key=value); child gets its own
-// session so we can kill the whole group. Returns a pipe fd for its stdout.
+// session so we can kill the whole group. With capture_out=true the child's
+// stdout+stderr are piped back via p.out_fd (the caller MUST drain it, or the
+// 64 KB pipe buffer fills and blocks the child in write()). With
+// capture_out=false they go to /dev/null — use this for long-running children
+// whose output nobody reads (e.g. the ramnfs broker), mirroring the Python
+// reference's stdout=DEVNULL/stderr=DEVNULL.
 static Proc spawn(const std::vector<std::string> &argv,
-                  const std::vector<std::string> &extra_env) {
+                  const std::vector<std::string> &extra_env,
+                  bool capture_out = true) {
     Proc p;
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return p;
+    int pipefd[2] = {-1, -1};
+    if (capture_out && pipe(pipefd) != 0) return p;
     pid_t pid = fork();
-    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return p; }
+    if (pid < 0) { if (capture_out) { close(pipefd[0]); close(pipefd[1]); } return p; }
     if (pid == 0) {
         // child
         setsid();
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[0]); close(pipefd[1]);
+        if (capture_out) {
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[0]); close(pipefd[1]);
+        } else {
+            int dn = open("/dev/null", O_RDWR);
+            if (dn >= 0) { dup2(dn, STDOUT_FILENO); dup2(dn, STDERR_FILENO); if (dn > 2) close(dn); }
+        }
         for (auto &e : extra_env) putenv(strdup(e.c_str()));
         std::vector<char *> cargv;
         for (auto &a : argv) cargv.push_back(const_cast<char *>(a.c_str()));
@@ -103,8 +114,8 @@ static Proc spawn(const std::vector<std::string> &argv,
         execvp(cargv[0], cargv.data());
         _exit(127);
     }
-    close(pipefd[1]);
-    p.pid = pid; p.out_fd = pipefd[0];
+    if (capture_out) { close(pipefd[1]); p.out_fd = pipefd[0]; }
+    p.pid = pid;
     return p;
 }
 
@@ -138,7 +149,10 @@ static bool start_broker(const std::string &sock, Proc &broker) {
     std::string bin = env_str("RAMNFS_BROKER", "/opt/ramnfs/broker");
     if (access(bin.c_str(), X_OK) != 0) { logmsg("ramnfs: broker not found"); return false; }
     unlink(sock.c_str());
-    broker = spawn({bin, sock}, {});
+    // Broker runs for the whole multi-hour CADO job and nobody reads its
+    // stdout/stderr; send it to /dev/null so its output can never fill an
+    // unread 64 KB pipe and back-pressure/deadlock the broker mid-run.
+    broker = spawn({bin, sock}, {}, /*capture_out=*/false);
     if (broker.pid < 0) return false;
     for (int i = 0; i < 50; i++) { if (access(sock.c_str(), F_OK) == 0) { logmsg("ramnfs: broker started"); return true; } usleep(100000); }
     kill_proc(broker);
@@ -147,9 +161,19 @@ static bool start_broker(const std::string &sock, Proc &broker) {
 
 static int cpu_count() {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
-    // honor cgroup quota (docker --cpus)
+    if (n <= 0) n = 8;
+    // honor cgroup quota (docker --cpus): cgroup v2 first
     FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
     if (f) { char a[64]; long period; if (fscanf(f, "%63s %ld", a, &period) == 2 && strcmp(a, "max") != 0 && period > 0) { long quota = atol(a); long q = quota / period; if (q >= 1 && q < n) n = q; } fclose(f); }
+    else {
+        // cgroup v1 fallback (cpu.cfs_quota_us / cpu.cfs_period_us), matching the
+        // Python _cpu_count() so a v1 host does not over-subscribe sieve clients.
+        FILE *fq = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+        FILE *fp = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+        if (fq && fp) { long quota, period; if (fscanf(fq, "%ld", &quota) == 1 && fscanf(fp, "%ld", &period) == 1 && quota > 0 && period > 0) { long q = quota / period; if (q >= 1 && q < n) n = q; } }
+        if (fq) fclose(fq);
+        if (fp) fclose(fp);
+    }
     return (int)(n > 0 ? n : 8);
 }
 
@@ -162,22 +186,61 @@ static bool run_cado(const mpz_class &n, double deadline, mpz_class &p, mpz_clas
     std::string mode = env_str("RAMNFS_MODE", "shim");
     int threads = (int)env_long("CADO_THREADS", 0); if (threads <= 0) threads = cpu_count();
 
+    // Start every run from a clean slate. CADO resumes from a SQLite state DB; the
+    // ramnfs shim keeps that DB on the REAL filesystem (/tmp/cado-sqlite) while the
+    // bulk data lives in the ephemeral broker. A DB left over from a prior run makes
+    // CADO skip steps whose data files no longer exist in the fresh broker and abort
+    // (e.g. "freerel.gz does not exist"). A fresh container never sees this, but
+    // clearing the stale CADO scratch makes every invocation idempotent.
+    // (/tmp/cado-sqlite mirrors SQLITE_REAL_DIR in ramnfs/shim.c.)
+    { std::string tmpdir = env_str("TMPDIR", "/tmp");
+      if (system(("rm -rf /tmp/cado-sqlite " + tmpdir + "/cado_run 2>/dev/null") .c_str())) { /* best effort */ } }
+
+    // Shim mode needs the LD_PRELOAD .so to actually exist to virtualize the
+    // /ramwork workdir. If it is missing/renamed, glibc silently ignores the
+    // bad LD_PRELOAD and CADO would write real files to a nonexistent /ramwork
+    // and fail. Mirror the Python guard: with no usable shim, skip the broker
+    // entirely and fall back to a /tmp workdir.
+    bool shim_ok = (mode != "shim") || access(shim.c_str(), R_OK) == 0;
+    if (!shim_ok) logmsg("ramnfs: shim not found at " + shim + "; falling back to /tmp");
+
     Proc broker;
-    bool have_broker = start_broker(sock, broker);
+    bool have_broker = shim_ok && start_broker(sock, broker);
     if (!have_broker) { workdir = env_str("TMPDIR", "/tmp") + "/cado_run"; mkdir(workdir.c_str(), 0777); }
 
-    // build CADO argv: let CADO pick size-appropriate params (degree/admax) itself.
+    // Build CADO argv. One single-threaded sieve client per core: las is the
+    // dominant GNFS phase and the HTTP server / ramnfs broker are near-idle during
+    // it, so every core should be sieving.
     std::string bindir = cado.substr(0, cado.find_last_of('/'));
+    int ndigits = (int)n.get_str().size();
+    int n_clients = threads;
+
     std::vector<std::string> argv = {
         "python3", cado, n.get_str(),
         "tasks.workdir=" + workdir,
         "tasks.threads=" + std::to_string(threads),
         "server.address=localhost", "server.port=0", "server.threaded=1",
-        "slaves.nrclients=" + std::to_string(threads),
+        "slaves.nrclients=" + std::to_string(n_clients),
         "slaves.cado_nfs_client.bindir=" + bindir,
         "tasks.linalg.bwc.threads=" + std::to_string(threads),
         "tasks.sieve.las.threads=1",
+        // NOTE: do NOT set tasks.sieve.adjust_strategy. Benchmarked value 2 made the
+        // sieve ~5x slower on c60 (sieve CPU 30s -> 164s, total 22s -> 51s). CADO's
+        // params.cNNN ship it commented out (default 0) for the production range, so
+        // the calibrated lim/lpb/mfb/I assume strategy 0. Leave it at the default.
     };
+    // Let CADO pick the size-appropriate polynomial-selection parameters (degree,
+    // admin, admax, P, nq, lim/lpb/mfb, ...) from its calibrated params.cNNN files.
+    // We deliberately do NOT force degree or admax: forcing degree=5 yields zero
+    // polynomials for c<100 (crash), and capping admax below a size's admin (e.g.
+    // 2000 < c145's admin=2100) gives an empty search range — a guaranteed failure
+    // on the production target — while saving only ~5% of wall time. CADO_ADMAX /
+    // CADO_DEGREE remain manual escape hatches (appended last so they win).
+    if (const char *e = getenv("CADO_ADMAX"); e && *e)
+        argv.push_back(std::string("tasks.polyselect.admax=") + e);
+    if (const char *e = getenv("CADO_DEGREE"); e && *e)
+        argv.push_back(std::string("tasks.polyselect.degree=") + e);
+
     std::vector<std::string> env = {"HOME=/tmp", "TMPDIR=/tmp"};
     if (have_broker && mode == "shim") {
         env.push_back("LD_PRELOAD=" + shim);
@@ -187,8 +250,9 @@ static bool run_cado(const mpz_class &n, double deadline, mpz_class &p, mpz_clas
         env.push_back("RAMNFS_SOCK=" + sock);
         env.push_back("RAMNFS_PREFIX=/ramwork");
     }
-    logmsg("Stage 2: CADO c" + std::to_string((int)n.get_str().size()) + " threads=" +
-           std::to_string(threads) + " workdir=" + workdir + " ram_shim=" +
+    logmsg("Stage 2: CADO c" + std::to_string(ndigits) + " threads=" +
+           std::to_string(threads) + " clients=" + std::to_string(n_clients) +
+           " workdir=" + workdir + " ram_shim=" +
            (have_broker && mode == "shim" ? "on" : (have_broker ? "patched" : "off")));
 
     Proc cado_p = spawn(argv, env);

@@ -25,9 +25,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import *
 
@@ -109,6 +111,12 @@ def _start_broker(sock_path: str, log) -> Optional[subprocess.Popen]:
     except OSError:
         pass
     try:
+        # NOTE: the broker is deliberately left in OUR process group/session (no
+        # start_new_session). It must share the session so the LD_PRELOAD shim in
+        # CADO's worker subprocesses talks to it correctly — giving the broker its
+        # own session makes CADO's freerel step fail to see its output files.
+        # Because of that, the broker must be torn down by PID only (see
+        # _terminate_pid), never via os.killpg, which would signal our own group.
         proc = subprocess.Popen([broker, sock_path],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:  # noqa: BLE001
@@ -148,6 +156,17 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     workdir = os.environ.get("RAMNFS_WORKDIR", "/ramwork/factor.work")
     threads = _env_int("CADO_THREADS", 0) or _cpu_count()
 
+    # Start every run from a clean slate. CADO resumes from a SQLite state DB; the
+    # ramnfs shim keeps that DB on the REAL filesystem (/tmp/cado-sqlite) while the
+    # bulk data lives in the ephemeral broker. A DB left over from a prior run makes
+    # CADO skip steps whose data files no longer exist in the fresh broker and abort
+    # (e.g. "freerel.gz does not exist"). A fresh container never sees this, but
+    # clearing the stale CADO scratch makes every invocation idempotent. /tmp/cado-
+    # sqlite mirrors SQLITE_REAL_DIR in ramnfs/shim.c.
+    for stale in ("/tmp/cado-sqlite",
+                  os.path.join(os.environ.get("TMPDIR", "/tmp"), "cado_run")):
+        shutil.rmtree(stale, ignore_errors=True)
+
     broker = None
     if shim:
         broker = _start_broker(sock, log)
@@ -167,25 +186,42 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
 
     remaining = max(60, int(deadline - time.time()))
     cado_build = str(Path(cado).parent)
+    ndigits = len(str(int(n)))
+    nbits = int(n).bit_length()
+
+    # One single-threaded sieve client per core. Lattice sieving (las) is the
+    # dominant GNFS phase (~60-75% of wall time); the in-process HTTP server and
+    # the ramnfs broker are near-idle during it, so every core should be sieving.
+    n_clients = threads
+
     cmd = [
         sys.executable, cado, str(int(n)),
         f"tasks.workdir={workdir}",
         f"tasks.threads={threads}",
         "server.address=localhost", "server.port=0", "server.threaded=1",
-        f"slaves.nrclients={threads}",
+        f"slaves.nrclients={n_clients}",
         f"slaves.cado_nfs_client.bindir={cado_build}",
         f"tasks.linalg.bwc.threads={threads}",
         "tasks.sieve.las.threads=1",
+        # NOTE: do NOT set tasks.sieve.adjust_strategy. Benchmarked value 2 made the
+        # sieve ~5x slower on c60 (sieve CPU 30s -> 164s, total 22s -> 51s). CADO's
+        # params.cNNN ship it commented out (default 0) for the production range, so
+        # the calibrated lim/lpb/mfb/I assume strategy 0. Leave it at the default.
     ]
-    # By default let CADO choose size-appropriate parameters (degree, admax) from
-    # its parameter files — a hardcoded degree=5 breaks small inputs that want
-    # degree 4. Override only when explicitly asked.
+    # Let CADO pick the size-appropriate polynomial-selection parameters (degree,
+    # admin, admax, P, nq, lim/lpb/mfb, ...) from its calibrated params.cNNN files.
+    # We deliberately do NOT force degree or admax. Forcing degree=5 makes
+    # polyselect return zero polynomials for c<100 inputs (a hard IndexError crash),
+    # and capping admax below a size's admin (e.g. 2000 < c145's admin=2100) gives an
+    # EMPTY search range — also zero polynomials, a guaranteed failure on the
+    # production target — while saving only ~5% (polyselect is a small fraction of
+    # NFS wall time, and its root-opt stage is bounded by nq/ropteffort, not admax).
+    # The CADO_ADMAX / CADO_DEGREE env vars remain as manual escape hatches.
     if os.environ.get("CADO_ADMAX"):
         cmd.append(f"tasks.polyselect.admax={os.environ['CADO_ADMAX']}")
     if os.environ.get("CADO_DEGREE"):
         cmd.append(f"tasks.polyselect.degree={os.environ['CADO_DEGREE']}")
-    ndigits = len(str(int(n)))
-    log(f"Stage 2: CADO c{ndigits} ({int(n).bit_length()}-bit) threads={threads} "
+    log(f"Stage 2: CADO c{ndigits} ({nbits}-bit) threads={threads} clients={n_clients} "
         f"workdir={workdir} ram_shim={'on' if shim else 'off'} budget={remaining}s")
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -194,6 +230,23 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     tail: List[str] = []
     last_log = 0.0
     t0 = time.time()
+
+    # Deadline watchdog. CADO's later phases (linear algebra, sqrt) can run for
+    # many minutes without emitting a stdout line, during which the blocking
+    # `for raw in proc.stdout` below would sleep right past the wall-clock budget.
+    # The watchdog kills CADO when the deadline passes, which closes its stdout
+    # and unblocks the read loop so we always return (and emit output) in time.
+    stop = threading.Event()
+
+    def _watchdog() -> None:
+        while not stop.wait(2.0):
+            if time.time() >= deadline:
+                log(f"Stage 2: CADO hit deadline after {int(time.time() - t0)}s; terminating")
+                _kill(proc)
+                return
+
+    wd = threading.Thread(target=_watchdog, daemon=True)
+    wd.start()
     try:
         assert proc.stdout
         for raw in proc.stdout:
@@ -211,17 +264,15 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
                 if now - last_log > 120:
                     log(f"Stage 2: CADO running ... {int(now - t0)}s elapsed")
                     last_log = now
-                if now >= deadline:
-                    log(f"Stage 2: CADO hit deadline after {int(now - t0)}s")
-                    break
-            if factors or time.time() >= deadline:
+            if factors:
                 break
     except Exception as e:  # noqa: BLE001
         log(f"Stage 2: CADO read error: {e}")
     finally:
+        stop.set()
         _kill(proc)
         if broker:
-            _kill(broker)
+            _terminate_pid(broker)
 
     if not factors:
         for ln in tail[-12:]:
@@ -243,6 +294,27 @@ def _kill(proc: subprocess.Popen) -> None:
                 pass
         try:
             proc.wait(timeout=8)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _terminate_pid(proc: subprocess.Popen) -> None:
+    """Terminate a single process by PID only — never its process group.
+
+    The ramnfs broker shares our process group (it must, or CADO's freerel step
+    fails), so killing its *group* would also kill this solver before it can emit
+    the solution output. The broker has no children, so a PID-targeted
+    SIGTERM->SIGKILL is sufficient and safe."""
+    if proc is None or proc.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            proc.send_signal(sig)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=5)
             return
         except Exception:  # noqa: BLE001
             continue
