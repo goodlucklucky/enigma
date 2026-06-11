@@ -60,8 +60,7 @@ def main():
         print(f"FAIL: no result.json (exit {proc.returncode}) in {outdir}")
         sys.exit(1)
     result = json.loads(result_path.read_text())
-    got = (result.get("bitstring") or result.get("peak") or result.get("peak_bitstring")
-           or result.get("solution") or result.get("answer"))
+    got = result.get("peaked_state")
     info = {}
     sip = Path(outdir, "solve_info.json")
     if sip.is_file():

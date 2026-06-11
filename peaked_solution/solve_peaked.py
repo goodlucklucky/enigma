@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from enigma_challenges.solution_output import build_solution_zip, write_solution_output
+from enigma_challenges.hardening_quantum_proof import Solution, Problem, load_solver_input
 
 
 # --------------------------------------------------------------------------- #
@@ -709,37 +710,26 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
 #  result.json emission
 # --------------------------------------------------------------------------- #
 
-def emit(bitstring: str, circuit_id: str, status: str, info: dict, diag: dict,
-         solve_time: float, started: str) -> None:
-    # Superset of plausible field names. Serde.from_dict ignores unexpected keys,
-    # so including aliases is safe and hedges the unknown canonical field name.
-    result = {
-        "status": status,
-        "bitstring": bitstring,
-        "peak_bitstring": bitstring,
-        "peak": bitstring,
-        "solution": bitstring,
-        "answer": bitstring,
-        "predictions": {circuit_id: bitstring},
-    }
-    extra_key = os.environ.get("PEAKED_RESULT_KEY", "").strip()
-    if extra_key:
-        result[extra_key] = bitstring
+def emit(bitstring: str, challenge_id: str, status: str, info: dict, diag: dict,
+         solve_time: float, started: str, difficulty: int = 0) -> None:
+    # Official HQP contract: result.json is the Solution dataclass
+    # ({"status", "peaked_state"}). validate_hqp_solution accepts either bit order.
+    peaked_state = bitstring if (bitstring and all(c in "01" for c in bitstring)) else None
+    result_json = json.dumps(Solution(status, peaked_state).to_dict(), indent=2)
 
     solve_info = {
         "solution_status": status,
-        "circuit_id": circuit_id,
+        "challenge_id": challenge_id,
         "timestamp_utc": started,
         "solve_time_seconds": round(solve_time, 2),
+        "difficulty": difficulty,
         "num_qubits": info.get("num_qubits"),
         "two_qubit_gates": info.get("two_qubit_gates"),
         "depth": info.get("depth"),
+        "method": diag.get("reason"),
         "fingerprint": info,
         "diagnostics": diag,
-        "reversed_bitstring": bitstring[::-1],  # convention fallback, for debugging
     }
-
-    result_json = json.dumps(result, indent=2)
     solve_info_json = json.dumps(solve_info, indent=2)
 
     # Local-dev convenience (no /output volume exists under the validator).
@@ -762,28 +752,50 @@ def emit(bitstring: str, circuit_id: str, status: str, info: dict, diag: dict,
 #  main
 # --------------------------------------------------------------------------- #
 
+def get_solver_input():
+    """Official HQP input via load_solver_input, with dev/robustness fallbacks.
+
+    Returns (challenge_id, qasm_file, difficulty). The official loader handles the
+    validator mount (/challenge_input/challenge_input.json) and workbench argv
+    (<challenge_id> <problem_json>); the fallback also accepts a bare *.qasm path
+    for local development."""
+    try:
+        cid, problem = load_solver_input(sys.argv)
+        return cid, problem.qasm_file, int(problem.difficulty)
+    except Exception as e:  # noqa: BLE001
+        log(f"load_solver_input did not apply ({e}); trying fallbacks")
+    for a in sys.argv[1:]:
+        a = a.strip()
+        if a.lower().endswith(".qasm") and os.path.isfile(a):
+            return Path(a).stem, a, 0
+    for d in ("/challenge_input", "/app", "."):
+        qs = sorted(glob.glob(os.path.join(d, "*.qasm")))
+        if qs:
+            return Path(qs[0]).stem, qs[0], 0
+    raise SystemExit("No HQP input: expected load_solver_input args / "
+                     "/challenge_input/challenge_input.json, or a *.qasm path.")
+
+
 def main() -> None:
-    # Bulletproof: ANY failure below still lands a structurally-valid result.json
-    # via the stdout protocol. A crash with no output is an automatic validation
-    # loss, so we never let that happen.
+    # Bulletproof: ANY failure below still lands a valid result.json via the stdout
+    # protocol. A crash with no output is an automatic validation loss.
     wall = env_int("WALL_TIME", 14400)
     margin = env_int("DEADLINE_MARGIN", 180)
     start = time.time()
     started_iso = datetime.now(timezone.utc).isoformat()
     deadline = start + wall - margin
 
-    circuit_id, info, diag = "circuit", {}, {}
+    challenge_id, info, diag, difficulty = "unknown", {}, {}, 0
     bitstring, status = "", "failed"
     try:
         # Install the robust SVD first so the GPU self-test below also exercises
-        # (and benefits from) it -- a flaky cuSOLVER SVD then won't needlessly
-        # trip the self-test into a CPU fallback.
+        # (and benefits from) it.
         if os.environ.get("ROBUST_SVD", "1").strip() not in ("0", "false", "False"):
             install_robust_svd()
         device = setup_device()
 
-        qasm_path, circuit_id = locate_qasm()
-        log(f"QASM: {qasm_path}  (circuit_id={circuit_id})")
+        challenge_id, qasm_path, difficulty = get_solver_input()
+        log(f"Challenge: {challenge_id} | difficulty={difficulty} | QASM: {qasm_path}")
         circuit = load_circuit(qasm_path)
         info = fingerprint(circuit)
         log(f"Fingerprint: n={info['num_qubits']} 2q={info['two_qubit_gates']} "
@@ -792,7 +804,9 @@ def main() -> None:
         log(f"Ops: {info['ops']}")
 
         bitstring, diag = solve(circuit, info, device, deadline)
-        status = "success"
+        # "success" means we are submitting a real candidate; the no-candidate
+        # fallback is reported honestly as "failed" with peaked_state=None.
+        status = "failed" if diag.get("reason") == "no_candidate" else "success"
     except SystemExit as e:  # noqa: BLE001
         log(f"FATAL (SystemExit): {e}")
         diag = {"reason": f"exit: {e}"}
@@ -800,24 +814,22 @@ def main() -> None:
         log(f"FATAL: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         diag = {"reason": f"exception: {type(e).__name__}: {e}"}
 
-    # Guarantee a valid-length bitstring if we know the qubit count.
     n = info.get("num_qubits") or 0
-    if n and (not bitstring or len(bitstring) != n or any(c not in "01" for c in bitstring)):
-        bitstring = "0" * n
-        diag.setdefault("fallback", "no valid candidate -> all-zero placeholder")
+    if status == "success" and (not bitstring or len(bitstring) != n or any(c not in "01" for c in bitstring)):
+        status, bitstring = "failed", ""  # invalid candidate -> honest failure
 
     solve_time = time.time() - start
-    log(f"FINAL bitstring ({len(bitstring)} bits): {bitstring}")
-    log(f"Decision: {diag.get('reason')} | solve_time={solve_time:.1f}s")
+    log(f"FINAL: status={status} peaked_state={bitstring or None} "
+        f"({solve_time:.1f}s, {diag.get('reason')})")
 
     try:
-        emit(bitstring, circuit_id, status, info, diag, solve_time, started_iso)
+        emit(bitstring, challenge_id, status, info, diag, solve_time, started_iso, difficulty)
     except Exception as e:  # noqa: BLE001
         log(f"emit() failed, retrying minimal: {e}")
         try:
+            ps = bitstring if (bitstring and all(c in "01" for c in bitstring)) else None
             write_solution_output(build_solution_zip({
-                "result.json": json.dumps({"status": status, "bitstring": bitstring,
-                                           "peak_bitstring": bitstring, "peak": bitstring}),
+                "result.json": json.dumps({"status": status, "peaked_state": ps}),
             }))
         except Exception as e2:  # noqa: BLE001
             log(f"minimal emit also failed: {e2}")
