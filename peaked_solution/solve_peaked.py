@@ -316,12 +316,32 @@ def stage_unswapping(circuit, device, seed=123, cutoff=0.002, max_bond=8192,
     from qiskit.transpiler import PassManager
     from qiskit.transpiler.passes import Collect2qBlocks, ConsolidateBlocks
     import utils
+    import unswap
     from unswap import mpo_compress_unswap, mpo_to_mps
 
     utils.DEVICE = device
 
+    # Runtime override of SabreSwap trials, applied to the symbol in unswap's
+    # namespace so the vendored file stays byte-identical. The reference hardcodes
+    # trials=10000 in rewire_layers, which is CPU-bound and dominates wall-time on
+    # few-core machines; ~200 is ~50x faster with negligible quality loss. Default
+    # (env unset / 0) preserves the verbatim trials=10000.
+    sabre_trials = env_int("SABRE_TRIALS", 0)
+    if sabre_trials > 0:
+        from qiskit.transpiler.passes import SabreSwap as _RealSabreSwap
+
+        def _sabre(*a, **k):
+            k["trials"] = sabre_trials
+            return _RealSabreSwap(*a, **k)
+        unswap.SabreSwap = _sabre
+        log(f"  [perf] SabreSwap trials overridden -> {sabre_trials}")
+
+    # complex64 halves VRAM and speeds GPU ops (fine above the ~2e-3 cutoff);
+    # default complex128 matches the reference exactly.
+    dtype = torch.complex64 if os.environ.get("UNSWAP_DTYPE") == "complex64" else torch.complex128
+
     def to_backend(x):
-        return torch.tensor(x, dtype=torch.complex128, device=device)
+        return torch.tensor(x, dtype=dtype, device=device)
 
     collect_2q = PassManager([Collect2qBlocks(), ConsolidateBlocks(force_consolidate=True)])
     circ = collect_2q.run(circuit)
@@ -453,19 +473,22 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
         return max(0.0, deadline - time.time())
 
     # ---- Stage 1: distillation (cheap; often solves Level-1 outright) ----
-    try:
-        b1 = min(remaining() * 0.20, env_float("T_DISTILL", 600))
-        log(f"Stage 1 (distillation): budget {b1:.0f}s")
-        with budget(b1):
-            r = stage_distillation(circuit, device,
-                                   max_bond=env_int("DISTILL_MAX_BOND", 128))
-        log(f"  voted={r['voted'][:24]}... mc_freq={r['mc_freq']:.3f} decisiveness={r['decisiveness']:.3f}")
-        add(r["voted"], "distill_vote", conf=r["decisiveness"])
-        add(r["most_common"], "distill_mc", conf=r["mc_freq"])
-    except KeyboardInterrupt:
-        log("  Stage 1 hit its budget.")
-    except Exception as e:  # noqa: BLE001
-        log(f"  Stage 1 failed: {e}")
+    if os.environ.get("SKIP_DISTILL", "").strip() not in ("", "0", "false", "False"):
+        log("Stage 1 (distillation): skipped via SKIP_DISTILL")
+    else:
+        try:
+            b1 = min(remaining() * 0.20, env_float("T_DISTILL", 600))
+            log(f"Stage 1 (distillation): budget {b1:.0f}s")
+            with budget(b1):
+                r = stage_distillation(circuit, device,
+                                       max_bond=env_int("DISTILL_MAX_BOND", 128))
+            log(f"  voted={r['voted'][:24]}... mc_freq={r['mc_freq']:.3f} decisiveness={r['decisiveness']:.3f}")
+            add(r["voted"], "distill_vote", conf=r["decisiveness"])
+            add(r["most_common"], "distill_mc", conf=r["mc_freq"])
+        except KeyboardInterrupt:
+            log("  Stage 1 hit its budget.")
+        except Exception as e:  # noqa: BLE001
+            log(f"  Stage 1 failed: {e}")
 
     # ---- Stage 3 / Stage 2: escalate by structure ----
     structured = (not info["all_to_all_ish"]) and (not info["has_swap"])
