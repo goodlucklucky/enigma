@@ -59,6 +59,9 @@ COPY --chown=miner:miner LICENSE-Apache-2.0 NOTICE /app/
 # Enigma stdout protocol + our orchestrator
 COPY --chown=miner:miner enigma_challenges /app/enigma_challenges/
 COPY --chown=miner:miner solve_peaked.py /app/
+# Test tooling (circuit generator + harness) so the image is self-testing on any
+# machine. Ignored by the validator, which just runs the ENTRYPOINT on the qasm.
+COPY --chown=miner:miner tools /app/tools/
 
 # Default wall clock; the validator overrides WALL_TIME as needed.
 ENV WALL_TIME=14400 \
