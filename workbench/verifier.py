@@ -64,6 +64,25 @@ def verify_breaking_rsa(problem, solution, verif) -> VerifyResult:
         )
 
 
+def verify_hardening_quantum_proof(problem, solution, verif) -> VerifyResult:
+    """Verify a Hardening Quantum Proof solution."""
+    from qbittensor.challenges.hardening_quantum_proof import validate_hqp_solution
+
+    success, reason = validate_hqp_solution(solution, verif, require_success_status=False)
+    if success:
+        return VerifyResult(
+            passed=True,
+            message=f"Correct peaked state: {verif.peaked_state}",
+        )
+    else:
+        return VerifyResult(
+            passed=False,
+            message=reason or "Incorrect peaked state",
+            expected=verif.peaked_state,
+            actual=getattr(solution, "peaked_state", "None") or "None",
+        )
+
+
 def verify_mock(problem, solution, verif) -> VerifyResult:
     """Verify a mock challenge solution (Ed25519 signature + timestamp)."""
     from qbittensor.challenges.mock_challenge import MockChallenge

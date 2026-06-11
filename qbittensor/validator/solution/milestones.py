@@ -22,6 +22,8 @@ from qbittensor.validator.solution.challenge_inputs.mock_solution_setup import m
 from qbittensor.validator.solution.solution_validations.mock_solution import run as run_mock_solution
 from qbittensor.validator.solution.challenge_inputs.breaking_rsa_setup import breaking_rsa_setup
 from qbittensor.validator.solution.solution_validations.breaking_rsa_solution import run as run_breaking_rsa
+from qbittensor.validator.solution.challenge_inputs.hqp_setup import hqp_setup
+from qbittensor.validator.solution.solution_validations.hqp_solution import run as run_hqp
 from qbittensor.validator.solution.exceptions.invalid_solution import InvalidSolutionError
 from qbittensor.validator.solution.exceptions.validation_errors import ValidationErrors
 
@@ -30,8 +32,12 @@ from qbittensor.validator.solution.exceptions.validation_errors import Validatio
 class MilestoneHandlers:
     """Holds the optional setup and validation functions for a given milestone.
 
-    Setup signature:   (solution_folder_path: str, configuration: dict) -> str
-    Validate signature: (solution_folder_path: str) -> tuple[bool, str | None]
+    Setup signature:
+        (solution_folder_path: str, configuration: dict, *, platform_client=None,
+         milestone_id: str | None = None, challenge_id: str | None = None) -> str
+
+    Validate signature:
+        (solution_folder_path: str) -> tuple[bool, str | None]
     """
 
     setup: Optional[Callable] = None
@@ -52,6 +58,7 @@ class MilestoneHandlers:
 # Registered challenge IDs (UUIDs from the platform, or synthetic for staging).
 MOCK_CHALLENGE_ID = "b513b40c-ecab-4d9c-b146-e1ffb357113b"
 BREAKING_RSA_CHALLENGE_ID = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+HQP_CHALLENGE_ID = "d4c3b2a1-f6e5-4b7a-9c8d-1e0f3a2b5c4d"
 
 MILESTONE_REGISTRY: dict[str, MilestoneHandlers] = {
     # Mock challenge used for testing private/public key (Ed25519) validation.
@@ -66,6 +73,12 @@ MILESTONE_REGISTRY: dict[str, MilestoneHandlers] = {
     BREAKING_RSA_CHALLENGE_ID: MilestoneHandlers(
         setup=breaking_rsa_setup,
         validate=run_breaking_rsa,
+    ),
+    # Hardening Quantum Proof (peaked circuits) challenge.
+    # Downloads QASM circuit from platform API during setup.
+    HQP_CHALLENGE_ID: MilestoneHandlers(
+        setup=hqp_setup,
+        validate=run_hqp,
     ),
 }
 

@@ -1,0 +1,9 @@
+{
+  "circuit_file": "d0_s0_trivial.qasm",
+  "peaked_state": "11100",
+  "metadata": {
+    "type": "trivial_test"
+  },
+  "difficulty": 0,
+  "qasm_sha256": "f38e7f1ac09b67ae186255fae47393edf322d98282ad90a63a5201ab3ae62317"
+}

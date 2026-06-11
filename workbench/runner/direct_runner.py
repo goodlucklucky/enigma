@@ -36,6 +36,7 @@ def find_entry_point(
 
     defaults = {
         "breaking_rsa": ["breaking_rsa.py"],
+        "hardening_quantum_proof": ["hardening_quantum_proof.py"],
         "mock": ["mock_solver.py"],
     }
 

@@ -27,13 +27,14 @@ from pathlib import Path
 import click
 
 from workbench.challenges import breaking_rsa as breaking_rsa_challenge
+from workbench.challenges import hardening_quantum_proof as hqp_challenge
 from workbench.challenges import mock as mock_challenge
 from workbench.runner.docker_runner import (
     check_docker, build_image, run_container, DEFAULT_WALL_TIME,
 )
 from workbench.runner.direct_runner import find_entry_point, run_direct
 from workbench.validator import validate_output, validate_dockerfile_security
-from workbench.verifier import verify_breaking_rsa, verify_mock
+from workbench.verifier import verify_breaking_rsa, verify_hardening_quantum_proof, verify_mock
 from workbench.report import print_report
 
 
@@ -165,6 +166,109 @@ def test_breaking_rsa(difficulty, solution, mode, seed, wall_time, allow_network
         total_time = time.time() - total_start
         success = print_report(
             "breaking_rsa", mode, seed_used, problem_summary,
+            build_result=build_result, run_result=run_result,
+            validation_results=validation_results,
+            verify_result=verify_result,
+            total_time=total_time,
+        )
+
+    finally:
+        if keep_output:
+            click.echo(f"Output kept at: {output_dir}")
+        else:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    sys.exit(0 if success else 1)
+
+
+@test.command("hardening-quantum-proof")
+@click.option("--difficulty", default=1, help="Difficulty label (default: 1)")
+@click.option("--solution", required=True, type=click.Path(exists=True), help="Path to solution directory")
+@click.option("--mode", type=click.Choice(["docker", "direct"]), default="docker", help="Execution mode")
+@click.option("--circuit", default=None, help="Sample circuit ID (default: random)")
+@click.option("--wall-time", default=DEFAULT_WALL_TIME, help=f"Wall time in seconds (default: {DEFAULT_WALL_TIME} = {DEFAULT_WALL_TIME // 3600}h, matches validator)")
+@click.option("--allow-network", is_flag=True, help="Allow network access in container (validator disables network)")
+@click.option("--keep-output", is_flag=True, help="Keep output directory after test")
+def test_hardening_quantum_proof(difficulty, solution, mode, circuit, wall_time, allow_network, keep_output):
+    """Test a Hardening Quantum Proof solution."""
+    total_start = time.time()
+
+    if mode == "docker":
+        if not check_docker():
+            click.echo("Error: Docker is not available. Install Docker or use --mode direct.")
+            sys.exit(1)
+        _preflight_dockerfile(solution)
+        _warn_non_default(wall_time, allow_network)
+
+    try:
+        problem, verif, circuit_id = hqp_challenge.load_sample_circuit(circuit, difficulty)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}")
+        sys.exit(1)
+
+    challenge_id = str(uuid.uuid4())
+
+    # For Docker mode, set qasm_file to the container path
+    if mode == "docker":
+        from qbittensor.challenges.hardening_quantum_proof import Problem as HQPProblem
+        problem_for_container = HQPProblem(
+            difficulty=problem.difficulty,
+            qasm_file="/app/peaked-circuit.qasm",
+        )
+        problem_json = problem_for_container.to_json()
+    else:
+        problem_json = problem.to_json()
+
+    problem_summary = {
+        "Circuit:    ": circuit_id,
+        "Difficulty: ": difficulty,
+        "Qubits:     ": len(verif.peaked_state),
+    }
+
+    output_dir = tempfile.mkdtemp(prefix="workbench-")
+
+    build_result = None
+    run_result = None
+
+    try:
+        if mode == "docker":
+            build_result = build_image(solution, "hardening_quantum_proof")
+            if not build_result.success:
+                print_report(
+                    "hardening_quantum_proof", mode, 0, problem_summary,
+                    build_result=build_result,
+                    total_time=time.time() - total_start,
+                )
+                sys.exit(1)
+
+            run_result = run_container(
+                "hardening_quantum_proof", challenge_id, problem_json, output_dir,
+                timeout=wall_time, qasm_file=problem.qasm_file, network=allow_network,
+            )
+        else:
+            entry = find_entry_point(solution, "hardening_quantum_proof")
+            if not entry:
+                click.echo(f"Error: No solver script found in {solution}. Expected hardening_quantum_proof.py.")
+                sys.exit(1)
+            run_result = run_direct(entry, challenge_id, problem_json, output_dir, wall_time)
+
+        validation_results = validate_output(
+            output_dir, "hardening_quantum_proof",
+            check_dockerfile=(mode == "docker"),
+            solution_dir=solution,
+        )
+
+        verify_result = None
+        schema_ok = all(c.passed for c in validation_results)
+        if schema_ok:
+            from qbittensor.challenges.hardening_quantum_proof import Solution
+            result_path = Path(os.path.join(output_dir, "result.json"))
+            sol = Solution.from_json_file(result_path)
+            verify_result = verify_hardening_quantum_proof(problem, sol, verif)
+
+        total_time = time.time() - total_start
+        success = print_report(
+            "hardening_quantum_proof", mode, 0, problem_summary,
             build_result=build_result, run_result=run_result,
             validation_results=validation_results,
             verify_result=verify_result,
@@ -316,6 +420,10 @@ Use --allow-network and --wall-time to override for development.
 breaking_rsa
   --difficulty   Bit-width of the semiprime to factor (default: 300)
 
+hardening_quantum_proof
+  --difficulty   Difficulty label (default: 1)
+  --circuit      Sample circuit ID (default: random)
+
 mock
   --difficulty   Difficulty label (default: 1)
   --private-key  Ed25519 private key hex (or ENIGMA_MOCK_PRIVATE_KEY env var)
@@ -327,7 +435,7 @@ Example solutions: workbench/challenges/*/example_solution/
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True))
-@click.option("--challenge", required=True, type=click.Choice(["breaking_rsa", "mock"]), help="Challenge type")
+@click.option("--challenge", required=True, type=click.Choice(["breaking_rsa", "hardening_quantum_proof", "mock"]), help="Challenge type")
 def validate(path, challenge):
     """Validate output directory structure (no solver run)."""
     results = validate_output(path, challenge)
@@ -343,3 +451,19 @@ def validate(path, challenge):
 
     click.echo(f"\nResult: {'ALL CHECKS PASSED' if all_passed else 'CHECKS FAILED'}\n")
     sys.exit(0 if all_passed else 1)
+
+
+@cli.command()
+@click.option("--difficulty", default=None, type=int, help="Filter by difficulty level")
+def samples(difficulty):
+    """List available sample circuits for Hardening Quantum Proof."""
+    sample_list = hqp_challenge.list_samples(difficulty=difficulty)
+    if not sample_list:
+        click.echo("No sample circuits found." + (f" (difficulty={difficulty})" if difficulty else ""))
+        return
+
+    click.echo(f"\n{'ID':<24} {'Diff':<6} {'Qubits':<8} {'Type'}")
+    click.echo("-" * 60)
+    for s in sample_list:
+        click.echo(f"{s['id']:<24} {s['difficulty']:<6} {s['qubit_count']:<8} {s['difficulty_type']}")
+    click.echo()

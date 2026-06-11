@@ -79,11 +79,15 @@ For current treasury balance and active prize pools, visit the [Enigma page](htt
 
 ### Breaking RSA — Live
 
-Factor large semiprimes to break RSA encryption. Solutions run in Docker containers on validator hardware (RTX PRO 6000, `--network none`, `linux/amd64`) with a 4-hour wall time.
+Factor large semiprimes to break RSA encryption. Solutions run in Docker containers on validator hardware (NVIDIA RTX PRO 6000, 24 vCPU, 85 GB RAM, `--network none`, `linux/amd64`) with a 4-hour wall time.
 
 See the [Breaking RSA challenge README](workbench/challenges/breaking_rsa/README.md) for details, and the [Miner Guide](qbittensor/miner/README.md) for submission instructions.
 
-### Peaked Circuits — Coming Soon
+### Hardening Quantum Proof — Live
+
+Given a quantum circuit, find the peaked state — the output with a disproportionately high measurement probability. Peaked circuits can serve as quantum proofs: verifiable tests that a real quantum computer can solve but a classical system cannot. If classical solvers can crack them, the proof doesn't hold.
+
+See the [Hardening Quantum Proof challenge README](workbench/challenges/hardening_quantum_proof/README.md) for details, and the [Miner Guide](qbittensor/miner/README.md) for submission instructions.
 
 For current prize pools, milestones, and additional details, visit the [Enigma page](https://www.qbittensorlabs.com/enigma).
 

@@ -33,6 +33,10 @@ python -m workbench test breaking-rsa \
     --solution workbench/challenges/breaking_rsa/example_solution/ \
     --difficulty 20 --mode direct
 
+# Hardening Quantum Proof (smoke test with trivial circuit)
+python -m workbench test hardening-quantum-proof --difficulty 0 \
+    --solution workbench/challenges/hardening_quantum_proof/example_solution/
+
 # Mock challenge (plumbing test)
 python -m workbench test mock \
     --solution <path> --private-key <hex>

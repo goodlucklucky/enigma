@@ -22,7 +22,13 @@ import bittensor as bt
 '''
 
 
-def mock_solution_setup(absolute_output_folder_location: str, configuration: dict | None = None) -> str:
+def mock_solution_setup(
+    absolute_output_folder_location: str,
+    configuration: dict | None = None,
+    platform_client: "object | None" = None,
+    milestone_id: str | None = None,
+    challenge_id: str | None = None,
+) -> str:
 
     try:
         with open(f"{absolute_output_folder_location}/challenge_input.txt", "w") as file:

@@ -216,6 +216,22 @@ class ChallengesClient:
             )
         return {}
 
+    def get_milestone_metadata(self, milestone_id: str) -> dict:
+        """
+        Fetch a metadata record for this validator for the milestone.
+        Requires an authenticated client (validator JWT).
+        """
+        if not self.request_manager:
+            raise RuntimeError(
+                "get_milestone_metadata requires an authenticated ChallengesClient (validator credentials)"
+            )
+        resp = self._request(
+            "get",
+            f"v1/challenges/milestones/{milestone_id}/metadata",
+            operation="get_milestone_metadata",
+        )
+        return resp.json()
+
     def get_milestone_price_tao(self, challenge_id: str, milestone_id: str) -> float:
         """
         Fetch the current priceTao for a milestone from the platform.

@@ -24,7 +24,7 @@ Solutions are executed by validators under these conditions:
 - **Wall time:** 4 hours (14,400 seconds)
 - **Network:** None (`--network none`, no internet access)
 - **Platform:** `linux/amd64`
-- **Compute:** RTX PRO 6000 (96 GB VRAM), 26 cores, 96 GB RAM
+- **Compute:** NVIDIA RTX PRO 6000 (96 GB VRAM), 24 vCPU, 85 GB RAM
 - **Filesystem:** Root filesystem is read-only. Use `/tmp` (tmpfs, currently sized to `VALIDATOR_DOCKER_TMPFS_DEFAULT` with noexec/nosuid) for any scratch space, temp files, or working directories needed at runtime.
 - **User:** Runs as a non-root user (default `miner`). Your Dockerfile should create this user and ensure your solver and any required binaries are accessible to it (see the example_solution/Dockerfile).
 - **Output contract:** In Docker/validator mode there is **no** writable `/output` volume mounted. Your solver must emit results exclusively via the stdout protocol (text logs, then the `SOLUTION_OUTPUT_SEPARATOR` line, then a base64-encoded zip of `result.json` + `solve_info.json` etc.). See `enigma_challenges/solution_output.py` (or the vendored copy at build time). The `OUTPUT_DIR` environment variable is only provided in direct (non-Docker) mode for local development convenience.

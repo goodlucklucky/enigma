@@ -27,14 +27,8 @@ import bittensor as bt
 
 from .validator.db_query import DBQuery
 from .miner.db_query import DBQueryMiner
-
-# Generic migration runner
-from typing import TYPE_CHECKING
-
 from .migrations.runner import run_migrations_for_db
-
-if TYPE_CHECKING:
-    from qbittensor.utils.services.telemetry import TelemetryService
+from qbittensor.utils.services.telemetry import TelemetryService
 
 
 def _package_fallback_project_root() -> Path:

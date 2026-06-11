@@ -37,7 +37,13 @@ import bittensor as bt
 from qbittensor.challenges.breaking_rsa import BreakingRSA
 
 
-def breaking_rsa_setup(absolute_output_folder_location: str, configuration: dict | None = None) -> str:
+def breaking_rsa_setup(
+    absolute_output_folder_location: str,
+    configuration: dict | None = None,
+    platform_client: "object | None" = None,
+    milestone_id: str | None = None,
+    challenge_id: str | None = None,
+) -> str:
     """Generate a Breaking RSA challenge and write it to the mount directory.
 
     Reads ``difficulty`` (bit-width of the semiprime) from the milestone

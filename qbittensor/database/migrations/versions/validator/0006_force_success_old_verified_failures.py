@@ -53,10 +53,7 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from qbittensor.utils.services.telemetry import TelemetryService
+from qbittensor.utils.services.telemetry import TelemetryService
 
 VERSION = 6
 DESCRIPTION = "Force success on pre-2026-06-10 verified_tx_hashes failures to unblock re-runs and cross-checks"
@@ -64,7 +61,7 @@ DESCRIPTION = "Force success on pre-2026-06-10 verified_tx_hashes failures to un
 CUTOFF = "2026-06-10"
 
 
-def upgrade(engine, telemetry_service: "TelemetryService | None" = None):
+def upgrade(engine, telemetry_service: TelemetryService | None = None):
     """Force success=True on old failure rows, with a note in error_message.
     Before updating, dump the affected rows via telemetry for audit.
     """

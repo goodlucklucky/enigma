@@ -90,6 +90,8 @@ def validate_output(
 
         if challenge_type == "breaking_rsa":
             from qbittensor.challenges.breaking_rsa import Solution
+        elif challenge_type == "hardening_quantum_proof":
+            from qbittensor.challenges.hardening_quantum_proof import Solution
         elif challenge_type == "mock":
             from qbittensor.challenges.mock_challenge import Solution
         else:

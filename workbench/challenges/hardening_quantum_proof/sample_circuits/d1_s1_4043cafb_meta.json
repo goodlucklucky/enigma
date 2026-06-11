@@ -1,0 +1,9 @@
+{
+  "circuit_file": "d1_s1_4043cafb.qasm",
+  "peaked_state": "0001001101001111101001001110010001111010100000",
+  "metadata": {
+    "type": "single_peak_difficulty_1"
+  },
+  "difficulty": 1,
+  "qasm_sha256": "4043cafb28653c7d0903af329cc357ed19b56bca47cc0deed4e5998efc880226"
+}

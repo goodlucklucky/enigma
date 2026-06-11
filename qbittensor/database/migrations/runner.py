@@ -38,14 +38,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-from typing import TYPE_CHECKING
 
 from sqlalchemy import Column, Integer, String, DateTime, text, func
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker
-
-if TYPE_CHECKING:
-    from qbittensor.utils.services.telemetry import TelemetryService
+from qbittensor.utils.services.telemetry import TelemetryService
 
 logger = logging.getLogger(__name__)
 

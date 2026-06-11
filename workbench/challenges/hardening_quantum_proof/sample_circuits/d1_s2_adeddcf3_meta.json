@@ -1,0 +1,9 @@
+{
+  "circuit_file": "d1_s2_adeddcf3.qasm",
+  "peaked_state": "111001111111010110011001010100001001101011001101",
+  "metadata": {
+    "type": "single_peak_difficulty_1"
+  },
+  "difficulty": 1,
+  "qasm_sha256": "adeddcf33dafe755c42a4a806eaac9972c08c73b156fb212b7986653987800e8"
+}

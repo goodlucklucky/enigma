@@ -178,3 +178,7 @@ data/
 
 # Proposals
 proposals
+
+# Private/test solutions (never publish)
+workbench/challenges/*/test_solution/
+workbench/challenges/*/participant_solution/

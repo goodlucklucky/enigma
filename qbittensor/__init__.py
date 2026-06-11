@@ -17,10 +17,14 @@
 # DEALINGS IN THE SOFTWARE.
 
 # Define the version of the template module.
-__version__ = "1.0.14"
+__version__ = "1.1.0"
 version_split = __version__.split(".")
+major = int(version_split[0]) if len(version_split) > 0 else 0
+minor = int(version_split[1]) if len(version_split) > 1 else 0
+build = int(version_split[2]) if len(version_split) > 2 else 0
+
 __spec_version__ = (
-    (1000 * int(version_split[0]))
-    + (10 * int(version_split[1]))
-    + (1 * int(version_split[2]))
+    (1_000_000_000_000 * major)   # 10**12 - major
+    + (1_000_000 * minor)         # 10**6  - minor
+    + (1 * build)                 # build  (6 digits safe)
 )
