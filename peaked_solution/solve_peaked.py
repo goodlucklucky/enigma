@@ -79,6 +79,90 @@ def env_float(name: str, default: float) -> float:
 
 
 # --------------------------------------------------------------------------- #
+#  Hardware-aware auto-scaling
+#
+#  The SUBMITTED image runs with these defaults (the validator passes no -e
+#  flags), so we scale bond dimensions to the detected VRAM at startup: a bigger
+#  card gets bigger bonds -> more GPU utilisation AND sharper marginals/oracle.
+#  Everything stays guarded by the existing time/OOM fallbacks, and an explicit
+#  env var always overrides the auto value (see auto_int).
+# --------------------------------------------------------------------------- #
+
+AUTO = {
+    "DISTILL_MAX_BOND": 128, "VERIFY_MAX_BOND": 1024, "TNO_MAX_BOND": 16,
+    "TNE_MAX_BOND": 8, "UNSWAP_MAX_BOND": 8192, "VERIFY_QUBIT_CAP": 56,
+}
+
+
+def auto_int(name: str) -> int:
+    """Explicit env override if set, else the VRAM-auto-scaled default."""
+    return env_int(name, AUTO[name])
+
+
+def cpu_count() -> int:
+    """Cores available to THIS container, honoring docker --cpus (cgroup quota),
+    which os.cpu_count() ignores (it reports host cores)."""
+    n = os.cpu_count() or 8
+    try:  # cgroup v2
+        parts = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        if parts and parts[0] != "max":
+            return max(1, min(n, int(parts[0]) // int(parts[1])))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # cgroup v1
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        if quota > 0 and period > 0:
+            return max(1, min(n, quota // period))
+    except (OSError, ValueError):
+        pass
+    return n
+
+
+def set_thread_env(cores: int) -> None:
+    """Pin BLAS/OpenMP pools to the core count. Must run before numpy/torch are
+    imported to take effect, so call it first thing in main()."""
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(var, str(max(1, cores)))
+
+
+def configure_resources(device, cores: int) -> None:
+    """Populate AUTO bond defaults from the detected GPU VRAM and pin torch threads."""
+    import torch
+    vram_gb = 0.0
+    if str(device).startswith("cuda"):
+        try:
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        except Exception:  # noqa: BLE001
+            vram_gb = 0.0
+    # DISTILL/VERIFY (and the oracle cap) are the accuracy levers -> scale with VRAM.
+    # TNO_MAX_BOND is kept modest on purpose: TNO blow-up is driven by link count,
+    # not bond size, so a bigger TNO bond just diverges faster on dense circuits.
+    if vram_gb >= 80:        # RTX PRO 6000 96GB / A100 80GB
+        tier = dict(DISTILL_MAX_BOND=1024, VERIFY_MAX_BOND=4096, TNO_MAX_BOND=24,
+                    TNE_MAX_BOND=10, UNSWAP_MAX_BOND=8192, VERIFY_QUBIT_CAP=64)
+    elif vram_gb >= 40:      # A6000 48GB / A100 40GB
+        tier = dict(DISTILL_MAX_BOND=512, VERIFY_MAX_BOND=2048, TNO_MAX_BOND=20,
+                    TNE_MAX_BOND=8, UNSWAP_MAX_BOND=8192, VERIFY_QUBIT_CAP=56)
+    elif vram_gb >= 20:      # 24 GB cards
+        tier = dict(DISTILL_MAX_BOND=256, VERIFY_MAX_BOND=1024, TNO_MAX_BOND=16,
+                    TNE_MAX_BOND=8, UNSWAP_MAX_BOND=6144, VERIFY_QUBIT_CAP=50)
+    else:                    # small GPU / CPU
+        tier = dict(DISTILL_MAX_BOND=128, VERIFY_MAX_BOND=512, TNO_MAX_BOND=16,
+                    TNE_MAX_BOND=8, UNSWAP_MAX_BOND=4096, VERIFY_QUBIT_CAP=44)
+    AUTO.update(tier)
+    try:
+        torch.set_num_threads(max(1, cores))
+    except Exception:  # noqa: BLE001
+        pass
+    log(f"Auto-scaled to {vram_gb:.0f} GB VRAM / {cores} cores -> "
+        f"DISTILL={AUTO['DISTILL_MAX_BOND']} VERIFY={AUTO['VERIFY_MAX_BOND']} "
+        f"TNO={AUTO['TNO_MAX_BOND']} UNSWAP={AUTO['UNSWAP_MAX_BOND']} "
+        f"VERIFY_CAP={AUTO['VERIFY_QUBIT_CAP']} (env vars override)")
+
+
+# --------------------------------------------------------------------------- #
 #  Deadline-bounded execution via SIGALRM
 #
 #  mpo_compress_unswap() catches KeyboardInterrupt internally and returns the
@@ -598,7 +682,7 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
             log(f"Stage 1 (distillation): budget {b1:.0f}s")
             with budget(b1):
                 r = stage_distillation(circuit, device,
-                                       max_bond=env_int("DISTILL_MAX_BOND", 128))
+                                       max_bond=auto_int("DISTILL_MAX_BOND"))
             log(f"  voted={r['voted'][:24]}... mc_freq={r['mc_freq']:.3f} decisiveness={r['decisiveness']:.3f}")
             add(r["voted"], "distill_vote", conf=r["decisiveness"])
             add(r["most_common"], "distill_mc", conf=r["mc_freq"])
@@ -615,8 +699,8 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
             log(f"Stage 3 (TNO, permutation-free): budget {b3:.0f}s")
             with budget(b3):
                 r = stage_tno(circuit, device,
-                              max_bond=env_int("TNO_MAX_BOND", 16),
-                              tne_max_bond=env_int("TNE_MAX_BOND", 8))
+                              max_bond=auto_int("TNO_MAX_BOND"),
+                              tne_max_bond=auto_int("TNE_MAX_BOND"))
             log(f"  tno pred={r['pred'][:24]}...")
             add(r["pred"], "tno", conf=0.5)
         except KeyboardInterrupt:
@@ -636,7 +720,7 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
                 r = stage_unswapping(
                     circuit, device,
                     cutoff=env_float("UNSWAP_CUTOFF", 0.002),
-                    max_bond=env_int("UNSWAP_MAX_BOND", 8192),
+                    max_bond=auto_int("UNSWAP_MAX_BOND"),
                     unswap_threshold=env_float("UNSWAP_THRESHOLD", 1e6),
                     max_its=env_int("UNSWAP_MAX_ITS", 20),
                 )
@@ -653,7 +737,7 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
         return "0" * n, {"reason": "no_candidate"}
 
     # ---- Stage 4: amplitude-oracle verification + hill-climb ----
-    verify_cap = env_int("VERIFY_QUBIT_CAP", 40)
+    verify_cap = auto_int("VERIFY_QUBIT_CAP")
     best_bs, best_amp = None, -1.0
     used_oracle = False
     if n <= verify_cap and remaining() > 30:
@@ -662,7 +746,7 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
             vb = min(remaining() * 0.5, env_float("T_VERIFY_BUILD", 180))
             log(f"Stage 4: building verification MPS (n={n} <= cap {verify_cap}), budget {vb:.0f}s")
             with budget(vb):
-                psi = build_verifier_psi(circuit, device, max_bond=env_int("VERIFY_MAX_BOND", 1024))
+                psi = build_verifier_psi(circuit, device, max_bond=auto_int("VERIFY_MAX_BOND"))
             if psi is None:
                 raise RuntimeError("verifier build did not complete")
             used_oracle = True
@@ -752,28 +836,52 @@ def emit(bitstring: str, challenge_id: str, status: str, info: dict, diag: dict,
 #  main
 # --------------------------------------------------------------------------- #
 
+def _qasm_files_under(path: str) -> list[str]:
+    """Return readable .qasm FILES at/under ``path`` (recursively), skipping dirs.
+
+    Recursing matters because ``docker run -v /nonexistent.qasm:/x.qasm`` makes
+    Docker create an empty *directory* at the source and mount it, so the target
+    can be a directory named ``*.qasm``; the real file may also sit inside a
+    mounted input directory."""
+    if os.path.isfile(path):
+        return [path]
+    if os.path.isdir(path):
+        return sorted(f for f in glob.glob(os.path.join(path, "**", "*.qasm"), recursive=True)
+                      if os.path.isfile(f))
+    return []
+
+
 def get_solver_input():
     """Official HQP input via load_solver_input, with dev/robustness fallbacks.
 
-    Returns (challenge_id, qasm_file, difficulty). The official loader handles the
-    validator mount (/challenge_input/challenge_input.json) and workbench argv
-    (<challenge_id> <problem_json>); the fallback also accepts a bare *.qasm path
-    for local development."""
+    Returns (challenge_id, qasm_file, difficulty). Resolves to an actual readable
+    .qasm FILE -- if a directory was mounted/pointed at (common docker -v mistake),
+    it searches inside for the circuit rather than failing cryptically."""
     try:
         cid, problem = load_solver_input(sys.argv)
-        return cid, problem.qasm_file, int(problem.difficulty)
+        files = _qasm_files_under(problem.qasm_file)
+        if files:
+            if files[0] != problem.qasm_file:
+                log(f"qasm_file '{problem.qasm_file}' was not a plain file; using '{files[0]}'")
+            return cid, files[0], int(problem.difficulty)
+        log(f"qasm_file '{problem.qasm_file}' has no readable .qasm; trying fallbacks")
     except Exception as e:  # noqa: BLE001
         log(f"load_solver_input did not apply ({e}); trying fallbacks")
+    # CLI/dev: a path argument that resolves to a .qasm file (or a dir holding one)
     for a in sys.argv[1:]:
-        a = a.strip()
-        if a.lower().endswith(".qasm") and os.path.isfile(a):
-            return Path(a).stem, a, 0
+        files = _qasm_files_under(a.strip())
+        if files:
+            return Path(files[0]).stem, files[0], 0
+    # validator/standalone mounts
     for d in ("/challenge_input", "/app", "."):
-        qs = sorted(glob.glob(os.path.join(d, "*.qasm")))
-        if qs:
-            return Path(qs[0]).stem, qs[0], 0
-    raise SystemExit("No HQP input: expected load_solver_input args / "
-                     "/challenge_input/challenge_input.json, or a *.qasm path.")
+        files = _qasm_files_under(d)
+        if files:
+            return Path(files[0]).stem, files[0], 0
+    raise SystemExit(
+        "No readable .qasm FILE found. NOTE: if you ran "
+        "'docker run -v /ABS/PATH/circuit.qasm:...', substitute a REAL host path -- "
+        "Docker silently creates an empty DIRECTORY when the source path does not "
+        "exist. Mount a real .qasm file, or mount the /challenge_input directory.")
 
 
 def main() -> None:
@@ -783,7 +891,13 @@ def main() -> None:
     margin = env_int("DEADLINE_MARGIN", 180)
     start = time.time()
     started_iso = datetime.now(timezone.utc).isoformat()
-    deadline = start + wall - margin
+    # Never let the safety margin push the deadline into the past (e.g. a small
+    # WALL_TIME during local testing) -- that would starve every stage.
+    deadline = start + max(60, wall - margin)
+
+    # Pin BLAS/OpenMP threads BEFORE torch/numpy import (they read these at import).
+    cores = cpu_count()
+    set_thread_env(cores)
 
     challenge_id, info, diag, difficulty = "unknown", {}, {}, 0
     bitstring, status = "", "failed"
@@ -793,6 +907,9 @@ def main() -> None:
         if os.environ.get("ROBUST_SVD", "1").strip() not in ("0", "false", "False"):
             install_robust_svd()
         device = setup_device()
+        # Scale bond dimensions to the detected VRAM (uses the validator's 96 GB
+        # without any -e flags); explicit env vars still override.
+        configure_resources(device, cores)
 
         challenge_id, qasm_path, difficulty = get_solver_input()
         log(f"Challenge: {challenge_id} | difficulty={difficulty} | QASM: {qasm_path}")
