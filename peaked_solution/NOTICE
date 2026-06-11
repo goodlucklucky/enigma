@@ -1,0 +1,39 @@
+Peaked Circuits solver — third-party code attribution
+=====================================================
+
+This solution vendors, VERBATIM, the following source files from:
+
+    Efficient Classical Simulation of Heuristic Peaked Quantum Circuits
+    David Kremer and Nicolas Dupuis (IBM T.J. Watson Research Center)
+    arXiv:2604.21908
+    https://github.com/d-kremer/peaked-circuit-simulation
+    Licensed under the Apache License, Version 2.0 (see LICENSE-Apache-2.0).
+
+Vendored files (unmodified):
+    utils.py         — circuit layering, TNO contraction, MPS sampling, marginal
+                       bitstring extraction, amplitude (bitstring_probability)
+    circuit_mpo.py   — MPO construction from circuits, MPO-MPO composition, swaps
+    unswap.py        — MPO iterative cancellation with greedy "unswapping",
+                       rewiring, and adaptive side selection
+
+The method targets the peaked circuits of:
+
+    Heuristic Quantum Advantage with Peaked Circuits
+    Gharibyan et al. (BlueQubit), arXiv:2510.25838
+    https://arxiv.org/abs/2510.25838
+
+If you use this code, please cite the original work:
+
+    @article{kremer2026peaked,
+        title   = {Efficient Classical Simulation of Heuristic Peaked Quantum Circuits},
+        author  = {Kremer, David and Dupuis, Nicolas},
+        year    = {2026},
+        eprint  = {2604.21908},
+        archivePrefix = {arXiv},
+        primaryClass  = {quant-ph},
+        url     = {https://arxiv.org/abs/2604.21908}
+    }
+
+The orchestrator (solve_peaked.py), Dockerfile, and tools/ in this directory are
+original glue around the vendored modules and the Enigma submission protocol.
+enigma_challenges/solution_output.py is vendored from the Enigma repository (MIT).

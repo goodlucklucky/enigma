@@ -1,0 +1,5 @@
+.cache
+.git
+.gitattributes
+__pycache__
+*.log
