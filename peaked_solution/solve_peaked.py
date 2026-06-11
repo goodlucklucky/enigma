@@ -117,21 +117,121 @@ def budget(seconds: float) -> _Budget:
 #  GPU setup + loud guard
 # --------------------------------------------------------------------------- #
 
+def gpu_self_test(dev) -> None:
+    """Run matmul + SVD in complex64 & complex128 to (a) verify the torch build
+    actually has kernels for this GPU's architecture and (b) prime cuBLAS/cuSOLVER.
+
+    On a Blackwell card (RTX PRO 6000, compute 12.0 / sm_120) a torch build without
+    matching kernels raises 'no kernel image is available for execution on the
+    device' on the first real op -- this surfaces that immediately with a clear
+    message instead of mid-solve."""
+    import torch
+    for dt in (torch.complex128, torch.complex64):
+        a = torch.randn(96, 96, dtype=dt, device=dev)
+        _ = (a @ a.conj().transpose(-1, -2)).abs().sum().item()
+        _ = torch.linalg.svd(a, full_matrices=False)
+    if str(dev).startswith("cuda"):
+        torch.cuda.synchronize()
+
+
 def setup_device():
+    """Pick the compute device. GPU-first, but NEVER crash on a device problem:
+    on any GPU failure we fall back to CPU (loudly) so the solver still produces
+    output. On the validator's working RTX PRO 6000 the self-test passes and we
+    use the GPU."""
     import torch
     allow_cpu = os.environ.get("ALLOW_CPU", "").strip() not in ("", "0", "false", "False")
-    if torch.cuda.is_available():
-        dev = os.environ.get("PEAKED_DEVICE", "cuda:0")
-        log(f"GPU OK: {torch.cuda.get_device_name(0)} | torch {torch.__version__} | device={dev}")
+
+    if not torch.cuda.is_available():
+        log("!!! NO CUDA GPU VISIBLE -- falling back to CPU. This is GPU-first; CPU will not "
+            "finish non-trivial circuits in time, but it will still emit a result.")
+        return "cpu"
+
+    dev = os.environ.get("PEAKED_DEVICE", "cuda:0")
+    try:
+        name = torch.cuda.get_device_name(0)
+        cap = torch.cuda.get_device_capability(0)
+        log(f"GPU: {name} | compute {cap[0]}.{cap[1]} | torch {torch.__version__} "
+            f"(CUDA {torch.version.cuda}) | device={dev}")
+    except Exception as e:  # noqa: BLE001
+        log(f"GPU info query failed: {e}")
+
+    try:
+        gpu_self_test(dev)
+        log("GPU self-test passed (matmul + SVD, complex64 & complex128).")
         return dev
-    msg = ("!!! NO CUDA GPU VISIBLE. This solver is GPU-first; running the tensor-network "
-           "methods on CPU will not finish within the wall clock for non-trivial circuits.")
-    log(msg)
-    if not allow_cpu:
-        log("Refusing to run on CPU. Set ALLOW_CPU=1 to override (debugging only).")
-        sys.exit(2)
-    log("ALLOW_CPU set -> continuing on CPU (debug).")
-    return "cpu"
+    except Exception as e:  # noqa: BLE001
+        log(f"!!! GPU SELF-TEST FAILED: {e}")
+        log("    The torch build may lack kernels for this GPU architecture. For a Blackwell "
+            "RTX PRO 6000 (sm_120) the image needs a CUDA 12.8+/13 torch wheel (cu130).")
+        if allow_cpu or os.environ.get("PEAKED_GPU_FALLBACK_CPU", "1").strip() not in ("0", "false", "False"):
+            log("    Falling back to CPU so a result is still produced (set "
+                "PEAKED_GPU_FALLBACK_CPU=0 to fail instead).")
+            return "cpu"
+        raise
+
+
+def install_robust_svd():
+    """Make torch.linalg.svd robust for FP32/complex64 on CUDA.
+
+    cuSOLVER's default Jacobi SVD ('gesvdj') fails to converge on the
+    ill-conditioned, repeated-singular-value matrices that arise in MPO/MPS
+    compression at single precision (LinAlgError "error code: 4"). We route
+    FP32/complex64 CUDA SVDs through the QR-based 'gesvd' driver, and on any
+    residual failure upcast *just that one SVD* to FP64. complex128 keeps the
+    default fast path untouched. This lets the unswapping run in complex64 -- far
+    faster on low-FP64 GPUs (A6000 / workstation cards) -- without the crash.
+
+    Patching torch.linalg.svd is sufficient because quimb's svd_truncated calls
+    `xp.linalg.svd(x)` (decomp.py:814), so the vendored modules stay verbatim.
+    """
+    import torch
+    if getattr(torch.linalg, "_peaked_robust_svd", False):
+        return
+    orig = torch.linalg.svd
+    up = {torch.complex64: torch.complex128, torch.float32: torch.float64}
+    real = {torch.complex64: torch.float32, torch.float32: torch.float32,
+            torch.complex128: torch.float64, torch.float64: torch.float64}
+
+    stats = {"gpu32": 0, "gpu64": 0, "cpu": 0, "nonfinite": 0}
+
+    def robust(A, full_matrices=True, *, driver=None):
+        on_cuda = getattr(A, "is_cuda", False)
+        fp32 = A.dtype in up
+        # 1) fast GPU path (gesvd for FP32 -- robust vs the default Jacobi driver)
+        try:
+            if on_cuda and fp32:
+                out = orig(A, full_matrices=full_matrices, driver="gesvd"); stats["gpu32"] += 1; return out
+            return orig(A, full_matrices=full_matrices, driver=driver)
+        except Exception:
+            pass
+        # 2) GPU FP64 upcast (handles ill-conditioning when the matrix is finite)
+        try:
+            if on_cuda:
+                tgt = up.get(A.dtype, A.dtype)
+                U, s, Vh = orig(A.to(tgt), full_matrices=full_matrices, driver="gesvd")
+                stats["gpu64"] += 1
+                return U.to(A.dtype), s.to(real.get(A.dtype, torch.float64)), Vh.to(A.dtype)
+        except Exception:
+            pass
+        # 3) CPU FP64 LAPACK -- bulletproof for finite matrices (no cuSOLVER quirks)
+        finite = bool(torch.isfinite(A).all().item())
+        if not finite:
+            stats["nonfinite"] += 1
+            if stats["nonfinite"] <= 3:
+                log(f"  [robust_svd] NON-FINITE matrix into SVD shape={tuple(A.shape)} "
+                    f"dtype={A.dtype} -> complex64 overflow/NaN (sanitizing)")
+        tgt = up.get(A.dtype, A.dtype)
+        A2 = torch.nan_to_num(A).to("cpu", tgt)
+        U, s, Vh = orig(A2, full_matrices=full_matrices)
+        stats["cpu"] += 1
+        dev = A.device
+        return (U.to(dev, A.dtype), s.to(dev, real.get(A.dtype, torch.float64)), Vh.to(dev, A.dtype))
+
+    torch.linalg.svd = robust
+    torch.linalg._peaked_robust_svd_stats = stats
+    torch.linalg._peaked_robust_svd = True
+    log("Robust SVD installed (FP32 -> gesvd, FP64 fallback on failure).")
 
 
 # --------------------------------------------------------------------------- #
@@ -336,9 +436,20 @@ def stage_unswapping(circuit, device, seed=123, cutoff=0.002, max_bond=8192,
         unswap.SabreSwap = _sabre
         log(f"  [perf] SabreSwap trials overridden -> {sabre_trials}")
 
-    # complex64 halves VRAM and speeds GPU ops (fine above the ~2e-3 cutoff);
-    # default complex128 matches the reference exactly.
+    # Precision. The reference uses complex128 and it is REQUIRED for large
+    # circuits: complex64's limited range overflows to Inf/NaN inside quimb's
+    # compression sweep, after which truncation collapses the MPO to bond 1 (a
+    # trivial product state -> wrong answer). This was confirmed empirically on
+    # peaked_circuit_P9_Hqap_56x1917 (overflow at ~5 gates, then permanent bond-1
+    # collapse). complex64 is therefore an EXPERIMENTAL opt-in, safe only for small
+    # circuits. (Profiling also showed the unswapping is overhead/latency-bound at
+    # ~6% GPU utilisation, not FP64-throughput-bound, so FP32 would not even speed
+    # it up.)
     dtype = torch.complex64 if os.environ.get("UNSWAP_DTYPE") == "complex64" else torch.complex128
+    if dtype == torch.complex64:
+        log("  [WARN] UNSWAP_DTYPE=complex64 is EXPERIMENTAL and numerically unstable on "
+            "large/deep circuits (FP32 overflow -> MPO collapse -> wrong answer). "
+            "Use only for small circuits; default complex128 is correct.")
 
     def to_backend(x):
         return torch.tensor(x, dtype=dtype, device=device)
@@ -346,12 +457,17 @@ def stage_unswapping(circuit, device, seed=123, cutoff=0.002, max_bond=8192,
     collect_2q = PassManager([Collect2qBlocks(), ConsolidateBlocks(force_consolidate=True)])
     circ = collect_2q.run(circuit)
 
+    # `hows` controls the unswap directions tried each iteration (3 dirs x 2
+    # parities = 6 sweeps). Cutting it is the main lever to reduce the early-phase
+    # operation count (the unswap cycles are ~70% of wall time and are
+    # overhead-bound, not compute-bound). Default matches the reference.
+    hows = tuple(h.strip() for h in os.environ.get("UNSWAP_HOWS", "both,left,right").split(",") if h.strip())
     mpo, layers_left, layers_right, _stats = mpo_compress_unswap(
         circ, seed=seed, to_backend=to_backend,
         cutoff=cutoff, max_bond=max_bond,
         unswap_threshold=unswap_threshold, center_ratio=0.5, equal=False,
         flip_freq=None, max_its=max_its, early_stopping_gates=0,
-        hows=("both", "left", "right"),
+        hows=hows,
     )
     mps, perm = mpo_to_mps(mpo, layers_left[:-2], layers_right, cutoff=cutoff, to_backend=to_backend)
 
@@ -647,41 +763,64 @@ def emit(bitstring: str, circuit_id: str, status: str, info: dict, diag: dict,
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
+    # Bulletproof: ANY failure below still lands a structurally-valid result.json
+    # via the stdout protocol. A crash with no output is an automatic validation
+    # loss, so we never let that happen.
     wall = env_int("WALL_TIME", 14400)
     margin = env_int("DEADLINE_MARGIN", 180)
     start = time.time()
     started_iso = datetime.now(timezone.utc).isoformat()
     deadline = start + wall - margin
 
-    device = setup_device()
-
+    circuit_id, info, diag = "circuit", {}, {}
+    bitstring, status = "", "failed"
     try:
+        # Install the robust SVD first so the GPU self-test below also exercises
+        # (and benefits from) it -- a flaky cuSOLVER SVD then won't needlessly
+        # trip the self-test into a CPU fallback.
+        if os.environ.get("ROBUST_SVD", "1").strip() not in ("0", "false", "False"):
+            install_robust_svd()
+        device = setup_device()
+
         qasm_path, circuit_id = locate_qasm()
-    except SystemExit as e:
-        log(str(e))
-        emit("", "circuit", "failed", {}, {"reason": str(e)}, time.time() - start, started_iso)
-        os._exit(1)
+        log(f"QASM: {qasm_path}  (circuit_id={circuit_id})")
+        circuit = load_circuit(qasm_path)
+        info = fingerprint(circuit)
+        log(f"Fingerprint: n={info['num_qubits']} 2q={info['two_qubit_gates']} "
+            f"depth={info['depth']} avg_deg={info['avg_degree']} "
+            f"all_to_all={info['all_to_all_ish']} has_swap={info['has_swap']}")
+        log(f"Ops: {info['ops']}")
 
-    log(f"QASM: {qasm_path}  (circuit_id={circuit_id})")
-    circuit = load_circuit(qasm_path)
-    info = fingerprint(circuit)
-    log(f"Fingerprint: n={info['num_qubits']} 2q={info['two_qubit_gates']} "
-        f"depth={info['depth']} avg_deg={info['avg_degree']} "
-        f"all_to_all={info['all_to_all_ish']} has_swap={info['has_swap']}")
-    log(f"Ops: {info['ops']}")
-
-    try:
         bitstring, diag = solve(circuit, info, device, deadline)
         status = "success"
+    except SystemExit as e:  # noqa: BLE001
+        log(f"FATAL (SystemExit): {e}")
+        diag = {"reason": f"exit: {e}"}
     except Exception as e:  # noqa: BLE001
-        log(f"FATAL in solve(): {e}\n{traceback.format_exc()}")
-        bitstring, diag, status = "0" * info["num_qubits"], {"reason": f"exception: {e}"}, "failed"
+        log(f"FATAL: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        diag = {"reason": f"exception: {type(e).__name__}: {e}"}
+
+    # Guarantee a valid-length bitstring if we know the qubit count.
+    n = info.get("num_qubits") or 0
+    if n and (not bitstring or len(bitstring) != n or any(c not in "01" for c in bitstring)):
+        bitstring = "0" * n
+        diag.setdefault("fallback", "no valid candidate -> all-zero placeholder")
 
     solve_time = time.time() - start
     log(f"FINAL bitstring ({len(bitstring)} bits): {bitstring}")
     log(f"Decision: {diag.get('reason')} | solve_time={solve_time:.1f}s")
 
-    emit(bitstring, circuit_id, status, info, diag, solve_time, started_iso)
+    try:
+        emit(bitstring, circuit_id, status, info, diag, solve_time, started_iso)
+    except Exception as e:  # noqa: BLE001
+        log(f"emit() failed, retrying minimal: {e}")
+        try:
+            write_solution_output(build_solution_zip({
+                "result.json": json.dumps({"status": status, "bitstring": bitstring,
+                                           "peak_bitstring": bitstring, "peak": bitstring}),
+            }))
+        except Exception as e2:  # noqa: BLE001
+            log(f"minimal emit also failed: {e2}")
     os._exit(0 if status == "success" else 1)
 
 
