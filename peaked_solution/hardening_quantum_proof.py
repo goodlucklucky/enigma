@@ -496,6 +496,90 @@ def stage_distillation(circuit, device, max_bond=128, shots=1000, seed=1234):
 #  Faithful to peaked-circuit-unswapping.ipynb.
 # --------------------------------------------------------------------------- #
 
+def install_parallel_unswap() -> bool:
+    """OPT-IN: replace ``unswap.unswap`` with a probe-parallel variant.
+
+    The reference inner loop evaluates the 6 ``(how, parity)`` candidate-swap
+    probes one at a time, each a separate MPO compression. On a big box this runs
+    the GPU at ~6% utilisation (latency/overhead-bound, not throughput-bound), so
+    the 24 cores + 96 GB card sit mostly idle. This variant fans the 6 probes out
+    across a thread pool: each ``get_good_swaps`` releases the GIL inside torch/
+    numpy SVDs, so their kernel launches overlap and the box actually gets used.
+
+    SEMANTIC NOTE: probes are evaluated against the iteration-START MPO (then the
+    selected swaps are applied greedily in the original order), whereas the
+    reference re-evaluates each probe against the MPO already mutated by earlier
+    probes in the same iteration. The recovered bitstring can therefore differ.
+    This is why it is OFF by default and gated on UNSWAP_PARALLEL_PROBES -- A/B it
+    on the GPU (same circuit, compare answer + wall-time) before trusting it on the
+    validator. Returns True if the patch was installed.
+    """
+    if os.environ.get("UNSWAP_PARALLEL_PROBES", "").strip() in ("", "0", "false", "False"):
+        return False
+    import unswap as _u
+    from concurrent.futures import ThreadPoolExecutor
+
+    if getattr(_u.unswap, "_is_parallel_probe", False):
+        return True
+    _orig = _u.unswap
+    n_workers = max(2, env_int("UNSWAP_PROBE_WORKERS", min(6, os.cpu_count() or 6)))
+
+    def parallel_unswap(mpo, hows=("left", "right", "both"), max_bond=2048,
+                        cutoff=0.0001, max_its=25, equal=False, to_backend=None, t0=0):
+        num_qubits = len(mpo.sites)
+        all_pairs = [(i, i + 1) for i in range(num_qubits - 1)]
+        perm_left = list(range(num_qubits))
+        perm_right = list(range(num_qubits))
+        logging_ = _u.logging
+        logging_.info("    [start unswap||] -> " + str(_u.get_tn_info(mpo)))
+        num_improvements, start_counts, end_counts, ii = 1, 1, 0, 0
+        stats_data = []
+        jobs = [(how, parity) for how in hows for parity in (0, 1)]
+        while num_improvements > 0 and ii < max_its and start_counts != end_counts:
+            num_improvements = 0
+            start_counts = _u.elem_counts(mpo)
+            mpo_snapshot = mpo  # probes read this snapshot concurrently (each .copy()s)
+
+            def _probe(job):
+                how, parity = job
+                ids = _u.get_good_swaps(
+                    mpo_snapshot, qubit_pairs=all_pairs[parity::2], how=how,
+                    max_bond=max_bond, cutoff=cutoff, to_backend=to_backend, equal=equal)
+                return job, ids
+
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                probed = dict(ex.map(_probe, jobs))
+
+            # Apply greedily in the original order so perms/MPO update deterministically.
+            for how in hows:
+                for parity in (0, 1):
+                    new_swap_ids = probed[(how, parity)]
+                    new_swaps = [all_pairs[i] for i in new_swap_ids if i % 2 == parity]
+                    swaps_l = new_swaps if how in ("left", "both") else []
+                    swaps_r = new_swaps if how in ("right", "both") else []
+                    mpo = _u.apply_swaps(mpo, swaps_l=swaps_l, swaps_r=swaps_r,
+                                         max_bond=max_bond, cutoff=cutoff, to_backend=to_backend)
+                    if how in ("left", "both"):
+                        perm_left = _u.swap_perm(perm_left, new_swaps)
+                    if how in ("right", "both"):
+                        perm_right = _u.swap_perm(perm_right, new_swaps)
+                    num_improvements += len(new_swap_ids)
+                    stats_data.append({"time": _u.time.perf_counter() - t0, "stage": "unswapping",
+                                       "iteration": ii, "side": how, "parity": parity,
+                                       "new_swaps": len(new_swap_ids), "total_swaps": num_improvements,
+                                       **_u.get_tn_info(mpo)})
+            end_counts = _u.elem_counts(mpo)
+            ii += 1
+        logging_.info("    [end unswap||] -> " + str(_u.get_tn_info(mpo)))
+        return mpo, (perm_left, perm_right), stats_data
+
+    parallel_unswap._is_parallel_probe = True
+    _u.unswap = parallel_unswap
+    log(f"  [perf] EXPERIMENTAL probe-parallel unswap installed "
+        f"({n_workers} workers); A/B-validate on GPU before trusting on the validator")
+    return True
+
+
 def stage_unswapping(circuit, device, seed=123, cutoff=0.002, max_bond=8192,
                      unswap_threshold=1e6, max_its=20, shots=1000):
     import torch
@@ -521,6 +605,10 @@ def stage_unswapping(circuit, device, seed=123, cutoff=0.002, max_bond=8192,
             return _RealSabreSwap(*a, **k)
         unswap.SabreSwap = _sabre
         log(f"  [perf] SabreSwap trials overridden -> {sabre_trials}")
+
+    # OPT-IN: fan the per-iteration swap probes across cores so the box gets used
+    # (default off -> reference-identical sequential probing). See install_parallel_unswap.
+    install_parallel_unswap()
 
     # Precision. The reference uses complex128 and it is REQUIRED for large
     # circuits: complex64's limited range overflows to Inf/NaN inside quimb's
@@ -694,6 +782,8 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
         ladder.append(target)
         log(f"Stage 1 (adaptive distillation): budget {b1:.0f}s, bond ladder {ladder}")
         t1 = time.time()
+        prev_voted = None  # previous rung's voted bitstring, for convergence early-exit
+        conv_h = env_int("DISTILL_CONVERGE_HAMMING", 1)
         for bd in ladder:
             left = b1 - (time.time() - t1)
             if left < 8:
@@ -706,6 +796,18 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
                 distill_psi = r.get("psi", distill_psi)  # keep highest completed rung's MPS
                 log(f"  distill@bond{bd}: voted={r['voted'][:20]}.. "
                     f"decisiveness={r['decisiveness']:.3f} mc_freq={r['mc_freq']:.3f}")
+                # Convergence early-exit: if the voted string stopped changing vs the
+                # previous rung (Hamming <= conv_h), a higher bond won't move the answer
+                # -- hand the residual (<=conv_h bits) to the hill-climb instead of
+                # burning the rest of the budget climbing. This is the real signal on
+                # mirror circuits, where `decisiveness` stays ~0.5 even when correct.
+                if prev_voted is not None:
+                    h = sum(a != b for a, b in zip(r["voted"], prev_voted))
+                    if h <= conv_h:
+                        log(f"  distill: vote converged (Hamming {h} vs prev rung); "
+                            f"stopping ladder early, hill-climb will fix residual")
+                        break
+                prev_voted = r["voted"]
                 if r["decisiveness"] >= env_float("DISTILL_STOP_DECISIVENESS", 0.95):
                     log("  distill: vote already decisive; stopping ladder early")
                     break
@@ -736,8 +838,62 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
         except Exception as e:  # noqa: BLE001
             log(f"  Stage 3 failed: {e}")
 
-    # Always try unswapping when there is real budget left and the circuit is
-    # non-trivial -- it is the most general method for BlueQubit all-to-all circuits.
+    # ---- Amplitude hill-climb oracle (runs BEFORE and AFTER unswapping) -------
+    # The hill-climb is cheap (a few hundred `bitstring_probability` evals on an
+    # already-built MPS) and is the decisive step that fixes residual single-bit
+    # errors in the marginal vote (proven on d1: 45/46 -> 46/46). We REUSE the
+    # distillation MPS as the verifier -- it is already built and faithful enough
+    # to rank the peak, so we do NOT pay to build a fresh high-bond verifier.
+    from utils import bitstring_probability
+    verify_cap = auto_int("VERIFY_QUBIT_CAP")
+    oracle = {"bs": None, "amp": -1.0, "used": False, "psi": None}
+
+    def oracle_pass(budget_s, label):
+        """Score the current candidates against the verifier MPS and steepest-ascent
+        hill-climb from the best one. Updates the global-best in `oracle`. Safe to
+        call multiple times -- a no-op when there is nothing new to improve."""
+        if n > verify_cap or not candidates or remaining() < 15:
+            return
+        psi = distill_psi if distill_psi is not None else oracle["psi"]
+        if psi is None and remaining() > 90:   # no distillation MPS -> build one once
+            try:
+                vb = min(remaining() * 0.5, env_float("T_VERIFY_BUILD", 600))
+                log(f"{label}: no distillation MPS; building verifier (budget {vb:.0f}s)")
+                with budget(vb):
+                    psi = build_verifier_psi(circuit, device, max_bond=auto_int("VERIFY_MAX_BOND"))
+                oracle["psi"] = psi
+            except Exception as e:  # noqa: BLE001
+                log(f"  {label} verifier build failed: {e}")
+                psi = None
+        if psi is None:
+            return
+        try:
+            oracle["used"] = True
+            scored = sorted(candidates.keys(),
+                            key=lambda b: float(bitstring_probability(psi, b)), reverse=True)
+            seed_bs = scored[0]
+            base_amp = float(bitstring_probability(psi, seed_bs))
+            log(f"{label}: seed amp^2 = {base_amp:.4e} (baseline 2^-n = {2.0**-n:.2e})")
+            cap = max(8.0, min(budget_s, remaining() - 10))
+            with budget(cap):
+                bs, amp = hill_climb(psi, seed_bs, min(deadline - 5, time.time() + cap))
+            if amp > oracle["amp"]:
+                oracle["bs"], oracle["amp"] = bs, amp
+            log(f"  {label} -> amp^2 = {amp:.4e} | bs={bs[:24]}...")
+        except KeyboardInterrupt:
+            log(f"  {label} hit its budget.")
+        except Exception as e:  # noqa: BLE001
+            log(f"  {label} (oracle) unavailable: {e}")
+
+    # ---- Stage 4a: cheap hill-climb BEFORE the (possibly diverging) unswap -----
+    # This is the routing fix: bank a best-effort answer NOW so a dense all-to-all
+    # circuit still emits a result even if unswapping later eats its whole budget
+    # without returning. On a structured circuit where distillation already nailed
+    # it, this IS the solve and unswap is skipped below.
+    oracle_pass(env_float("T_HILLCLIMB_EARLY", 150), "Stage 4a (early hill-climb)")
+
+    # ---- Stage 2: mirror unswapping (general method for all-to-all) -----------
+    n_cands_before_unswap = len(candidates)
     run_unswap = (info["all_to_all_ish"] or info["has_swap"] or not structured
                   or len(candidates) == 0) and remaining() > env_float("UNSWAP_MIN", 180)
     if run_unswap:
@@ -760,52 +916,20 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
         except Exception as e:  # noqa: BLE001
             log(f"  Stage 2 failed: {e}\n{traceback.format_exc()}")
 
-    if not candidates:
+    # ---- Stage 4b: refine using the FULL candidate set (incl. unswap) ---------
+    # Only re-run if unswap actually produced new candidates (otherwise 4a already
+    # gave the best answer and re-climbing the same seed is wasted work).
+    if len(candidates) > n_cands_before_unswap or oracle["bs"] is None:
+        oracle_pass(max(10.0, remaining() - 10), "Stage 4b (final hill-climb)")
+
+    if not candidates and oracle["bs"] is None:
         log("No candidates from any stage; emitting all-zero fallback.")
         return "0" * n, {"reason": "no_candidate"}
 
-    # ---- Stage 4: amplitude steepest-ascent hill-climb (the decisive step) ----
-    # Fixes the residual single-bit errors in the marginal vote (proven on the
-    # difficulty-1 samples: 45/46 -> 46/46). We REUSE the distillation MPS as the
-    # verifier -- it is already built and faithful enough to rank the peak, so we do
-    # NOT pay to build a fresh high-bond verifier (which timed out and stranded the
-    # hill-climb, leaving d1_s1 one bit short).
-    verify_cap = auto_int("VERIFY_QUBIT_CAP")
-    best_bs, best_amp = None, -1.0
-    used_oracle = False
-    if n <= verify_cap and remaining() > 20:
-        from utils import bitstring_probability
-        psi = distill_psi
-        if psi is None and remaining() > 90:   # no distillation MPS -> build a fallback verifier
-            try:
-                vb = min(remaining() * 0.5, env_float("T_VERIFY_BUILD", 600))
-                log(f"Stage 4: no distillation MPS; building verifier (budget {vb:.0f}s)")
-                with budget(vb):
-                    psi = build_verifier_psi(circuit, device, max_bond=auto_int("VERIFY_MAX_BOND"))
-            except Exception as e:  # noqa: BLE001
-                log(f"  Stage 4 verifier build failed: {e}")
-                psi = None
-        if psi is not None:
-            try:
-                used_oracle = True
-                scored = sorted(candidates.keys(),
-                                key=lambda b: float(bitstring_probability(psi, b)), reverse=True)
-                seed_bs = scored[0]
-                base_amp = float(bitstring_probability(psi, seed_bs))
-                log(f"Stage 4: amplitude hill-climb on distillation MPS; "
-                    f"seed amp^2 = {base_amp:.4e} (baseline 2^-n = {2.0**-n:.2e})")
-                with budget(max(10.0, remaining() - 20)):
-                    best_bs, best_amp = hill_climb(psi, seed_bs, deadline - 10)
-                log(f"  after hill-climb amp^2 = {best_amp:.4e} | bs={best_bs[:24]}...")
-            except KeyboardInterrupt:
-                log("  Stage 4 hit its budget.")
-            except Exception as e:  # noqa: BLE001
-                log(f"  Stage 4 (oracle) unavailable: {e}")
-
     # ---- Stage 5: choose final answer ----
-    if best_bs is not None and best_amp > 0:
-        final = best_bs
-        reason = f"amplitude_oracle amp2={best_amp:.4e}"
+    if oracle["bs"] is not None and oracle["amp"] > 0:
+        final = oracle["bs"]
+        reason = f"amplitude_oracle amp2={oracle['amp']:.4e}"
     else:
         # trust method confidence; prefer unswap > tno > distill on hard circuits
         def rank(item):
@@ -818,8 +942,8 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
 
     diag = {
         "reason": reason,
-        "used_oracle": used_oracle,
-        "best_amp2": best_amp if best_amp > 0 else None,
+        "used_oracle": oracle["used"],
+        "best_amp2": oracle["amp"] if oracle["amp"] > 0 else None,
         "baseline_2_minus_n": 2.0 ** -n,
         "num_candidates": len(candidates),
         "candidate_methods": {bs[:16] + "...": sorted(m["methods"]) for bs, m in list(candidates.items())[:8]},
