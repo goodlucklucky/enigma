@@ -673,29 +673,54 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     def remaining():
         return max(0.0, deadline - time.time())
 
-    # ---- Stage 1: distillation (cheap; often solves Level-1 outright) ----
+    # ---- Stage 1: adaptive distillation ----
+    # Climb a bond-dimension ladder under ONE time budget. A low bond finishes fast
+    # (guaranteeing a candidate); higher bonds sharpen the per-bit vote only while
+    # time remains. A too-big bond that would time out just leaves us with the last
+    # completed rung -- so we never end up with NO candidate the way a single fixed
+    # high bond can (which is exactly what happened at bond 1024).
     if os.environ.get("SKIP_DISTILL", "").strip() not in ("", "0", "false", "False"):
         log("Stage 1 (distillation): skipped via SKIP_DISTILL")
     else:
-        try:
-            b1 = min(remaining() * 0.20, env_float("T_DISTILL", 600))
-            log(f"Stage 1 (distillation): budget {b1:.0f}s")
-            with budget(b1):
-                r = stage_distillation(circuit, device,
-                                       max_bond=auto_int("DISTILL_MAX_BOND"))
-            log(f"  voted={r['voted'][:24]}... mc_freq={r['mc_freq']:.3f} decisiveness={r['decisiveness']:.3f}")
-            add(r["voted"], "distill_vote", conf=r["decisiveness"])
-            add(r["most_common"], "distill_mc", conf=r["mc_freq"])
-        except KeyboardInterrupt:
-            log("  Stage 1 hit its budget.")
-        except Exception as e:  # noqa: BLE001
-            log(f"  Stage 1 failed: {e}")
+        b1 = min(remaining() * 0.20, env_float("T_DISTILL", 600))
+        target = auto_int("DISTILL_MAX_BOND")
+        b = max(8, env_int("DISTILL_START_BOND", 128))
+        ladder = []
+        while b < target:
+            ladder.append(b)
+            b *= 2
+        ladder.append(target)
+        log(f"Stage 1 (adaptive distillation): budget {b1:.0f}s, bond ladder {ladder}")
+        t1 = time.time()
+        for bd in ladder:
+            left = b1 - (time.time() - t1)
+            if left < 8:
+                break
+            try:
+                with budget(left):
+                    r = stage_distillation(circuit, device, max_bond=bd)
+                add(r["voted"], "distill_vote", conf=r["decisiveness"])
+                add(r["most_common"], "distill_mc", conf=r["mc_freq"])
+                log(f"  distill@bond{bd}: voted={r['voted'][:20]}.. "
+                    f"decisiveness={r['decisiveness']:.3f} mc_freq={r['mc_freq']:.3f}")
+                if r["decisiveness"] >= env_float("DISTILL_STOP_DECISIVENESS", 0.95):
+                    log("  distill: vote already decisive; stopping ladder early")
+                    break
+            except KeyboardInterrupt:
+                log(f"  distill@bond{bd}: hit budget; keeping last completed rung")
+                break
+            except Exception as e:  # noqa: BLE001
+                log(f"  distill@bond{bd} failed: {e}")
+                break
 
     # ---- Stage 3 / Stage 2: escalate by structure ----
     structured = (not info["all_to_all_ish"]) and (not info["has_swap"])
     if structured:
         try:
-            b3 = min(remaining() * 0.40, env_float("T_TNO", 1800))
+            # TNO is fast when it works (sparse/heavy-hex: seconds-minutes) and
+            # diverges on dense circuits -- cap it low by default so it can't burn
+            # the budget the decisive oracle needs. Raise T_TNO for sparse circuits.
+            b3 = min(remaining() * 0.40, env_float("T_TNO", 300))
             log(f"Stage 3 (TNO, permutation-free): budget {b3:.0f}s")
             with budget(b3):
                 r = stage_tno(circuit, device,
@@ -743,7 +768,11 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     if n <= verify_cap and remaining() > 30:
         psi = None
         try:
-            vb = min(remaining() * 0.5, env_float("T_VERIFY_BUILD", 180))
+            # The oracle is the decisive stage (it fixes single-bit marginal errors
+            # by amplitude hill-climbing), so give its verifier build a large share
+            # of the REMAINING wall -- not a tiny fixed cap that strands it while
+            # the budget sits idle. (d1_s1 was 1 bit off purely because this was 180s.)
+            vb = min(remaining() * 0.6, env_float("T_VERIFY_BUILD", 3600))
             log(f"Stage 4: building verification MPS (n={n} <= cap {verify_cap}), budget {vb:.0f}s")
             with budget(vb):
                 psi = build_verifier_psi(circuit, device, max_bond=auto_int("VERIFY_MAX_BOND"))
