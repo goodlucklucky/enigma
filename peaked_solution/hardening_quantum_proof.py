@@ -581,7 +581,7 @@ def install_parallel_unswap() -> bool:
 
 
 def stage_unswapping(circuit, device, seed=123, cutoff=0.002, max_bond=8192,
-                     unswap_threshold=1e6, max_its=20, shots=1000):
+                     unswap_threshold=1e6, max_its=20, shots=1000, center_ratio=0.5):
     import torch
     from qiskit.transpiler import PassManager
     from qiskit.transpiler.passes import Collect2qBlocks, ConsolidateBlocks
@@ -639,7 +639,7 @@ def stage_unswapping(circuit, device, seed=123, cutoff=0.002, max_bond=8192,
     mpo, layers_left, layers_right, _stats = mpo_compress_unswap(
         circ, seed=seed, to_backend=to_backend,
         cutoff=cutoff, max_bond=max_bond,
-        unswap_threshold=unswap_threshold, center_ratio=0.5, equal=False,
+        unswap_threshold=unswap_threshold, center_ratio=center_ratio, equal=False,
         flip_freq=None, max_its=max_its, early_stopping_gates=0,
         hows=hows,
     )
@@ -741,6 +741,64 @@ def hill_climb(psi, bs, deadline, max_passes=12):
             best, best_p, improved = cand_best, cand_best_p, True
         if not improved:
             break
+    return best, best_p
+
+
+def beam_search(psi, seeds, deadline, width=None, max_passes=10):
+    """Beam search over |<s|psi>|^2, keeping the top-`width` bitstrings.
+
+    Idea #2: single-bit steepest-ascent hill-climb (the special case width=1)
+    gets trapped in local optima -- e.g. it left d2_s1 three bits short of the
+    peak. A beam keeps the `width` best candidates and, each pass, expands EVERY
+    member by all single-bit flips, dedupes, and keeps the best `width`. This
+    explores several basins at once and walks past the 1- and 2-bit traps that
+    stop greedy. Amplitudes are memoised so each distinct string is scored once.
+    Returns (best_bitstring, best_amp2). With width=1 it reduces to hill_climb.
+    """
+    from utils import bitstring_probability
+    width = max(1, width if width is not None else env_int("BEAM_WIDTH", 16))
+    cache: dict[str, float] = {}
+
+    def amp(b):
+        v = cache.get(b)
+        if v is None:
+            v = float(bitstring_probability(psi, b))
+            cache[b] = v
+        return v
+
+    beam = sorted(dict.fromkeys(s for s in seeds if s), key=amp, reverse=True)[:width]
+    if not beam:
+        return None, -1.0
+    best, best_p = beam[0], amp(beam[0])
+    # Keep ALL beam members each pass (including ones that locally look worse) --
+    # that is what lets the beam carry a barrier-crossing string through a stale
+    # pass to a higher basin. Terminate on `patience` stale passes or a fixed point,
+    # NOT on a single non-improving pass (which would collapse it back to greedy).
+    patience = max(1, env_int("BEAM_PATIENCE", 3))
+    stale, prev_set = 0, None
+    for _ in range(max_passes):
+        if time.time() > deadline:
+            break
+        cand = set(beam)
+        stop = False
+        for b in beam:
+            for i in range(len(b)):
+                if time.time() > deadline:
+                    stop = True
+                    break
+                cand.add(flip(b, i))
+            if stop:
+                break
+        new_beam = sorted(cand, key=amp, reverse=True)[:width]
+        top_p = amp(new_beam[0])
+        if top_p > best_p:
+            best, best_p, stale = new_beam[0], top_p, 0
+        else:
+            stale += 1
+        cur_set = frozenset(new_beam)
+        if cur_set == prev_set or stale >= patience:
+            break   # fixed point, or no improvement for `patience` passes
+        prev_set, beam = cur_set, new_beam
     return best, best_p
 
 
@@ -849,8 +907,8 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     oracle = {"bs": None, "amp": -1.0, "used": False, "psi": None}
 
     def oracle_pass(budget_s, label):
-        """Score the current candidates against the verifier MPS and steepest-ascent
-        hill-climb from the best one. Updates the global-best in `oracle`. Safe to
+        """Score the current candidates against the verifier MPS and beam-search
+        from the best ones (Idea #2). Updates the global-best in `oracle`. Safe to
         call multiple times -- a no-op when there is nothing new to improve."""
         if n > verify_cap or not candidates or remaining() < 15:
             return
@@ -869,17 +927,22 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
             return
         try:
             oracle["used"] = True
+            # Seed the beam from ALL candidates (distillation vote/mc, tno, unswap
+            # samples), ranked by amplitude -- diversity helps the beam escape the
+            # single-basin trap that left greedy hill-climb a few bits short.
             scored = sorted(candidates.keys(),
                             key=lambda b: float(bitstring_probability(psi, b)), reverse=True)
-            seed_bs = scored[0]
-            base_amp = float(bitstring_probability(psi, seed_bs))
-            log(f"{label}: seed amp^2 = {base_amp:.4e} (baseline 2^-n = {2.0**-n:.2e})")
+            base_amp = float(bitstring_probability(psi, scored[0]))
+            log(f"{label}: best seed amp^2 = {base_amp:.4e} (baseline 2^-n = {2.0**-n:.2e})")
             cap = max(8.0, min(budget_s, remaining() - 10))
+            seeds = scored[:max(1, env_int("BEAM_SEEDS", 8))]
+            # beam's graceful deadline sits a few seconds INSIDE the hard budget so it
+            # returns its best-so-far instead of being killed mid-pass by the SIGALRM.
             with budget(cap):
-                bs, amp = hill_climb(psi, seed_bs, min(deadline - 5, time.time() + cap))
-            if amp > oracle["amp"]:
+                bs, amp = beam_search(psi, seeds, min(deadline - 5, time.time() + cap - 3))
+            if bs is not None and amp > oracle["amp"]:
                 oracle["bs"], oracle["amp"] = bs, amp
-            log(f"  {label} -> amp^2 = {amp:.4e} | bs={bs[:24]}...")
+            log(f"  {label} -> amp^2 = {amp:.4e} | bs={(bs or '')[:24]}...")
         except KeyboardInterrupt:
             log(f"  {label} hit its budget.")
         except Exception as e:  # noqa: BLE001
@@ -897,24 +960,49 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     run_unswap = (info["all_to_all_ish"] or info["has_swap"] or not structured
                   or len(candidates) == 0) and remaining() > env_float("UNSWAP_MIN", 180)
     if run_unswap:
-        try:
-            b2 = max(0.0, remaining() - env_float("RESERVE_FOR_VERIFY", 240))
-            log(f"Stage 2 (mirror unswapping): budget {b2:.0f}s")
-            with budget(b2):
-                r = stage_unswapping(
-                    circuit, device,
-                    cutoff=env_float("UNSWAP_CUTOFF", 0.002),
-                    max_bond=auto_int("UNSWAP_MAX_BOND"),
-                    unswap_threshold=env_float("UNSWAP_THRESHOLD", 1e6),
-                    max_its=env_int("UNSWAP_MAX_ITS", 20),
-                )
-            for k, c in enumerate(r["candidates"]):
-                add(c, "unswap", conf=r["top_freq"] if k == 0 else r["top_freq"] * 0.5)
-            log(f"  unswap pred={r['pred'][:24] if r['pred'] else None}... top_freq={r['top_freq']:.3f}")
-        except KeyboardInterrupt:
-            log("  Stage 2 hit its budget (returned partial / no result).")
-        except Exception as e:  # noqa: BLE001
-            log(f"  Stage 2 failed: {e}\n{traceback.format_exc()}")
+        # Idea #3: optionally scan the mirror split-point. Transpilation shifts gates,
+        # so the true mirror midpoint may not be at 0.5 -- a misaligned split is what
+        # makes the MPO bond grow uncontrollably (the d2_s1 divergence). Try several
+        # center_ratios; every config's MPS samples become candidates and the amp^2
+        # oracle picks the winner. Idea #1: with Stage 4a already banking an answer,
+        # the whole remaining wall (minus a small verify reserve) goes to contraction.
+        scan = os.environ.get("UNSWAP_CENTER_SCAN", "").strip()
+        ratios = ([float(x) for x in scan.split(",") if x.strip()] if scan
+                  else [env_float("UNSWAP_CENTER_RATIO", 0.5)])
+        reserve = env_float("RESERVE_FOR_VERIFY", 240)
+        total_b2 = max(0.0, remaining() - reserve)
+        per = total_b2 / max(1, len(ratios))
+        log(f"Stage 2 (mirror unswapping): budget {total_b2:.0f}s over center_ratios {ratios}")
+        for cr in ratios:
+            cap = min(per, max(0.0, remaining() - reserve))
+            if cap < 30:
+                log("  Stage 2: out of budget for the next center_ratio; stopping scan")
+                break
+            try:
+                log(f"  unswap @center_ratio={cr}: budget {cap:.0f}s")
+                with budget(cap):
+                    r = stage_unswapping(
+                        circuit, device,
+                        cutoff=env_float("UNSWAP_CUTOFF", 0.002),
+                        max_bond=auto_int("UNSWAP_MAX_BOND"),
+                        unswap_threshold=env_float("UNSWAP_THRESHOLD", 1e6),
+                        max_its=env_int("UNSWAP_MAX_ITS", 20),
+                        center_ratio=cr,
+                    )
+                for k, c in enumerate(r["candidates"]):
+                    add(c, "unswap", conf=r["top_freq"] if k == 0 else r["top_freq"] * 0.5)
+                log(f"    pred={r['pred'][:24] if r['pred'] else None}... top_freq={r['top_freq']:.3f}")
+                # A strongly-concentrated MPS means this split aligned the mirror --
+                # no need to spend budget scanning the rest.
+                if r["top_freq"] >= env_float("UNSWAP_TOPFREQ_STOP", 0.10):
+                    log("    unswap concentrated (mirror aligned); stopping center scan early")
+                    break
+            except KeyboardInterrupt:
+                log(f"  unswap @center_ratio={cr} hit its budget (partial); next ratio")
+                continue
+            except Exception as e:  # noqa: BLE001
+                log(f"  unswap @center_ratio={cr} failed: {e}\n{traceback.format_exc()}")
+                continue
 
     # ---- Stage 4b: refine using the FULL candidate set (incl. unswap) ---------
     # Only re-run if unswap actually produced new candidates (otherwise 4a already
