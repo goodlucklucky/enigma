@@ -1,0 +1,53 @@
+# AVX2-only build of the Breaking-RSA solver. CADO is rebuilt from source with
+# -march=x86-64-v3 (AVX2/FMA/BMI2, NO AVX-512): CADO's feature macro skips adding
+# -mavx512f when -march is already present, so the siever stays AVX2. Use this to
+# A/B against the stock AVX-512 image (gpu-sol) across CPUs — relevant where Intel
+# AVX-512 frequency throttling may make AVX2 faster.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev \
+    build-essential gcc g++ make cmake \
+    libgmp-dev libhwloc15 libhwloc-dev libgomp1 \
+    zlib1g-dev numactl \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir --break-system-packages gmpy2 flask requests
+
+# Rebuild CADO-NFS from source, AVX2-only.
+COPY cado-nfs.tar.gz /tmp/
+RUN tar xzf /tmp/cado-nfs.tar.gz -C / && rm /tmp/cado-nfs.tar.gz \
+    && cd /opt/cado-nfs \
+    && printf 'CFLAGS="-O3 -march=x86-64-v3 -DNDEBUG"\nCXXFLAGS="-O3 -march=x86-64-v3 -DNDEBUG"\nbuild_tree="/opt/cado-nfs/build/release"\n' > local.sh \
+    && rm -rf build/release \
+    && make cmake \
+    && make -j"$(nproc)" \
+    && python3 /opt/cado-nfs/build/release/cado-nfs.py --help > /dev/null 2>&1 \
+    # -march=x86-64-v3 removes AVX-512 from the hot sieve path (zmm 2178 -> ~46,
+    # vs >5000 AVX2 ymm). The handful of residual zmm are cold auto-vectorized
+    # utility code; assert the hot path is overwhelmingly AVX2.
+    && Z=$(objdump -d /opt/cado-nfs/build/release/sieve/las | grep -c zmm) \
+    && Y=$(objdump -d /opt/cado-nfs/build/release/sieve/las | grep -c ymm) \
+    && echo "las SIMD: zmm=$Z ymm(avx2)=$Y" \
+    && test "$Z" -lt 200 && test "$Y" -gt 1000
+
+COPY ramnfs/broker.c ramnfs/shim.c /opt/ramnfs/
+RUN cd /opt/ramnfs \
+    && gcc -O2 -pthread -o broker broker.c -lpthread \
+    && gcc -O2 -fPIC -shared -o shim.so shim.c -ldl -lpthread \
+    && chmod +x broker
+
+RUN userdel -r ubuntu 2>/dev/null; useradd -m -u 1000 -s /usr/sbin/nologin miner
+WORKDIR /app
+COPY enigma_challenges /app/enigma_challenges/
+COPY breaking_rsa.py gpu_la.py section3_build.py /app/
+COPY msieve /app/msieve/
+ENV CADO_NFS=/opt/cado-nfs/build/release/cado-nfs.py \
+    CADO_REPLAY=/opt/cado-nfs/build/release/filter/replay \
+    MSIEVE_BIN=/app/msieve/msieve \
+    RAMNFS_BROKER=/opt/ramnfs/broker \
+    RAMNFS_SHIM=/opt/ramnfs/shim.so \
+    RAMNFS_SOCK=/tmp/ramnfs.sock \
+    RAMNFS_WORKDIR=/ramwork/factor.work \
+    HOME=/tmp TMPDIR=/tmp WALL_TIME=14400 DEADLINE_MARGIN=120 PYTHONUNBUFFERED=1
+USER miner
+ENTRYPOINT ["python3", "/app/breaking_rsa.py"]
