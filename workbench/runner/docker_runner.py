@@ -34,6 +34,7 @@ from qbittensor.validator.solution.constants import (
     SOLUTION_STDOUT_MAX_BYTES_DEFAULT,
     SOLUTION_STDOUT_MAX_BYTES_ENV,
     VALIDATOR_DOCKER_CPU_LIMIT_ENV,
+    VALIDATOR_DOCKER_GPUS_DEFAULT,
     VALIDATOR_DOCKER_GPUS_ENV,
     VALIDATOR_MEMORY_LIMIT_ENV,
 )
@@ -101,24 +102,33 @@ def _get_workbench_docker_args() -> list[str]:
     Return docker run hardening arguments, using the exact same logic and
     constants as the validator for security parity.
 
-    We deliberately relax some capacity-oriented limits on the workbench
-    (cpus, memory, gpus, pids-limit, nofile ulimit) by default, because typical
-    developer machines are much smaller than validator hosts. These limits are
-    only applied if you explicitly set the corresponding VALIDATOR_* env var.
+    We deliberately relax the capacity-oriented CPU/memory limits on the
+    workbench by default, because typical developer machines are much smaller
+    than validator hosts. These are only applied if you explicitly set the
+    corresponding VALIDATOR_* env var.
+
+    GPU passthrough, however, defaults to the validator's value ("all") so the
+    local docker test exercises the same GPU path the validator uses. Set
+    VALIDATOR_DOCKER_GPUS="" to force a CPU-only run.
     """
-    resource_envs = (
+    relaxed_envs = (
         VALIDATOR_DOCKER_CPU_LIMIT_ENV,
         VALIDATOR_MEMORY_LIMIT_ENV,
-        VALIDATOR_DOCKER_GPUS_ENV,
     )
 
     saved: dict[str, str | None] = {}
-    for env_name in resource_envs:
+    for env_name in relaxed_envs:
         current = os.environ.get(env_name)
         saved[env_name] = current
         if not current or not current.strip():
             # Force empty so the shared function skips emitting the resource flag.
             os.environ[env_name] = ""
+
+    # GPU: default to validator parity ("all") unless the user explicitly set it
+    # (including to "" for a CPU-only run).
+    if VALIDATOR_DOCKER_GPUS_ENV not in os.environ:
+        saved[VALIDATOR_DOCKER_GPUS_ENV] = None
+        os.environ[VALIDATOR_DOCKER_GPUS_ENV] = VALIDATOR_DOCKER_GPUS_DEFAULT
 
     try:
         return docker_run_security_args()

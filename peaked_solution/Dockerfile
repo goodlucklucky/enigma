@@ -26,7 +26,7 @@ RUN pip install --index-url https://download.pytorch.org/whl/cu130 torch
 
 # --- Quantum / tensor-network stack ---
 # EXACT pins from the reference repo's uv.lock (Kremer & Dupuis), the environment
-# their code is tested against. The QASM loader in solve_peaked.py is robust to
+# their code is tested against. The QASM loader in hardening_quantum_proof.py is robust to
 # qiskit's qasm2/qasm3/legacy API differences.
 RUN pip install \
     "numpy==2.4.4" \
@@ -57,8 +57,8 @@ WORKDIR /app
 COPY --chown=miner:miner utils.py circuit_mpo.py unswap.py /app/
 COPY --chown=miner:miner LICENSE-Apache-2.0 NOTICE /app/
 # Enigma stdout protocol + our orchestrator
-COPY --chown=miner:miner enigma_challenges /app/enigma_challenges/
-COPY --chown=miner:miner solve_peaked.py /app/
+COPY --chown=miner:miner _hqp_serde.py _hqp_types.py _hqp_output.py /app/
+COPY --chown=miner:miner hardening_quantum_proof.py /app/
 # Test tooling (circuit generator + harness) so the image is self-testing on any
 # machine. Ignored by the validator, which just runs the ENTRYPOINT on the qasm.
 COPY --chown=miner:miner tools /app/tools/
@@ -68,4 +68,4 @@ ENV WALL_TIME=14400 \
     DEADLINE_MARGIN=180
 
 USER miner
-ENTRYPOINT ["python", "/app/solve_peaked.py"]
+ENTRYPOINT ["python", "/app/hardening_quantum_proof.py"]

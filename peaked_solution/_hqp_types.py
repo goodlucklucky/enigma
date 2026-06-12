@@ -29,7 +29,7 @@ import logging
 from pathlib import Path
 from typing import *
 
-from . import Serde
+from _hqp_serde import Serde
 
 _logger = logging.getLogger(__name__)
 

@@ -51,8 +51,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from enigma_challenges.solution_output import build_solution_zip, write_solution_output
-from enigma_challenges.hardening_quantum_proof import Solution, Problem, load_solver_input
+from _hqp_output import build_solution_zip, write_solution_output
+from _hqp_types import Solution, Problem, load_solver_input
 
 
 # --------------------------------------------------------------------------- #

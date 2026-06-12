@@ -3,7 +3,7 @@
 
     python tools/test_local.py --qasm /tmp/peaked.qasm
 
-Reads the ground-truth peak from <qasm>.peak.json, runs solve_peaked.py as a
+Reads the ground-truth peak from <qasm>.peak.json, runs hardening_quantum_proof.py as a
 subprocess (the actual entrypoint, in OUTPUT_DIR/direct mode), then compares the
 emitted bitstring against the peak — reporting whether it matched directly or only
 when reversed (to catch any bit-ordering convention mismatch).
@@ -43,7 +43,7 @@ def main():
 
     t0 = time.time()
     proc = subprocess.run(
-        [sys.executable, str(SOLVER_DIR / "solve_peaked.py"), args.qasm],
+        [sys.executable, str(SOLVER_DIR / "hardening_quantum_proof.py"), args.qasm],
         cwd=str(SOLVER_DIR), env=env, capture_output=True, text=True,
     )
     dt = time.time() - t0
