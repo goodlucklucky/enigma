@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     build-essential gcc g++ make \
     libgmp-dev libhwloc15 libhwloc-dev libgomp1 \
-    zlib1g-dev \
+    zlib1g-dev numactl \
     && rm -rf /var/lib/apt/lists/*
 
 # gmpy2 for the solver; flask + requests are required by CADO-NFS master's

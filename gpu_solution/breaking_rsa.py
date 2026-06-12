@@ -102,6 +102,47 @@ def _find_cado_script() -> Optional[str]:
     return None
 
 
+def _default_ropteffort(ndigits: int) -> Optional[float]:
+    """CADO's calibrated ropteffort for the params.cNN file nearest this size.
+
+    Used to bump it multiplicatively (always an increase). CADO's defaults jump
+    non-linearly with size (c140=16, c145=18, c150=25), so a fixed bumped value
+    would be a regression at some sizes — reading the per-size default avoids
+    that."""
+    pdir = None
+    cado = _find_cado_script()
+    cands = []
+    if cado:
+        for up in Path(cado).resolve().parents:
+            cands.append(up / "parameters" / "factor")
+    cands.append(Path("/opt/cado-nfs/parameters/factor"))
+    for c in cands:
+        if c.is_dir():
+            pdir = c
+            break
+    if not pdir:
+        return None
+    best, best_d = None, 1 << 30
+    for f in pdir.glob("params.c[0-9]*"):
+        try:
+            nn = int(f.name[len("params.c"):])
+        except ValueError:
+            continue
+        d = abs(nn - ndigits)
+        if d < best_d:
+            best, best_d = f, d
+    if not best:
+        return None
+    try:
+        for line in best.read_text().splitlines():
+            m = re.match(r"\s*tasks\.polyselect\.ropteffort\s*=\s*([0-9.]+)", line)
+            if m:
+                return float(m.group(1))
+    except OSError:
+        pass
+    return None
+
+
 def _start_broker(sock_path: str, log) -> Optional[subprocess.Popen]:
     broker = _find_bin("RAMNFS_BROKER", ["/opt/ramnfs/broker", "/app/ramnfs/broker"])
     if not broker:
@@ -207,6 +248,143 @@ def _invoke_cado(cmd: List[str], env: dict, n: mpz, deadline: float, label: str,
     return factors, (rc if rc is not None else 1)
 
 
+def _count_cpulist(cl: str) -> int:
+    n = 0
+    for part in cl.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-")
+            n += int(b) - int(a) + 1
+        elif part:
+            n += 1
+    return n
+
+
+def _numa_plan(threads: int, las_threads: int, log) -> Optional[list]:
+    """Plan one pinned sieve-client group per CPU locality domain.
+
+    Returns [(membind_node|None, physcpubind_str, n_clients), ...] or None when
+    NUMA pinning doesn't apply. Real kernel NUMA nodes (/sys) drive production;
+    CADO_NUMA_TEST=k simulates k CPU groups on a single node (CPU-pin only) so
+    the launcher can be validated on non-NUMA hardware."""
+    test_k = _env_int("CADO_NUMA_TEST", 0)
+    if test_k > 1:
+        cpus = list(range(threads))
+        per = max(1, len(cpus) // test_k)
+        groups = []
+        for g in range(test_k):
+            chunk = cpus[g * per:] if g == test_k - 1 else cpus[g * per:(g + 1) * per]
+            if chunk:
+                cl = ",".join(str(c) for c in chunk)
+                groups.append((None, cl, max(1, len(chunk) // las_threads)))
+        return groups if len(groups) > 1 else None
+    nodes = []
+    for d in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
+        try:
+            cl = Path(d, "cpulist").read_text().strip()
+        except OSError:
+            continue
+        if not cl:
+            continue
+        node_id = int(os.path.basename(d)[4:])
+        ncpu = _count_cpulist(cl)
+        if ncpu:
+            nodes.append((node_id, cl, max(1, ncpu // las_threads)))
+    if len(nodes) <= 1:
+        log(f"NUMA: {len(nodes)} node(s) — pinning not applicable, using auto-clients")
+        return None
+    return nodes
+
+
+def _invoke_cado_numa(server_cmd: List[str], plan: list, client_py: str,
+                      bindir: str, workdir: str, env: dict, n: mpz,
+                      deadline: float, label: str, log
+                      ) -> Tuple[Optional[Tuple[int, int]], int]:
+    """Run CADO as a server (no auto-clients) plus manually-launched sieve
+    clients, each numactl-pinned to one CPU/NUMA group. Mirrors _invoke_cado's
+    watchdog + factor-parsing read loop, but feeds many local NUMA-local clients
+    so sieving stays on local memory on big multi-socket boxes."""
+    server = subprocess.Popen(server_cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, env=env,
+                              start_new_session=True)
+    clients: List[subprocess.Popen] = []
+    factors: Optional[Tuple[int, int]] = None
+    tail: List[str] = []
+    launched = False
+    last_log = 0.0
+    t0 = time.time()
+    conn_re = re.compile(r"--server=(\S+)\s+--certsha1=(\S+)")
+
+    stop = threading.Event()
+
+    def _watchdog() -> None:
+        while not stop.wait(2.0):
+            if time.time() >= deadline:
+                log(f"Stage 2: {label} hit deadline after {int(time.time()-t0)}s; terminating")
+                _kill(server)
+                return
+
+    def _launch(url: str, sha: str) -> None:
+        total = 0
+        for gi, (node, cpus, nc) in enumerate(plan):
+            for i in range(nc):
+                numa = ["numactl", f"--physcpubind={cpus}"]
+                if node is not None:
+                    numa.append(f"--membind={node}")
+                ccmd = numa + [sys.executable, client_py,
+                               f"--server={url}", f"--certsha1={sha}",
+                               f"--bindir={bindir}",
+                               f"--basepath={os.path.join(workdir, f'cl.{gi}.{i}')}"]
+                try:
+                    clients.append(subprocess.Popen(
+                        ccmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        env=env, start_new_session=True))
+                    total += 1
+                except Exception as e:  # noqa: BLE001
+                    log(f"Stage 2: {label} client launch failed: {e}")
+        log(f"Stage 2: {label} launched {total} NUMA-pinned clients "
+            f"across {len(plan)} group(s)")
+
+    wd = threading.Thread(target=_watchdog, daemon=True)
+    wd.start()
+    try:
+        assert server.stdout
+        for raw in server.stdout:
+            for line in raw.replace("\r", "\n").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                tail.append(s)
+                del tail[:-40]
+                if not launched:
+                    m = conn_re.search(s)
+                    if m:
+                        _launch(m.group(1), m.group(2))
+                        launched = True
+                factors = _factors_from_line(s, n)
+                if factors:
+                    log(f"Stage 2: {label} found factors")
+                    break
+                now = time.time()
+                if now - last_log > 120:
+                    log(f"Stage 2: {label} running ... {int(now - t0)}s elapsed")
+                    last_log = now
+            if factors:
+                break
+    except Exception as e:  # noqa: BLE001
+        log(f"Stage 2: {label} read error: {e}")
+    finally:
+        stop.set()
+        for c in clients:
+            _kill(c)            # each client is its own session (las children)
+        _kill(server)
+    rc = server.poll()
+    if not factors and rc not in (0, None):
+        for ln in tail[-10:]:
+            log(f"  cado: {ln[:200]}")
+    return factors, (rc if rc is not None else 1)
+
+
 def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     """Stage 2: GNFS via CADO with ramnfs, optionally offloading the linear
     algebra to the GPU (msieve block Lanczos) when a GPU is present.
@@ -257,7 +435,14 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     cado_build = str(Path(cado).parent)
     ndigits = len(str(int(n)))
     nbits = int(n).bit_length()
-    n_clients = threads  # one single-threaded sieve client per core
+
+    # Sieve throughput tuning (research-backed; see git history). On many-core
+    # NUMA servers, ~2-4 threads per las with several clients beats 1 thread per
+    # core (sieving saturates at a few threads and CADO's NUMA placement wants
+    # several clients per node). All knobs are env-overridable so the optimal
+    # values can be A/B'd on the actual target hardware.
+    las_threads = _env_int("CADO_LAS_THREADS", 1)
+    n_clients = _env_int("CADO_NCLIENTS", 0) or max(1, threads // las_threads)
 
     base_cmd = [
         sys.executable, cado, str(int(n)),
@@ -267,15 +452,70 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
         f"slaves.nrclients={n_clients}",
         f"slaves.cado_nfs_client.bindir={cado_build}",
         f"tasks.linalg.bwc.threads={threads}",
-        "tasks.sieve.las.threads=1",
+        f"tasks.sieve.las.threads={las_threads}",
         # NOTE: do NOT set tasks.sieve.adjust_strategy (benchmarked value 2 made the
         # sieve ~5x slower). Let CADO pick size-appropriate polyselect params from
         # its calibrated params.cNNN; do not force degree/admax (see git history).
     ]
-    if os.environ.get("CADO_ADMAX"):
-        base_cmd.append(f"tasks.polyselect.admax={os.environ['CADO_ADMAX']}")
-    if os.environ.get("CADO_DEGREE"):
-        base_cmd.append(f"tasks.polyselect.degree={os.environ['CADO_DEGREE']}")
+    # Explicit per-knob overrides (empty = CADO's calibrated default). I and
+    # las.threads are intentionally NOT auto-tuned — they must be A/B'd on the
+    # actual target CPU (e.g. I=13->14, las.threads=1->2), so they stay manual.
+    for env_key, cado_key in (("CADO_ADMAX", "tasks.polyselect.admax"),
+                              ("CADO_DEGREE", "tasks.polyselect.degree"),
+                              ("CADO_I", "tasks.I"),
+                              ("CADO_QMIN", "tasks.sieve.qmin")):
+        v = os.environ.get(env_key, "").strip()
+        if v:
+            base_cmd.append(f"{cado_key}={v}")
+
+    # Size-aware sieve tuning — applied ONLY to large (production c130-c145)
+    # inputs, where it cuts sieve wall time; never to small inputs (the c90 A/B
+    # showed no benefit there and these defaults are calibrated for the big
+    # range). Explicit env vars still win.
+    #   * ropteffort: a better polynomial (higher Murphy-E) yields more relations
+    #     per special-q, so sieving needs fewer of them. Bumped MULTIPLICATIVELY
+    #     off CADO's per-size default so it is always an increase.
+    #   * rels_wanted=1: stop sieving as soon as filtering can succeed, instead of
+    #     collecting CADO's built-in safety margin (c140 ships 71M).
+    tune_min = _env_int("SIEVE_TUNE_MIN_DIGITS", 120)
+    tuned: List[str] = []
+    ropt = os.environ.get("CADO_ROPTEFFORT", "").strip()
+    if not ropt and ndigits >= tune_min:
+        base = _default_ropteffort(ndigits)
+        if base:
+            try:
+                mult = float(os.environ.get("CADO_ROPTEFFORT_MULT", "1.5") or "1.5")
+            except ValueError:
+                mult = 1.5
+            ropt = str(round(base * mult, 1))
+    if ropt:
+        base_cmd.append(f"tasks.polyselect.ropteffort={ropt}")
+        tuned.append(f"ropteffort={ropt}")
+    relsw = os.environ.get("CADO_RELS_WANTED", "").strip()
+    if not relsw and ndigits >= tune_min:
+        relsw = "1"
+    if relsw:
+        base_cmd.append(f"tasks.sieve.rels_wanted={relsw}")
+        tuned.append(f"rels_wanted={relsw}")
+
+    # Optional NUMA-pinned client launch (opt-in via CADO_NUMA). On big
+    # multi-socket boxes, binding each sieve client to one node's CPUs + local
+    # memory removes remote-memory penalties on the bandwidth-bound sieve. When
+    # it doesn't apply (single node / not requested), we use CADO's auto-clients.
+    numa = (_numa_plan(threads, las_threads, log)
+            if os.environ.get("CADO_NUMA") else None)
+    client_py = os.path.join(cado_build, "cado-nfs-client.py")
+    use_numa = bool(numa) and os.path.isfile(client_py)
+    if use_numa:
+        # server only — clients are launched (pinned) by us, so disable auto-spawn
+        base_cmd = ["slaves.nrclients=0" if x.startswith("slaves.nrclients=")
+                    else x for x in base_cmd]
+
+    def _cado(extra: List[str], label: str) -> Tuple[Optional[Tuple[int, int]], int]:
+        if use_numa:
+            return _invoke_cado_numa(base_cmd + extra, numa, client_py, cado_build,
+                                     workdir, env, n, deadline, label, log)
+        return _invoke_cado(base_cmd + extra, env, n, deadline, label, log)
 
     # GPU offload only pays off once the linear algebra is substantial. Below
     # ~c100 the matrix is tiny, CADO is already fast, and the filter-split +
@@ -286,14 +526,16 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     factors: Optional[Tuple[int, int]] = None
     try:
         log(f"Stage 2: CADO c{ndigits} ({nbits}-bit) threads={threads} "
-            f"clients={n_clients} ram_shim={'on' if shim else 'off'} "
-            f"gpu_la={'on' if use_gpu else 'off'} budget={remaining}s")
+            f"clients={n_clients} las_threads={las_threads} "
+            f"numa={'on(' + str(len(numa)) + ' grp)' if use_numa else 'off'} "
+            f"ram_shim={'on' if shim else 'off'} "
+            f"gpu_la={'on' if use_gpu else 'off'} "
+            f"tune=[{', '.join(tuned) if tuned else 'none'}] budget={remaining}s")
 
         if use_gpu:
             # Phase 1: sieve + filter only (skip CADO's own linalg/sqrt).
-            _, rc = _invoke_cado(
-                base_cmd + ["tasks.linalg.run=false", "tasks.sqrt.run=false"],
-                env, n, deadline, "CADO filter", log)
+            _, rc = _cado(["tasks.linalg.run=false", "tasks.sqrt.run=false"],
+                          "CADO filter")
             if rc == 0:
                 # Phase 2: GPU linear algebra + square root on CADO's matrix.
                 # CADO names its files "c<digits>" by default; gpu_la discovers
@@ -310,7 +552,7 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
         if not factors:
             # CPU path / fallback: full CADO (resumes from the filtered state in
             # the SQLite DB, reusing all relations already in the broker).
-            factors, _ = _invoke_cado(base_cmd, env, n, deadline, "CADO", log)
+            factors, _ = _cado([], "CADO")
     finally:
         if broker:
             _terminate_pid(broker)
