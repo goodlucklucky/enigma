@@ -182,3 +182,9 @@ proposals
 # Private/test solutions (never publish)
 workbench/challenges/*/test_solution/
 workbench/challenges/*/participant_solution/
+
+# Local test scratch (sample-circuit runs: /challenge_input mount, solver stdout)
+/ci/
+/mock/
+/out.txt
+/out_*.txt

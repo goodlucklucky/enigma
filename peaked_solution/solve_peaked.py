@@ -487,6 +487,7 @@ def stage_distillation(circuit, device, max_bond=128, shots=1000, seed=1234):
         "mc_freq": mc_count / shots,
         "decisiveness": decisiveness,
         "counter": csamples,
+        "psi": qc.psi,   # the built MPS, reused by Stage 4's amplitude hill-climb
     }
 
 
@@ -679,6 +680,7 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     # time remains. A too-big bond that would time out just leaves us with the last
     # completed rung -- so we never end up with NO candidate the way a single fixed
     # high bond can (which is exactly what happened at bond 1024).
+    distill_psi = None  # best completed distillation MPS, reused as Stage 4's verifier
     if os.environ.get("SKIP_DISTILL", "").strip() not in ("", "0", "false", "False"):
         log("Stage 1 (distillation): skipped via SKIP_DISTILL")
     else:
@@ -701,6 +703,7 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
                     r = stage_distillation(circuit, device, max_bond=bd)
                 add(r["voted"], "distill_vote", conf=r["decisiveness"])
                 add(r["most_common"], "distill_mc", conf=r["mc_freq"])
+                distill_psi = r.get("psi", distill_psi)  # keep highest completed rung's MPS
                 log(f"  distill@bond{bd}: voted={r['voted'][:20]}.. "
                     f"decisiveness={r['decisiveness']:.3f} mc_freq={r['mc_freq']:.3f}")
                 if r["decisiveness"] >= env_float("DISTILL_STOP_DECISIVENESS", 0.95):
@@ -761,38 +764,43 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
         log("No candidates from any stage; emitting all-zero fallback.")
         return "0" * n, {"reason": "no_candidate"}
 
-    # ---- Stage 4: amplitude-oracle verification + hill-climb ----
+    # ---- Stage 4: amplitude steepest-ascent hill-climb (the decisive step) ----
+    # Fixes the residual single-bit errors in the marginal vote (proven on the
+    # difficulty-1 samples: 45/46 -> 46/46). We REUSE the distillation MPS as the
+    # verifier -- it is already built and faithful enough to rank the peak, so we do
+    # NOT pay to build a fresh high-bond verifier (which timed out and stranded the
+    # hill-climb, leaving d1_s1 one bit short).
     verify_cap = auto_int("VERIFY_QUBIT_CAP")
     best_bs, best_amp = None, -1.0
     used_oracle = False
-    if n <= verify_cap and remaining() > 30:
-        psi = None
-        try:
-            # The oracle is the decisive stage (it fixes single-bit marginal errors
-            # by amplitude hill-climbing), so give its verifier build a large share
-            # of the REMAINING wall -- not a tiny fixed cap that strands it while
-            # the budget sits idle. (d1_s1 was 1 bit off purely because this was 180s.)
-            vb = min(remaining() * 0.6, env_float("T_VERIFY_BUILD", 3600))
-            log(f"Stage 4: building verification MPS (n={n} <= cap {verify_cap}), budget {vb:.0f}s")
-            with budget(vb):
-                psi = build_verifier_psi(circuit, device, max_bond=auto_int("VERIFY_MAX_BOND"))
-            if psi is None:
-                raise RuntimeError("verifier build did not complete")
-            used_oracle = True
-            # score every candidate, then hill-climb the best one
-            from utils import bitstring_probability
-            scored = sorted(candidates.keys(),
-                            key=lambda b: float(bitstring_probability(psi, b)), reverse=True)
-            seed_bs = scored[0]
-            base_amp = float(bitstring_probability(psi, seed_bs))
-            log(f"  best raw candidate amp^2 = {base_amp:.4e} (baseline 2^-n = {2.0**-n:.2e})")
-            with budget(max(10.0, remaining() - 30)):
-                best_bs, best_amp = hill_climb(psi, seed_bs, deadline - 15)
-            log(f"  after hill-climb amp^2 = {best_amp:.4e} | bs={best_bs[:24]}...")
-        except KeyboardInterrupt:
-            log("  Stage 4 hit its budget.")
-        except Exception as e:  # noqa: BLE001
-            log(f"  Stage 4 (oracle) unavailable: {e}")
+    if n <= verify_cap and remaining() > 20:
+        from utils import bitstring_probability
+        psi = distill_psi
+        if psi is None and remaining() > 90:   # no distillation MPS -> build a fallback verifier
+            try:
+                vb = min(remaining() * 0.5, env_float("T_VERIFY_BUILD", 600))
+                log(f"Stage 4: no distillation MPS; building verifier (budget {vb:.0f}s)")
+                with budget(vb):
+                    psi = build_verifier_psi(circuit, device, max_bond=auto_int("VERIFY_MAX_BOND"))
+            except Exception as e:  # noqa: BLE001
+                log(f"  Stage 4 verifier build failed: {e}")
+                psi = None
+        if psi is not None:
+            try:
+                used_oracle = True
+                scored = sorted(candidates.keys(),
+                                key=lambda b: float(bitstring_probability(psi, b)), reverse=True)
+                seed_bs = scored[0]
+                base_amp = float(bitstring_probability(psi, seed_bs))
+                log(f"Stage 4: amplitude hill-climb on distillation MPS; "
+                    f"seed amp^2 = {base_amp:.4e} (baseline 2^-n = {2.0**-n:.2e})")
+                with budget(max(10.0, remaining() - 20)):
+                    best_bs, best_amp = hill_climb(psi, seed_bs, deadline - 10)
+                log(f"  after hill-climb amp^2 = {best_amp:.4e} | bs={best_bs[:24]}...")
+            except KeyboardInterrupt:
+                log("  Stage 4 hit its budget.")
+            except Exception as e:  # noqa: BLE001
+                log(f"  Stage 4 (oracle) unavailable: {e}")
 
     # ---- Stage 5: choose final answer ----
     if best_bs is not None and best_amp > 0:
