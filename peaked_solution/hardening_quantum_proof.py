@@ -1095,16 +1095,20 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     if len(candidates) > n_cands_before_unswap or oracle["bs"] is None:
         oracle_pass(max(10.0, remaining() - 10), "Stage 4b (final hill-climb)")
 
-    # ---- Stage 4c: belief-propagation oracle (Idea #4) + portfolio select (#5) -
-    # The portfolio rule: keep whichever INDEPENDENT oracle certifies the highest
-    # peak (amp^2). If the MPS oracle's best is at/near the uniform baseline 2^-n,
-    # the 1D attack found nothing -- fall through to a BP contraction of the full
-    # TN, which works on the non-1D geometry the MPS can't. Also runs on BP_ENABLE=1.
+    # ---- Stage 4c: belief-propagation oracle (Idea #4) -- OPT-IN ONLY ----------
+    # REGRESSION FIX: this MUST NOT auto-fire. On weak-signal STRUCTURED circuits
+    # (the live difficulty-1 case) the MPS oracle's amp^2 can land below the 2^-n
+    # baseline even when its bitstring is right; an `amp^2 < baseline` auto-trigger
+    # therefore fired BP by default, and quimb's contract_d2bp does NOT converge on
+    # these circuits -- beam_search then burned the whole wall on non-converging BP
+    # scores and emitted a wrong answer (validator failure at ~10 min). BP is now
+    # gated behind BP_ENABLE=1 AND excluded on structured circuits, where the MPS +
+    # beam path is the intended decisive method. The amp^2 baseline is kept only for
+    # logging/diagnostics.
     baseline = 2.0 ** -n
     bp_force = os.environ.get("BP_ENABLE", "").strip() not in ("", "0", "false", "False")
-    bp_trigger = baseline * env_float("BP_TRIGGER_MULT", 4.0)
-    if (n <= verify_cap and candidates and remaining() > env_float("BP_MIN", 120)
-            and (bp_force or oracle["amp"] < bp_trigger)):
+    if (bp_force and not structured and n <= verify_cap and candidates
+            and remaining() > env_float("BP_MIN", 120)):
         try:
             cap = max(20.0, remaining() - 15)
             log(f"Stage 4c (BP oracle): MPS amp^2={oracle['amp']:.2e} vs baseline "
@@ -1299,6 +1303,13 @@ def main() -> None:
         # "success" means we are submitting a real candidate; the no-candidate
         # fallback is reported honestly as "failed" with peaked_state=None.
         status = "failed" if diag.get("reason") == "no_candidate" else "success"
+    except KeyboardInterrupt as e:
+        # A budget() SIGALRM that escaped a stage's own handler. NOT a user Ctrl-C
+        # (the container is non-interactive). Catch it here so we still emit() a
+        # result instead of dying with no output -- a crash with no output is an
+        # automatic validation loss.
+        log(f"FATAL: budget/interrupt escaped to main(): {e}")
+        diag = diag or {"reason": f"interrupt: {e}"}
     except SystemExit as e:  # noqa: BLE001
         log(f"FATAL (SystemExit): {e}")
         diag = {"reason": f"exit: {e}"}

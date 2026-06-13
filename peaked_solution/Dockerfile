@@ -43,11 +43,13 @@ RUN pip install \
 RUN pip install kahypar optuna || \
     echo "kahypar/optuna not installed (optional) — cotengra falls back to random sampling."
 
-# Optional cuQuantum/cuTensorNet acceleration for contraction paths. Kept in a
-# separate, failure-tolerant layer so the image still builds if a wheel is
-# unavailable for the target platform.
-RUN pip install cuquantum-python-cu13 cupy-cuda13x || \
-    echo "cuquantum/cupy not installed (optional) — quimb will use the torch backend."
+# NOTE: we deliberately DO NOT install cuquantum-python-cu13 / cupy-cuda13x.
+# The solver uses the torch backend exclusively (it never imports cupy/cuquantum),
+# but having them installed lets quimb/cotengra/autoray auto-detect and import cupy
+# at startup -- a large, CUDA-13-pinned, DRIVER-SENSITIVE stack that can fail to
+# initialise on a validator whose NVIDIA driver doesn't match cu130, crashing the
+# run before it starts. Omitting it removes that startup failure surface, shrinks
+# the image (~0.5-1 GB), and speeds the (uncached) validator build.
 
 # --- Non-root runtime user (validator runs --user + read-only rootfs) ---
 RUN useradd -r -s /sbin/nologin -d /app -U miner
