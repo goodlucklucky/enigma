@@ -8,11 +8,18 @@
 //   'L' listdir      [op:1][len:2][prefix:len]-> [count:4LE]([namelen:2LE][name:namelen])*
 //       (returns direct-child basenames only)
 //
-// Thread-per-connection; global table guarded by mutex.
+// Scalability (idea #1): the file table is a SHARDED hash map. Each path hashes
+// to one of NSTRIPE independent shards, each with its own mutex and hash
+// buckets. Open/Stat/Unlink are therefore O(1) and only contend with other ops
+// on the *same* shard — so N sieve clients on N cores no longer serialize on a
+// single global lock doing an O(files) strcmp scan (the old design's quadratic
+// blow-up that made the broker the bottleneck at high core counts). Entries are
+// heap-allocated, so there is no fixed MAXF ceiling either.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -22,32 +29,59 @@
 #include <pthread.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/resource.h>
 
-#define MAXF    16384
-#define PATHMAX 1024
+#define PATHMAX  1024
+#define NSTRIPE  256          // lock/hash shards (power of two)
+#define SBUCKETS 4096         // hash buckets per shard (power of two)
 
-static char            g_paths[MAXF][PATHMAX];
-static int             g_fds[MAXF];
-static int             g_nf = 0;
-static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static int             g_dbg = 0;
-static int             g_keep = 0;
+typedef struct entry {
+    struct entry *next;
+    int           fd;
+    size_t        plen;
+    char          path[];     // flexible array, NUL-terminated, exact length
+} entry_t;
 
-static int idx_of(const char *p) {
-    for (int i = 0; i < g_nf; i++)
-        if (g_fds[i] >= 0 && strcmp(g_paths[i], p) == 0) return i;
-    return -1;
+typedef struct {
+    pthread_mutex_t mu;
+    entry_t        *buckets[SBUCKETS];
+} stripe_t;
+
+static stripe_t g_str[NSTRIPE];
+static int      g_dbg  = 0;
+static int      g_keep = 0;
+
+// FNV-1a; split into shard index (low bits) and bucket index (high bits).
+static uint64_t hash_path(const char *p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= (unsigned char)p[i]; h *= 1099511628211ULL; }
+    return h;
 }
 
-static int find_or_create(const char *path) {
-    int i = idx_of(path);
-    if (i >= 0) return g_fds[i];
-    if (g_nf >= MAXF) return -1;
+static entry_t *bucket_find(entry_t *head, const char *p, size_t n) {
+    for (entry_t *e = head; e; e = e->next)
+        if (e->fd >= 0 && e->plen == n && memcmp(e->path, p, n) == 0) return e;
+    return NULL;
+}
+
+// Open-or-create the memfd for `path`. Returns the fd (>=0) or -1.
+// On *existed (out), reports whether the path already had a memfd.
+static int find_or_create(const char *path, int *existed) {
+    size_t n = strlen(path);
+    uint64_t h = hash_path(path, n);
+    stripe_t *s = &g_str[h & (NSTRIPE - 1)];
+    size_t b = (h >> 16) & (SBUCKETS - 1);
+    pthread_mutex_lock(&s->mu);
+    entry_t *e = bucket_find(s->buckets[b], path, n);
+    if (e) { if (existed) *existed = 1; int fd = e->fd; pthread_mutex_unlock(&s->mu); return fd; }
+    if (existed) *existed = 0;
     int fd = memfd_create("ramnfs", 0);
-    if (fd < 0) return -1;
-    strncpy(g_paths[g_nf], path, PATHMAX - 1);
-    g_fds[g_nf] = fd;
-    g_nf++;
+    if (fd < 0) { pthread_mutex_unlock(&s->mu); return -1; }
+    e = malloc(sizeof(entry_t) + n + 1);
+    if (!e) { close(fd); pthread_mutex_unlock(&s->mu); return -1; }
+    e->fd = fd; e->plen = n; memcpy(e->path, path, n + 1);
+    e->next = s->buckets[b]; s->buckets[b] = e;
+    pthread_mutex_unlock(&s->mu);
     return fd;
 }
 
@@ -90,10 +124,8 @@ static void *handle_conn(void *arg) {
     path[len] = 0;
 
     if (op == 'O') {
-        pthread_mutex_lock(&g_mu);
-        int existed = idx_of(path) >= 0;
-        int memfd = find_or_create(path);
-        pthread_mutex_unlock(&g_mu);
+        int existed = 0;
+        int memfd = find_or_create(path, &existed);
         if (g_dbg) fprintf(stderr, "broker: OPEN %s %s\n", existed ? "existing" : "CREATE", path);
         if (memfd < 0) { send_fd(c, -1, 'E'); goto done; }
         char proc[64];
@@ -103,14 +135,18 @@ static void *handle_conn(void *arg) {
         if (sendable >= 0) close(sendable);
 
     } else if (op == 'S') {
-        pthread_mutex_lock(&g_mu);
-        int i = idx_of(path);
+        size_t n = strlen(path);
+        uint64_t h = hash_path(path, n);
+        stripe_t *s = &g_str[h & (NSTRIPE - 1)];
+        size_t b = (h >> 16) & (SBUCKETS - 1);
         long long sz = 0; char st = 'E';
-        if (i >= 0) {
+        pthread_mutex_lock(&s->mu);
+        entry_t *e = bucket_find(s->buckets[b], path, n);
+        if (e) {
             struct stat stt;
-            if (fstat(g_fds[i], &stt) == 0) { sz = stt.st_size; st = 'K'; }
+            if (fstat(e->fd, &stt) == 0) { sz = stt.st_size; st = 'K'; }
         }
-        pthread_mutex_unlock(&g_mu);
+        pthread_mutex_unlock(&s->mu);
         if (g_dbg && st == 'E') fprintf(stderr, "broker: STAT MISS %s\n", path);
         write(c, &st, 1); write(c, &sz, 8);
 
@@ -122,32 +158,43 @@ static void *handle_conn(void *arg) {
         size_t pl = strlen(path);
         int is_rel = (pl >= 3 && strcmp(path + pl - 3, ".gz") == 0);
         int retain = g_keep || is_rel;
-        pthread_mutex_lock(&g_mu);
-        int i = idx_of(path);
+        uint64_t h = hash_path(path, pl);
+        stripe_t *s = &g_str[h & (NSTRIPE - 1)];
+        size_t b = (h >> 16) & (SBUCKETS - 1);
+        pthread_mutex_lock(&s->mu);
+        entry_t **pp = &s->buckets[b], *e = NULL;
+        for (; *pp; pp = &(*pp)->next)
+            if ((*pp)->fd >= 0 && (*pp)->plen == pl && memcmp((*pp)->path, path, pl) == 0) { e = *pp; break; }
         if (g_dbg) fprintf(stderr, "broker: UNLINK %s %s%s\n",
-                           i >= 0 ? "hit" : "miss", path, (i >= 0 && retain) ? " (RETAINED)" : "");
-        if (i >= 0 && !retain) { close(g_fds[i]); g_fds[i] = -1; g_paths[i][0] = 0; }
-        pthread_mutex_unlock(&g_mu);
+                           e ? "hit" : "miss", path, (e && retain) ? " (RETAINED)" : "");
+        if (e && !retain) { close(e->fd); *pp = e->next; free(e); }
+        pthread_mutex_unlock(&s->mu);
         char st = 'K'; write(c, &st, 1);
 
     } else if (op == 'L') {
-        // List direct children of directory 'path' (strip trailing slash)
+        // List direct children of directory 'path' (strip trailing slash).
+        // Rare op; scans every shard (each under its own lock).
         char pfx[PATHMAX]; strncpy(pfx, path, PATHMAX - 1); pfx[PATHMAX-1] = 0;
         size_t pl = strlen(pfx);
         if (pl > 0 && pfx[pl-1] == '/') pfx[--pl] = 0;
 
         char **names = NULL; int cnt = 0;
-        pthread_mutex_lock(&g_mu);
-        for (int i = 0; i < g_nf; i++) {
-            if (g_fds[i] < 0) continue;
-            const char *p = g_paths[i];
-            if (strncmp(p, pfx, pl) != 0 || p[pl] != '/') continue;
-            const char *rest = p + pl + 1;
-            if (strchr(rest, '/') != NULL) continue;
-            names = realloc(names, (cnt + 1) * sizeof(char *));
-            names[cnt++] = strdup(rest);
+        for (int si = 0; si < NSTRIPE; si++) {
+            stripe_t *s = &g_str[si];
+            pthread_mutex_lock(&s->mu);
+            for (int bi = 0; bi < SBUCKETS; bi++) {
+                for (entry_t *e = s->buckets[bi]; e; e = e->next) {
+                    if (e->fd < 0) continue;
+                    const char *p = e->path;
+                    if (strncmp(p, pfx, pl) != 0 || p[pl] != '/') continue;
+                    const char *rest = p + pl + 1;
+                    if (strchr(rest, '/') != NULL) continue;
+                    names = realloc(names, (cnt + 1) * sizeof(char *));
+                    names[cnt++] = strdup(rest);
+                }
+            }
+            pthread_mutex_unlock(&s->mu);
         }
-        pthread_mutex_unlock(&g_mu);
 
         write(c, &cnt, 4);
         for (int i = 0; i < cnt; i++) {
@@ -167,19 +214,28 @@ done:
 
 static void dump_table(int sig) {
     (void)sig;
-    fprintf(stderr, "=== BROKER DUMP: %d slots ===\n", g_nf);
-    for (int i = 0; i < g_nf; i++) {
-        if (g_fds[i] < 0) continue;
-        if (strstr(g_paths[i], "filelist") || strstr(g_paths[i], "stderr") || strstr(g_paths[i], "stdout")) {
-            fprintf(stderr, "DUMP %s CONTENT:\n", g_paths[i]);
-            off_t cur = lseek(g_fds[i], 0, SEEK_CUR);
-            lseek(g_fds[i], 0, SEEK_SET);
-            char buf[16384]; int r;
-            while ((r = read(g_fds[i], buf, sizeof buf)) > 0) fwrite(buf, 1, r, stderr);
-            lseek(g_fds[i], cur, SEEK_SET);
-            fprintf(stderr, "--- end filelist ---\n");
-        } else {
-            fprintf(stderr, "FILE %s\n", g_paths[i]);
+    int total = 0;
+    for (int si = 0; si < NSTRIPE; si++)
+        for (int bi = 0; bi < SBUCKETS; bi++)
+            for (entry_t *e = g_str[si].buckets[bi]; e; e = e->next)
+                if (e->fd >= 0) total++;
+    fprintf(stderr, "=== BROKER DUMP: %d files ===\n", total);
+    for (int si = 0; si < NSTRIPE; si++) {
+        for (int bi = 0; bi < SBUCKETS; bi++) {
+            for (entry_t *e = g_str[si].buckets[bi]; e; e = e->next) {
+                if (e->fd < 0) continue;
+                if (strstr(e->path, "filelist") || strstr(e->path, "stderr") || strstr(e->path, "stdout")) {
+                    fprintf(stderr, "DUMP %s CONTENT:\n", e->path);
+                    off_t cur = lseek(e->fd, 0, SEEK_CUR);
+                    lseek(e->fd, 0, SEEK_SET);
+                    char buf[16384]; int r;
+                    while ((r = read(e->fd, buf, sizeof buf)) > 0) fwrite(buf, 1, r, stderr);
+                    lseek(e->fd, cur, SEEK_SET);
+                    fprintf(stderr, "--- end filelist ---\n");
+                } else {
+                    fprintf(stderr, "FILE %s\n", e->path);
+                }
+            }
         }
     }
     fprintf(stderr, "=== END DUMP ===\n");
@@ -188,15 +244,30 @@ static void dump_table(int sig) {
 int main(int argc, char **argv) {
     const char *sp = argc > 1 ? argv[1] : "/tmp/ramnfs.sock";
     signal(SIGUSR1, dump_table);
+    // A client that disconnects mid-reply (timeout, kill, OOM-killed sieve
+    // worker) must NOT take the broker — and thus the whole job — down. Without
+    // this, the next write/sendmsg to that dead socket raises SIGPIPE whose
+    // default action terminates the process. At high core counts, with dozens of
+    // clients churning, one ill-timed disconnect would otherwise be fatal.
+    signal(SIGPIPE, SIG_IGN);
+    // Hold one memfd per RAM file; never let a low inherited soft limit cap how
+    // many files (workunits/relations) we can keep at high core counts.
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
     g_dbg = getenv("RAMNFS_DEBUG") != NULL;
     g_keep = getenv("RAMNFS_KEEP") != NULL;
+    for (int i = 0; i < NSTRIPE; i++)
+        pthread_mutex_init(&g_str[i].mu, NULL);
     unlink(sp);
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un a = {0}; a.sun_family = AF_UNIX;
     strncpy(a.sun_path, sp, sizeof a.sun_path - 1);
     if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); return 1; }
     listen(s, 4096);
-    fprintf(stderr, "broker: listening on %s (pid %d)\n", sp, getpid());
+    fprintf(stderr, "broker: listening on %s (pid %d, %d shards)\n", sp, getpid(), NSTRIPE);
     for (;;) {
         int c = accept(s, 0, 0);
         if (c < 0) continue;

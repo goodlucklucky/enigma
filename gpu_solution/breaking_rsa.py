@@ -102,13 +102,13 @@ def _find_cado_script() -> Optional[str]:
     return None
 
 
-def _default_ropteffort(ndigits: int) -> Optional[float]:
-    """CADO's calibrated ropteffort for the params.cNN file nearest this size.
+def _default_param(ndigits: int, key: str = "tasks.polyselect.ropteffort") -> Optional[float]:
+    """CADO's calibrated value of `key` for the params.cNN file nearest this size.
 
-    Used to bump it multiplicatively (always an increase). CADO's defaults jump
-    non-linearly with size (c140=16, c145=18, c150=25), so a fixed bumped value
-    would be a regression at some sizes — reading the per-size default avoids
-    that."""
+    Used to bump a tuning knob multiplicatively off its per-size default. CADO's
+    defaults jump non-linearly with size (e.g. ropteffort c140=16, c145=18,
+    c150=25), so a fixed bumped value would be a regression at some sizes —
+    reading the per-size default avoids that."""
     pdir = None
     cado = _find_cado_script()
     cands = []
@@ -135,7 +135,7 @@ def _default_ropteffort(ndigits: int) -> Optional[float]:
         return None
     try:
         for line in best.read_text().splitlines():
-            m = re.match(r"\s*tasks\.polyselect\.ropteffort\s*=\s*([0-9.]+)", line)
+            m = re.match(r"\s*" + re.escape(key) + r"\s*=\s*([0-9.]+)", line)
             if m:
                 return float(m.group(1))
     except OSError:
@@ -248,25 +248,30 @@ def _invoke_cado(cmd: List[str], env: dict, n: mpz, deadline: float, label: str,
     return factors, (rc if rc is not None else 1)
 
 
-def _count_cpulist(cl: str) -> int:
-    n = 0
+def _parse_cpulist(cl: str) -> List[int]:
+    """Expand a Linux cpulist ("0-7,16" form) into explicit CPU ids."""
+    out: List[int] = []
     for part in cl.split(","):
         part = part.strip()
         if "-" in part:
             a, b = part.split("-")
-            n += int(b) - int(a) + 1
+            out += list(range(int(a), int(b) + 1))
         elif part:
-            n += 1
-    return n
+            out.append(int(part))
+    return out
 
 
 def _numa_plan(threads: int, las_threads: int, log) -> Optional[list]:
     """Plan one pinned sieve-client group per CPU locality domain.
 
-    Returns [(membind_node|None, physcpubind_str, n_clients), ...] or None when
-    NUMA pinning doesn't apply. Real kernel NUMA nodes (/sys) drive production;
-    CADO_NUMA_TEST=k simulates k CPU groups on a single node (CPU-pin only) so
-    the launcher can be validated on non-NUMA hardware."""
+    Returns [(membind_node|None, [cpu ids], las_threads), ...] or None when NUMA
+    pinning doesn't apply. The launcher slices each node's CPUs into DISTINCT
+    per-client core sets (idea #2): the old plan pinned every client to the whole
+    node's cpuset, so N clients floated over the same N cores and the scheduler
+    migrated them, thrashing per-core L1/L2 on the bandwidth-bound sieve. Real
+    kernel NUMA nodes (/sys) drive production; CADO_NUMA_TEST=k simulates k CPU
+    groups on one node (CPU-pin only) so the launcher can be validated on
+    single-node hardware."""
     test_k = _env_int("CADO_NUMA_TEST", 0)
     if test_k > 1:
         cpus = list(range(threads))
@@ -275,8 +280,7 @@ def _numa_plan(threads: int, las_threads: int, log) -> Optional[list]:
         for g in range(test_k):
             chunk = cpus[g * per:] if g == test_k - 1 else cpus[g * per:(g + 1) * per]
             if chunk:
-                cl = ",".join(str(c) for c in chunk)
-                groups.append((None, cl, max(1, len(chunk) // las_threads)))
+                groups.append((None, chunk, las_threads))
         return groups if len(groups) > 1 else None
     nodes = []
     for d in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
@@ -286,10 +290,9 @@ def _numa_plan(threads: int, las_threads: int, log) -> Optional[list]:
             continue
         if not cl:
             continue
-        node_id = int(os.path.basename(d)[4:])
-        ncpu = _count_cpulist(cl)
-        if ncpu:
-            nodes.append((node_id, cl, max(1, ncpu // las_threads)))
+        cpus = _parse_cpulist(cl)
+        if cpus:
+            nodes.append((int(os.path.basename(d)[4:]), cpus, las_threads))
     if len(nodes) <= 1:
         log(f"NUMA: {len(nodes)} node(s) — pinning not applicable, using auto-clients")
         return None
@@ -326,10 +329,24 @@ def _invoke_cado_numa(server_cmd: List[str], plan: list, client_py: str,
 
     def _launch(url: str, sha: str) -> None:
         total = 0
-        for gi, (node, cpus, nc) in enumerate(plan):
+        for gi, (node, cpus, lt) in enumerate(plan):
+            nc = max(1, len(cpus) // lt)
             for i in range(nc):
-                numa = ["numactl", f"--physcpubind={cpus}"]
-                if node is not None:
+                # Each client gets its OWN distinct cores (last absorbs remainder)
+                # + that node's local memory — no two clients share a core, and
+                # the scheduler can't migrate them off-node.
+                chunk = cpus[i * lt:] if i == nc - 1 else cpus[i * lt:(i + 1) * lt]
+                cl = ",".join(str(c) for c in chunk)
+                numa = ["numactl", f"--physcpubind={cl}"]
+                # --membind needs the set_mempolicy capability, which the
+                # validator's unprivileged (--read-only) container DENIES
+                # ("Operation not permitted") — that aborts every client before
+                # it can sieve. CPU-pinning is allowed (sched_setaffinity), and
+                # Linux first-touch then places each pinned client's pages on its
+                # local node anyway, so we get locality without the privileged
+                # syscall. Only add --membind when explicitly enabled on a
+                # permissive host (CADO_NUMA_MEMBIND=1).
+                if node is not None and os.environ.get("CADO_NUMA_MEMBIND"):
                     numa.append(f"--membind={node}")
                 ccmd = numa + [sys.executable, client_py,
                                f"--server={url}", f"--certsha1={sha}",
@@ -343,7 +360,7 @@ def _invoke_cado_numa(server_cmd: List[str], plan: list, client_py: str,
                 except Exception as e:  # noqa: BLE001
                     log(f"Stage 2: {label} client launch failed: {e}")
         log(f"Stage 2: {label} launched {total} NUMA-pinned clients "
-            f"across {len(plan)} group(s)")
+            f"(distinct cores) across {len(plan)} node(s)")
 
     wd = threading.Thread(target=_watchdog, daemon=True)
     wd.start()
@@ -463,7 +480,13 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     for env_key, cado_key in (("CADO_ADMAX", "tasks.polyselect.admax"),
                               ("CADO_DEGREE", "tasks.polyselect.degree"),
                               ("CADO_I", "tasks.I"),
-                              ("CADO_QMIN", "tasks.sieve.qmin")):
+                              ("CADO_QMIN", "tasks.sieve.qmin"),
+                              # idea #5: bucket-allocation margin. CADO grows the
+                              # bucket arrays and RE-SIEVES the region when one
+                              # overflows; pre-allocating more margin (e.g. 1.15)
+                              # trades a little RAM to avoid those restarts. (las
+                              # has no hugepage flag, so bkmult is the lever.)
+                              ("CADO_BKMULT", "tasks.sieve.bkmult")):
         v = os.environ.get(env_key, "").strip()
         if v:
             base_cmd.append(f"{cado_key}={v}")
@@ -479,18 +502,38 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     #     collecting CADO's built-in safety margin (c140 ships 71M).
     tune_min = _env_int("SIEVE_TUNE_MIN_DIGITS", 120)
     tuned: List[str] = []
-    ropt = os.environ.get("CADO_ROPTEFFORT", "").strip()
-    if not ropt and ndigits >= tune_min:
-        base = _default_ropteffort(ndigits)
-        if base:
+
+    def _bump(env_name: str, mult_env: str, cado_key: str, default_mult: float,
+              fallback: float, auto: bool = True) -> None:
+        """Set `cado_key` to (per-size default x mult) for large inputs.
+        `env_name` (explicit value) always wins. When auto=False the bump is
+        OPT-IN: it applies only if the *_MULT env is explicitly set — used for
+        levers whose benefit a fast benchmark could not confirm, so the default
+        stays exactly CADO's calibrated value (no silent regression)."""
+        v = os.environ.get(env_name, "").strip()
+        enabled = auto or bool(os.environ.get(mult_env, "").strip())
+        if not v and enabled and ndigits >= tune_min:
+            base = _default_param(ndigits, cado_key) or fallback
             try:
-                mult = float(os.environ.get("CADO_ROPTEFFORT_MULT", "1.5") or "1.5")
+                mult = float(os.environ.get(mult_env, str(default_mult)) or default_mult)
             except ValueError:
-                mult = 1.5
-            ropt = str(round(base * mult, 1))
-    if ropt:
-        base_cmd.append(f"tasks.polyselect.ropteffort={ropt}")
-        tuned.append(f"ropteffort={ropt}")
+                mult = default_mult
+            v = str(round(base * mult, 1)).rstrip("0").rstrip(".")
+        if v:
+            base_cmd.append(f"{cado_key}={v}")
+            tuned.append(f"{cado_key.split('.')[-1]}={v}")
+
+    # idea #4 (better poly): ropteffort (more root-opt) stays auto-on (it was
+    # already the shipped default). nrkeep (keep more stage-1 survivors) is
+    # OPT-IN: the fast benchmark showed no Murphy-E gain at testable search sizes
+    # while tripling poly-select time, so enable it only via CADO_NRKEEP[_MULT].
+    _bump("CADO_ROPTEFFORT", "CADO_ROPTEFFORT_MULT", "tasks.polyselect.ropteffort", 1.5, 16.0)
+    _bump("CADO_NRKEEP", "CADO_NRKEEP_MULT", "tasks.polyselect.nrkeep", 1.5, 60, auto=False)
+
+    # idea #3 (sieve/LA rebalance): rels_wanted=1 stops sieving as soon as
+    # filtering can build a matrix, instead of collecting CADO's safety margin
+    # (c140 ships 71M). The denser/just-enough matrix is handed to the fast GPU
+    # block-Lanczos, so we spend cheap GPU-LA time to save expensive sieve time.
     relsw = os.environ.get("CADO_RELS_WANTED", "").strip()
     if not relsw and ndigits >= tune_min:
         relsw = "1"
@@ -510,6 +553,11 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
         # server only — clients are launched (pinned) by us, so disable auto-spawn
         base_cmd = ["slaves.nrclients=0" if x.startswith("slaves.nrclients=")
                     else x for x in base_cmd]
+        # CADO only auto-whitelists hosts of clients IT launches; with nrclients=0
+        # the whitelist stays empty and every one of our manually-launched clients
+        # is rejected with HTTP 403 (api_limit_remote_addr), so the sieve collects
+        # zero relations and the job times out. Explicitly whitelist localhost.
+        base_cmd.append("server.whitelist=localhost")
 
     def _cado(extra: List[str], label: str) -> Tuple[Optional[Tuple[int, int]], int]:
         if use_numa:
@@ -523,6 +571,26 @@ def _run_cado(n: mpz, deadline: float, log) -> Optional[Tuple[int, int]]:
     # GPU path on input size. The production targets (c130-c145) are well above.
     gpu_min = _env_int("GPU_MIN_DIGITS", 100)
     use_gpu = (bool(shim) and ndigits >= gpu_min and gpu_la.gpu_available(log))
+
+    # idea #3 (sieve/LA rebalance, GPU half): when the fast GPU block-Lanczos is
+    # doing the LA, a denser target matrix is cheap to solve AND lets the filter
+    # build a matrix from FEWER relations -> less sieving. Only raise density on
+    # the GPU path; CADO's CPU bwc prefers its calibrated (lower) density.
+    td = os.environ.get("CADO_TARGET_DENSITY", "").strip()
+    # OPT-IN (unverified by fast benchmark): auto-raise density only when
+    # CADO_TARGET_DENSITY_MULT is explicitly set, and only on the GPU path.
+    if (not td and os.environ.get("CADO_TARGET_DENSITY_MULT", "").strip()
+            and use_gpu and ndigits >= tune_min):
+        base_td = _default_param(ndigits, "tasks.filter.target_density") or 125.0
+        try:
+            mult = float(os.environ.get("CADO_TARGET_DENSITY_MULT", "1.4") or "1.4")
+        except ValueError:
+            mult = 1.4
+        td = str(round(base_td * mult, 1))
+    if td:
+        base_cmd.append(f"tasks.filter.target_density={td}")
+        tuned.append(f"target_density={td}")
+
     factors: Optional[Tuple[int, int]] = None
     try:
         log(f"Stage 2: CADO c{ndigits} ({nbits}-bit) threads={threads} "
