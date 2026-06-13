@@ -53,15 +53,13 @@ RUN pip install cuquantum-python-cu13 cupy-cuda13x || \
 RUN useradd -r -s /sbin/nologin -d /app -U miner
 
 WORKDIR /app
-# Vendored verbatim from github.com/d-kremer/peaked-circuit-simulation (Apache-2.0)
-COPY --chown=miner:miner utils.py circuit_mpo.py unswap.py /app/
-COPY --chown=miner:miner LICENSE-Apache-2.0 NOTICE /app/
-# Enigma stdout protocol + our orchestrator
-COPY --chown=miner:miner _hqp_serde.py _hqp_types.py _hqp_output.py /app/
-COPY --chown=miner:miner hardening_quantum_proof.py /app/
-# Test tooling (circuit generator + harness) so the image is self-testing on any
-# machine. Ignored by the validator, which just runs the ENTRYPOINT on the qasm.
-COPY --chown=miner:miner tools /app/tools/
+# One catch-all COPY of the whole submission context: the vendored Apache-2.0
+# reference code (utils.py, circuit_mpo.py, unswap.py + LICENSE/NOTICE), the Enigma
+# stdout-protocol modules (_hqp_*.py) and our orchestrator (hardening_quantum_proof.py).
+# A single COPY is deliberately robust -- the build cannot fail on one missing source
+# file -- and .dockerignore keeps test-only/scratch files (tools/, __pycache__, logs)
+# out of the image. Paths are relative, so this passes the validator's Dockerfile policy.
+COPY --chown=miner:miner . /app/
 
 # Default wall clock; the validator overrides WALL_TIME as needed.
 ENV WALL_TIME=14400 \

@@ -172,19 +172,26 @@ def configure_resources(device, cores: int) -> None:
 # --------------------------------------------------------------------------- #
 
 class _Budget:
-    def __init__(self, seconds: float):
-        self.seconds = max(1, int(seconds))
+    def __init__(self, seconds: float, repeat: float = 5.0):
+        self.seconds = max(1.0, float(seconds))
+        self.repeat = max(1.0, float(repeat))
         self._old = None
 
     def __enter__(self):
         def _raise(signum, frame):
-            raise KeyboardInterrupt(f"budget of {self.seconds}s elapsed")
+            raise KeyboardInterrupt(f"budget of {self.seconds:.0f}s elapsed")
         self._old = signal.signal(signal.SIGALRM, _raise)
-        signal.alarm(self.seconds)
+        # PERIODIC, not one-shot. A heavy stage like mpo_compress_unswap catches the
+        # first KeyboardInterrupt internally (to return its partial MPO) -- with a
+        # one-shot alarm that CONSUMES the deadline, and the next phase (mpo_to_mps
+        # reconstruction) then runs unbounded, blowing past WALL_TIME by hours. By
+        # re-firing every `repeat`s the deadline survives a caught interrupt and stops
+        # the very next long op, bounding the overrun to ~one tensor contraction.
+        signal.setitimer(signal.ITIMER_REAL, self.seconds, self.repeat)
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        signal.alarm(0)
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
         if self._old is not None:
             signal.signal(signal.SIGALRM, self._old)
         # Do NOT suppress: let the timeout KeyboardInterrupt propagate to the
@@ -194,8 +201,8 @@ class _Budget:
         return False
 
 
-def budget(seconds: float) -> _Budget:
-    return _Budget(seconds)
+def budget(seconds: float, repeat: float = 5.0) -> _Budget:
+    return _Budget(seconds, repeat=repeat)
 
 
 # --------------------------------------------------------------------------- #
@@ -720,6 +727,79 @@ def build_verifier_psi(circuit, device, max_bond, cutoff=1e-10):
     return qc.psi
 
 
+def build_bp_oracle(circuit, device, tol=1e-6, damping=0.1):
+    """Idea #4: a belief-propagation verifier for circuits the 1D MPS attack
+    cannot reach.
+
+    Builds the FULL circuit tensor network (general geometry, NOT an MPS) and
+    contracts a projected amplitude <s|C|0> with dense 2-norm BP. BP does not
+    assume 1D structure, so it stays meaningful on all-to-all / native-obfuscation
+    circuits where unswapping diverges and the distillation MPS is pure noise.
+
+    Returns ``(score_fn, seed_or_None)``:
+      * ``score_fn(bitstring) -> float`` approximates |<s|C|0>|^2 via BP, drop-in
+        for `beam_search`'s `score_fn` -- an INDEPENDENT second oracle.
+      * ``seed`` is a bitstring read off the BP single-qubit marginals (best effort).
+
+    Fully fault-tolerant: ANY failure (import, build, non-convergence, API drift)
+    returns ``(None, None)`` and the pipeline continues on the banked answer.
+    """
+    try:
+        import quimb
+        import torch
+        import numpy as _np
+        from qiskit_quimb import quimb_circuit
+        from quimb.tensor.belief_propagation import contract_d2bp
+    except Exception as e:  # noqa: BLE001
+        log(f"  BP oracle unavailable (import): {e}")
+        return None, None
+
+    max_it = env_int("BP_MAX_ITERS", 200)
+
+    def to_backend(x):
+        return torch.tensor(x, dtype=torch.complex64, device=device)
+
+    try:
+        circ = strip_swaps(circuit)
+        qc = quimb_circuit(circ, quimb_circuit_class=quimb.tensor.Circuit,
+                           to_backend=to_backend)
+        psi = qc.psi  # full state TN with one open index per qubit
+    except Exception as e:  # noqa: BLE001
+        log(f"  BP oracle build failed: {e}")
+        return None, None
+
+    def _scalar(val):
+        try:
+            return float(abs(val))
+        except TypeError:                         # (mantissa, exponent) form
+            m, e = val
+            return float(abs(m)) * (10.0 ** float(e))
+
+    def score_fn(bitstring):
+        tn = psi.isel({psi.site_ind(i): int(b) for i, b in zip(psi.sites, bitstring)})
+        val = contract_d2bp(tn, max_iterations=max_it, tol=tol,
+                            damping=damping, progbar=False)
+        return _scalar(val)
+
+    # Best-effort marginal seed: one BP run on <psi|psi> -> per-qubit P(0) vs P(1).
+    seed = None
+    try:
+        from quimb.tensor.belief_propagation import D2BP
+        bp = D2BP((psi.H | psi), damping=damping)
+        runner = getattr(bp, "run", None) or getattr(bp, "run_iterations")
+        runner(max_iterations=max_it, tol=tol)
+        bits = []
+        for i in psi.sites:
+            m = bp.compute_marginal(psi.site_ind(i))
+            arr = _np.asarray(getattr(m, "data", m)).real.ravel()
+            bits.append("0" if arr[0] >= arr[-1] else "1")
+        seed = "".join(bits)
+    except Exception as e:  # noqa: BLE001
+        log(f"  BP marginal seed skipped: {e}")
+
+    return score_fn, seed
+
+
 def hill_climb(psi, bs, deadline, max_passes=12):
     from utils import bitstring_probability
     best = bs
@@ -744,25 +824,30 @@ def hill_climb(psi, bs, deadline, max_passes=12):
     return best, best_p
 
 
-def beam_search(psi, seeds, deadline, width=None, max_passes=10):
-    """Beam search over |<s|psi>|^2, keeping the top-`width` bitstrings.
+def beam_search(psi, seeds, deadline, width=None, max_passes=10, score_fn=None):
+    """Beam search over a scalar score s -> score(s), keeping the top-`width` strings.
 
     Idea #2: single-bit steepest-ascent hill-climb (the special case width=1)
     gets trapped in local optima -- e.g. it left d2_s1 three bits short of the
     peak. A beam keeps the `width` best candidates and, each pass, expands EVERY
     member by all single-bit flips, dedupes, and keeps the best `width`. This
     explores several basins at once and walks past the 1- and 2-bit traps that
-    stop greedy. Amplitudes are memoised so each distinct string is scored once.
-    Returns (best_bitstring, best_amp2). With width=1 it reduces to hill_climb.
+    stop greedy. Scores are memoised so each distinct string is scored once.
+
+    `score_fn(bitstring) -> float` defaults to the exact MPS amplitude
+    |<s|psi>|^2; the BP oracle (Idea #4) passes a belief-propagation amplitude
+    instead, so the SAME search drives both verifiers. Returns (best, best_score).
     """
-    from utils import bitstring_probability
     width = max(1, width if width is not None else env_int("BEAM_WIDTH", 16))
+    if score_fn is None:
+        from utils import bitstring_probability
+        score_fn = lambda b: float(bitstring_probability(psi, b))  # noqa: E731
     cache: dict[str, float] = {}
 
     def amp(b):
         v = cache.get(b)
         if v is None:
-            v = float(bitstring_probability(psi, b))
+            v = float(score_fn(b))
             cache[b] = v
         return v
 
@@ -904,7 +989,7 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     # to rank the peak, so we do NOT pay to build a fresh high-bond verifier.
     from utils import bitstring_probability
     verify_cap = auto_int("VERIFY_QUBIT_CAP")
-    oracle = {"bs": None, "amp": -1.0, "used": False, "psi": None}
+    oracle = {"bs": None, "amp": -1.0, "used": False, "psi": None, "oracle": "mps"}
 
     def oracle_pass(budget_s, label):
         """Score the current candidates against the verifier MPS and beam-search
@@ -1010,14 +1095,53 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     if len(candidates) > n_cands_before_unswap or oracle["bs"] is None:
         oracle_pass(max(10.0, remaining() - 10), "Stage 4b (final hill-climb)")
 
+    # ---- Stage 4c: belief-propagation oracle (Idea #4) + portfolio select (#5) -
+    # The portfolio rule: keep whichever INDEPENDENT oracle certifies the highest
+    # peak (amp^2). If the MPS oracle's best is at/near the uniform baseline 2^-n,
+    # the 1D attack found nothing -- fall through to a BP contraction of the full
+    # TN, which works on the non-1D geometry the MPS can't. Also runs on BP_ENABLE=1.
+    baseline = 2.0 ** -n
+    bp_force = os.environ.get("BP_ENABLE", "").strip() not in ("", "0", "false", "False")
+    bp_trigger = baseline * env_float("BP_TRIGGER_MULT", 4.0)
+    if (n <= verify_cap and candidates and remaining() > env_float("BP_MIN", 120)
+            and (bp_force or oracle["amp"] < bp_trigger)):
+        try:
+            cap = max(20.0, remaining() - 15)
+            log(f"Stage 4c (BP oracle): MPS amp^2={oracle['amp']:.2e} vs baseline "
+                f"{baseline:.2e}; trying belief propagation (budget {cap:.0f}s)")
+            with budget(cap):
+                bp_score, bp_seed = build_bp_oracle(circuit, device)
+                if bp_score is not None:
+                    seeds = sorted(candidates.keys(),
+                                   key=lambda b: candidates[b]["conf"],
+                                   reverse=True)[:env_int("BEAM_SEEDS", 8)]
+                    if bp_seed:
+                        add(bp_seed, "bp_marginal", conf=0.6)
+                        seeds = [bp_seed] + seeds
+                    bs, amp = beam_search(
+                        None, seeds, min(deadline - 5, time.time() + cap - 3),
+                        width=env_int("BP_BEAM_WIDTH", 6), max_passes=4, score_fn=bp_score)
+                    log(f"  Stage 4c (BP) -> bp_amp^2 = {amp:.4e} | bs={(bs or '')[:24]}...")
+                    # Adopt BP's answer only if it certifies a clear peak (>> baseline)
+                    # that beats the MPS oracle -- the portfolio max-amp^2 select.
+                    if (bs is not None and amp > baseline * env_float("BP_ADOPT_MULT", 10.0)
+                            and amp > oracle["amp"]):
+                        oracle.update(bs=bs, amp=amp, used=True, oracle="bp")
+                        log(f"  Stage 4c (BP) WINS the portfolio (bp_amp^2 {amp:.2e} "
+                            f">> baseline {baseline:.2e})")
+        except KeyboardInterrupt:
+            log("  Stage 4c (BP) hit its budget.")
+        except Exception as e:  # noqa: BLE001
+            log(f"  Stage 4c (BP) failed: {e}")
+
     if not candidates and oracle["bs"] is None:
         log("No candidates from any stage; emitting all-zero fallback.")
         return "0" * n, {"reason": "no_candidate"}
 
-    # ---- Stage 5: choose final answer ----
+    # ---- Stage 5: choose final answer (portfolio winner) ----
     if oracle["bs"] is not None and oracle["amp"] > 0:
         final = oracle["bs"]
-        reason = f"amplitude_oracle amp2={oracle['amp']:.4e}"
+        reason = f"amplitude_oracle[{oracle['oracle']}] amp2={oracle['amp']:.4e}"
     else:
         # trust method confidence; prefer unswap > tno > distill on hard circuits
         def rank(item):
@@ -1031,8 +1155,10 @@ def solve(circuit, info, device, deadline) -> tuple[str, dict]:
     diag = {
         "reason": reason,
         "used_oracle": oracle["used"],
+        "winning_oracle": oracle["oracle"],
         "best_amp2": oracle["amp"] if oracle["amp"] > 0 else None,
         "baseline_2_minus_n": 2.0 ** -n,
+        "amp2_over_baseline": (oracle["amp"] / (2.0 ** -n)) if oracle["amp"] > 0 else None,
         "num_candidates": len(candidates),
         "candidate_methods": {bs[:16] + "...": sorted(m["methods"]) for bs, m in list(candidates.items())[:8]},
     }

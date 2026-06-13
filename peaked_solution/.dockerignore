@@ -1,0 +1,25 @@
+# Keep the image minimal and the build robust. The validator builds from the
+# submission context; everything here is excluded from `COPY . /app/`.
+
+# Build/control files (not needed inside the image)
+Dockerfile
+.dockerignore
+.git
+.gitignore
+
+# Test-only tooling (never used by the validator ENTRYPOINT)
+tools/
+
+# Python caches / artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local scratch / logs / outputs
+*.log
+ci/
+mock/
+out.txt
+out_*.txt
+*.peak.json
