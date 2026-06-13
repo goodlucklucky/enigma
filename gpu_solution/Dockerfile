@@ -27,6 +27,11 @@ RUN tar xzf /tmp/cado-nfs.tar.gz -C / \
                 /opt/cado-nfs/build/release/polyselect/polyselect \
     && python3 /opt/cado-nfs/build/release/cado-nfs.py --help > /dev/null 2>&1
 
+# Right-sized parameter files for the c136-c139 gap (RSA-460 is c139). CADO
+# otherwise falls back to the nearest file (oversized c140) since it does not
+# interpolate; these are linear interpolations of CADO's hand-tuned c135/c140.
+COPY cado_params/params.c13[6-9] /opt/cado-nfs/parameters/factor/
+
 # ramnfs: broker daemon + LD_PRELOAD shim. Routes CADO-NFS file I/O under
 # /ramwork to memfd_create RAM-backed files, bypassing the validator's small
 # (~1 GB) noexec /tmp tmpfs — no mount, no root, no extra privileges.
